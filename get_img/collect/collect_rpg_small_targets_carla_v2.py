@@ -336,7 +336,9 @@ def load_collection_config(config_path: Optional[str]) -> Dict[str, Any]:
     aliases = {
         "height_image": "height_img",
         "target_actor_filters": "target_actor_filter",
-        "targets": "target"
+        "targets": "target",
+        "min_vehicle_visible_ratio": "min_actor_visible_ratio",
+        "min_vehicle_visible_px": "min_actor_visible_px"
     }
 
     config: Dict[str, Any] = {}
@@ -417,21 +419,63 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height-img", type=int, default=720)
     parser.add_argument("--fov", type=float, default=70.0)
+    parser.add_argument(
+        "--enable-rgb-postprocess",
+        dest="enable_rgb_postprocess",
+        action="store_true",
+        default=False,
+        help="开启 RGB 相机后处理，使采集图更接近模拟器视口效果。"
+    )
+    parser.add_argument(
+        "--disable-rgb-postprocess",
+        dest="enable_rgb_postprocess",
+        action="store_false",
+        help="关闭 RGB 相机后处理，减少自动曝光/运动模糊等影响。"
+    )
     parser.add_argument("--fps", type=float, default=20.0)
 
     # UAV 视角参数
     parser.add_argument("--center-x", type=float, default=0.0)
     parser.add_argument("--center-y", type=float, default=0.0)
-    parser.add_argument("--height", type=float, default=90.0)
-    parser.add_argument("--height-min", type=float, default=50.0)
+    parser.add_argument("--road-centered-camera", action="store_true", default=True)
+    parser.add_argument(
+        "--fixed-config-center",
+        dest="road_centered_camera",
+        action="store_false",
+        help="使用配置中的 center_x/center_y，不自动选择道路中心。"
+    )
+    parser.add_argument("--height", type=float, default=130.0)
+    parser.add_argument("--height-min", type=float, default=120.0)
     parser.add_argument("--height-max", type=float, default=140.0)
-    parser.add_argument("--radius-min", type=float, default=30.0)
-    parser.add_argument("--radius-max", type=float, default=140.0)
+    parser.add_argument("--radius-min", type=float, default=80.0)
+    parser.add_argument("--radius-max", type=float, default=180.0)
     parser.add_argument("--pitch", type=float, default=-65.0)
+    parser.add_argument("--pitch-min", type=float, default=None)
+    parser.add_argument("--pitch-max", type=float, default=None)
     parser.add_argument("--route", type=str, default="orbit", choices=["orbit", "random"])
+    parser.add_argument("--orbit-degrees-per-sequence", type=float, default=60.0)
+    parser.add_argument("--safe-camera-min-z", type=float, default=120.0)
+    parser.add_argument("--max-camera-pose-retries", type=int, default=20)
+    parser.add_argument("--min-near-depth-m", type=float, default=5.0)
+    parser.add_argument("--max-near-depth-ratio", type=float, default=0.05)
+    parser.add_argument("--min-road-visible-ratio", type=float, default=0.25)
+    parser.add_argument("--road-semantic-ids", type=int, nargs="+", default=[6, 7, 8])
 
     # 天气
     parser.add_argument("--weather", type=str, default="ClearNoon")
+    parser.add_argument(
+        "--keep-current-weather",
+        dest="keep_current_weather",
+        action="store_true",
+        default=False,
+        help="保持模拟器当前天气，不调用 world.set_weather。"
+    )
+    parser.add_argument(
+        "--apply-config-weather",
+        dest="keep_current_weather",
+        action="store_false",
+        help="按 --weather 或 --random-weather 设置天气。"
+    )
     parser.add_argument("--random-weather", action="store_true")
 
     # 目标类别
@@ -486,6 +530,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vehicles", type=int, default=20)
     parser.add_argument("--walkers", type=int, default=10)
     parser.add_argument("--no-traffic", action="store_true")
+    parser.add_argument(
+        "--hide-static-map-vehicles",
+        action="store_true",
+        default=True,
+        help="隐藏地图自带的静态车辆环境对象，只保留脚本生成的 vehicle.* actor。"
+    )
+    parser.add_argument(
+        "--keep-static-map-vehicles",
+        dest="hide_static_map_vehicles",
+        action="store_false",
+        help="保留地图自带静态车辆。"
+    )
 
     # 可选：主动生成自定义小目标 actor。
     # 例如导入 RPG / missile / small UAV blueprint 后：
@@ -656,6 +712,77 @@ def save_disparity(
         str(path),
         depth_to_disparity_u16(depth_m, min_depth_m, max_depth_m)
     )
+
+
+def is_bad_camera_view(
+    depth_m: np.ndarray,
+    min_near_depth_m: float,
+    max_near_depth_ratio: float
+) -> Tuple[bool, Dict[str, float]]:
+    """
+    判断相机是否进入建筑/贴近遮挡物。
+
+    如果大量像素深度极近，通常意味着相机穿模进楼体或贴着墙。
+    """
+    valid = np.isfinite(depth_m) & (depth_m > 0.0)
+    if not np.any(valid):
+        return True, {
+            "near_depth_ratio": 1.0,
+            "valid_ratio": 0.0,
+            "min_depth": 0.0
+        }
+
+    valid_depth = depth_m[valid]
+    near_ratio = float(np.mean(valid_depth < min_near_depth_m))
+    valid_ratio = float(np.mean(valid))
+    min_depth = float(np.min(valid_depth))
+
+    return near_ratio > max_near_depth_ratio, {
+        "near_depth_ratio": near_ratio,
+        "valid_ratio": valid_ratio,
+        "min_depth": min_depth
+    }
+
+
+def road_visible_ratio(
+    semantic_image: carla.Image,
+    road_semantic_ids: List[int]
+) -> float:
+    """
+    计算画面中道路/车道线/人行道等可行驶区域的语义像素比例。
+
+    默认 CARLA 语义：
+    6 RoadLine, 7 Road, 8 SideWalk
+    """
+    bgra = carla_image_to_bgra(semantic_image)
+    road_ids = np.array(road_semantic_ids, dtype=np.uint8)
+
+    raw_masks = [
+        np.isin(bgra[:, :, channel].astype(np.uint8), road_ids)
+        for channel in range(3)
+    ]
+    raw_ratio = max(float(np.mean(mask)) for mask in raw_masks)
+
+    # OpenHUTB/CARLA 有些版本返回 raw semantic id，有些版本返回 CityScapes 调色板颜色。
+    cityscapes_rgb = {
+        6: (157, 234, 50),   # RoadLine
+        7: (128, 64, 128),   # Road
+        8: (244, 35, 232),   # SideWalk
+    }
+    palette_mask = np.zeros(bgra.shape[:2], dtype=bool)
+    for sem_id in road_semantic_ids:
+        rgb = cityscapes_rgb.get(int(sem_id))
+        if rgb is None:
+            continue
+        r, g, b = rgb
+        palette_mask |= (
+            (bgra[:, :, 0] == b)
+            & (bgra[:, :, 1] == g)
+            & (bgra[:, :, 2] == r)
+        )
+
+    palette_ratio = float(np.mean(palette_mask))
+    return max(raw_ratio, palette_ratio)
 
 
 def save_segmentation_raw(image: carla.Image, path: Path) -> np.ndarray:
@@ -1244,7 +1371,78 @@ def try_load_world(client: carla.Client, map_name: Optional[str]) -> carla.World
     return world
 
 
-def apply_weather(world: carla.World, preset_name: str) -> None:
+def get_vehicle_environment_label():
+    """
+    不同 CARLA/OpenHUTB 版本的 CityObjectLabel 命名可能不同。
+    优先查找车辆类标签，用于隐藏地图自带静态车。
+    """
+    label_class = getattr(carla, "CityObjectLabel", None)
+    if label_class is None:
+        return None
+
+    for name in ("Vehicles", "Vehicle", "Cars", "Car"):
+        if hasattr(label_class, name):
+            return getattr(label_class, name)
+
+    return None
+
+
+def hide_static_map_vehicles(world: carla.World) -> List[int]:
+    """
+    隐藏地图环境对象中的静态车辆。
+
+    这不会影响脚本生成的 vehicle.* actor，只影响地图自带环境对象。
+    返回被隐藏的环境对象 id，便于脚本退出时恢复。
+    """
+    if not hasattr(world, "get_environment_objects") or not hasattr(world, "enable_environment_objects"):
+        print("[WARN] This OpenHUTB/CARLA API has no environment object controls.")
+        return []
+
+    vehicle_label = get_vehicle_environment_label()
+    if vehicle_label is None:
+        print("[WARN] carla.CityObjectLabel has no vehicle label; static map vehicles were not hidden.")
+        return []
+
+    try:
+        env_objects = world.get_environment_objects(vehicle_label)
+        env_ids = [obj.id for obj in env_objects]
+        if len(env_ids) == 0:
+            print("[INFO] No static map vehicle environment objects found.")
+            return []
+
+        world.enable_environment_objects(set(env_ids), False)
+        print(f"[INFO] Hidden static map vehicle environment objects: {len(env_ids)}")
+        return env_ids
+
+    except Exception as exc:
+        print(f"[WARN] Failed to hide static map vehicles: {exc}")
+        return []
+
+
+def restore_static_map_vehicles(world: carla.World, env_ids: List[int]) -> None:
+    if len(env_ids) == 0:
+        return
+
+    if not hasattr(world, "enable_environment_objects"):
+        return
+
+    try:
+        world.enable_environment_objects(set(env_ids), True)
+        print(f"[INFO] Restored static map vehicle environment objects: {len(env_ids)}")
+    except Exception as exc:
+        print(f"[WARN] Failed to restore static map vehicles: {exc}")
+
+
+def apply_weather(world: carla.World, preset_name: Optional[str]) -> str:
+    if preset_name is None:
+        print("[INFO] Keeping current simulator weather.")
+        return "current"
+
+    preset_name = str(preset_name).strip()
+    if preset_name.lower() in ("", "current", "keep", "keep_current"):
+        print("[INFO] Keeping current simulator weather.")
+        return "current"
+
     presets = {
         "ClearNoon": carla.WeatherParameters.ClearNoon,
         "CloudyNoon": carla.WeatherParameters.CloudyNoon,
@@ -1261,8 +1459,14 @@ def apply_weather(world: carla.World, preset_name: str) -> None:
         "HardRainSunset": carla.WeatherParameters.HardRainSunset
     }
 
-    weather = presets.get(preset_name, carla.WeatherParameters.ClearNoon)
+    if preset_name not in presets:
+        print(f"[WARN] Unknown weather preset '{preset_name}', fallback to ClearNoon.")
+        preset_name = "ClearNoon"
+
+    weather = presets[preset_name]
     world.set_weather(weather)
+    print(f"[INFO] Applied weather: {preset_name}")
+    return preset_name
 
 
 def get_weather_names() -> List[str]:
@@ -1289,7 +1493,8 @@ def setup_camera_blueprint(
     width: int,
     height: int,
     fov: float,
-    sensor_tick: float
+    sensor_tick: float,
+    enable_rgb_postprocess: bool = False
 ):
     bp = blueprint_library.find(sensor_type)
 
@@ -1303,7 +1508,18 @@ def setup_camera_blueprint(
 
     if sensor_type == "sensor.camera.rgb":
         if bp.has_attribute("enable_postprocess_effects"):
-            bp.set_attribute("enable_postprocess_effects", "true")
+            bp.set_attribute(
+                "enable_postprocess_effects",
+                "true" if enable_rgb_postprocess else "false"
+            )
+        if not enable_rgb_postprocess:
+            for attr_name in (
+                "motion_blur_intensity",
+                "motion_blur_max_distortion",
+                "motion_blur_min_object_screen_size"
+            ):
+                if bp.has_attribute(attr_name):
+                    bp.set_attribute(attr_name, "0.0")
 
     return bp
 
@@ -1314,7 +1530,8 @@ def spawn_camera_set(
     height: int,
     fov: float,
     sensor_tick: float,
-    initial_transform: carla.Transform
+    initial_transform: carla.Transform,
+    enable_rgb_postprocess: bool
 ) -> Dict[str, carla.Sensor]:
     """
     创建 RGB / depth / semantic / instance 四个相机。
@@ -1342,7 +1559,8 @@ def spawn_camera_set(
             width,
             height,
             fov,
-            sensor_tick
+            sensor_tick,
+            enable_rgb_postprocess=enable_rgb_postprocess
         )
         sensor = world.spawn_actor(bp, initial_transform)
         sensors[name] = sensor
@@ -1441,11 +1659,13 @@ def random_uav_transform(
     height_max: float,
     radius_min: float,
     radius_max: float,
-    pitch: float
+    pitch_min: float,
+    pitch_max: float
 ) -> carla.Transform:
     height = random.uniform(height_min, height_max)
     radius = random.uniform(radius_min, radius_max)
     theta = random.uniform(0.0, 2.0 * math.pi)
+    pitch = random.uniform(pitch_min, pitch_max)
 
     return uav_orbit_transform(
         center_x=center_x,
@@ -1455,6 +1675,15 @@ def random_uav_transform(
         theta=theta,
         pitch=pitch
     )
+
+
+def random_road_center(carla_map) -> Tuple[float, float]:
+    spawn_points = carla_map.get_spawn_points()
+    if len(spawn_points) == 0:
+        return 0.0, 0.0
+
+    sp = random.choice(spawn_points)
+    return float(sp.location.x), float(sp.location.y)
 
 
 def spawn_background_traffic(
@@ -1679,6 +1908,13 @@ def main() -> None:
             TargetClass("traffic_light", 3, [18])
         ]
 
+    if args.pitch_min is None:
+        args.pitch_min = args.pitch
+    if args.pitch_max is None:
+        args.pitch_max = args.pitch
+    if args.pitch_min > args.pitch_max:
+        args.pitch_min, args.pitch_max = args.pitch_max, args.pitch_min
+
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -1696,6 +1932,7 @@ def main() -> None:
     walker_actors: List[carla.Actor] = []
     walker_controllers: List[carla.Actor] = []
     sensors: Dict[str, carla.Sensor] = {}
+    hidden_static_vehicle_ids: List[int] = []
 
     try:
         # ------------------------------------------------------------
@@ -1708,6 +1945,12 @@ def main() -> None:
 
         print("[INFO] Applied synchronous mode.")
         print(f"[INFO] fixed_delta_seconds={fixed_delta_seconds}")
+
+        # ------------------------------------------------------------
+        # 隐藏地图自带静态车辆，只保留脚本生成的 vehicle actor。
+        # ------------------------------------------------------------
+        if args.hide_static_map_vehicles:
+            hidden_static_vehicle_ids = hide_static_map_vehicles(world)
 
         # ------------------------------------------------------------
         # 天气
@@ -1770,7 +2013,8 @@ def main() -> None:
             height=args.height_img,
             fov=args.fov,
             sensor_tick=sensor_tick,
-            initial_transform=initial_transform
+            initial_transform=initial_transform,
+            enable_rgb_postprocess=args.enable_rgb_postprocess
         )
 
         optional_sensors = spawn_optional_sensors(
@@ -1812,6 +2056,7 @@ def main() -> None:
             "map": world.get_map().name,
             "image_size": [args.width, args.height_img],
             "fov": args.fov,
+            "rgb_postprocess": args.enable_rgb_postprocess,
             "fps": args.fps,
             "targets": [
                 {
@@ -1852,6 +2097,24 @@ def main() -> None:
                 ],
                 "z_offset": args.target_spawn_z_offset
             },
+            "camera_safety": {
+                "road_centered_camera": args.road_centered_camera,
+                "safe_camera_min_z": args.safe_camera_min_z,
+                "max_camera_pose_retries": args.max_camera_pose_retries,
+                "min_near_depth_m": args.min_near_depth_m,
+                "max_near_depth_ratio": args.max_near_depth_ratio,
+                "min_road_visible_ratio": args.min_road_visible_ratio,
+                "road_semantic_ids": args.road_semantic_ids
+            },
+            "static_map_vehicle_filter": {
+                "hide_static_map_vehicles": args.hide_static_map_vehicles,
+                "hidden_environment_object_count": len(hidden_static_vehicle_ids)
+            },
+            "weather_policy": {
+                "keep_current_weather": args.keep_current_weather,
+                "random_weather": args.random_weather,
+                "configured_weather": args.weather
+            },
             "modalities": [
                 "rgb",
                 "depth_meters",
@@ -1872,33 +2135,44 @@ def main() -> None:
         # sequence 循环
         # ------------------------------------------------------------
         total_drop_frames = 0
+        total_saved_frames = 0
 
         for seq_idx in range(args.sequences):
             seq_name = f"seq_{seq_idx:04d}"
             seq_dir = out_root / seq_name
             dirs = make_dirs(seq_dir)
 
-            if args.random_weather:
+            if args.keep_current_weather:
+                weather_name = "current"
+            elif args.random_weather:
                 weather_name = random.choice(weather_names)
             else:
                 weather_name = args.weather
 
-            apply_weather(world, weather_name)
+            weather_name = apply_weather(world, weather_name)
 
             orbit_phase = random.uniform(0.0, 2.0 * math.pi)
             orbit_radius = random.uniform(args.radius_min, args.radius_max)
             orbit_height = args.height
+            if args.road_centered_camera:
+                base_center_x, base_center_y = random_road_center(world.get_map())
+            else:
+                base_center_x, base_center_y = args.center_x, args.center_y
 
             seq_meta = {
                 "sequence": seq_name,
                 "weather": weather_name,
                 "route": args.route,
-                "center_xy": [args.center_x, args.center_y],
+                "center_xy": [base_center_x, base_center_y],
+                "road_centered_camera": args.road_centered_camera,
+                "min_road_visible_ratio": args.min_road_visible_ratio,
+                "road_semantic_ids": args.road_semantic_ids,
                 "height": args.height,
                 "height_range": [args.height_min, args.height_max],
                 "radius": orbit_radius,
                 "radius_range": [args.radius_min, args.radius_max],
-                "pitch": args.pitch
+                "pitch": args.pitch,
+                "pitch_range": [args.pitch_min, args.pitch_max]
             }
 
             manifest["sequences"].append(seq_meta)
@@ -1957,69 +2231,121 @@ def main() -> None:
 
                 for frame_i in range(args.frames):
                     # ------------------------------------------------
-                    # 生成 UAV 相机位姿
+                    # 生成 UAV 相机位姿，并过滤穿模/近距离遮挡视角。
                     # ------------------------------------------------
-                    if args.route == "orbit":
-                        theta = orbit_phase + 2.0 * math.pi * frame_i / max(args.frames, 1)
+                    accepted_view = False
+                    last_bad_view_stats: Optional[Dict[str, Any]] = None
+                    best_view_stats: Optional[Dict[str, Any]] = None
 
-                        transform = uav_orbit_transform(
-                            center_x=args.center_x,
-                            center_y=args.center_y,
-                            height=orbit_height,
-                            radius=orbit_radius,
-                            theta=theta,
-                            pitch=args.pitch
-                        )
-                    else:
-                        transform = random_uav_transform(
-                            center_x=args.center_x,
-                            center_y=args.center_y,
-                            height_min=args.height_min,
-                            height_max=args.height_max,
-                            radius_min=args.radius_min,
-                            radius_max=args.radius_max,
-                            pitch=args.pitch
-                        )
+                    for pose_try in range(max(1, args.max_camera_pose_retries)):
+                        if args.route == "orbit" and pose_try == 0:
+                            theta = orbit_phase + math.radians(args.orbit_degrees_per_sequence) * frame_i / max(args.frames, 1)
+                            transform = uav_orbit_transform(
+                                center_x=base_center_x,
+                                center_y=base_center_y,
+                                height=max(orbit_height, args.safe_camera_min_z),
+                                radius=max(orbit_radius, args.radius_min),
+                                theta=theta,
+                                pitch=args.pitch
+                            )
+                        else:
+                            if args.road_centered_camera:
+                                center_x, center_y = random_road_center(world.get_map())
+                            else:
+                                center_x, center_y = args.center_x, args.center_y
 
-                    set_all_sensor_transform(sensors, transform)
+                            transform = random_uav_transform(
+                                center_x=center_x,
+                                center_y=center_y,
+                                height_min=max(args.height_min, args.safe_camera_min_z),
+                                height_max=max(args.height_max, args.safe_camera_min_z),
+                                radius_min=args.radius_min,
+                                radius_max=args.radius_max,
+                                pitch_min=args.pitch_min,
+                                pitch_max=args.pitch_max
+                            )
 
-                    # ------------------------------------------------
-                    # 推进仿真一帧
-                    # ------------------------------------------------
-                    carla_frame = world.tick()
+                        set_all_sensor_transform(sensors, transform)
+                        carla_frame = world.tick()
 
-                    # ------------------------------------------------
-                    # 同步取四个核心相机
-                    # ------------------------------------------------
-                    try:
-                        rgb_img = sync["rgb"].get(
-                            carla_frame,
-                            timeout=args.sensor_timeout
-                        )
-                        depth_img = sync["depth"].get(
-                            carla_frame,
-                            timeout=args.sensor_timeout
-                        )
-                        semantic_img = sync["semantic"].get(
-                            carla_frame,
-                            timeout=args.sensor_timeout
-                        )
-                        instance_img = sync["instance"].get(
-                            carla_frame,
-                            timeout=args.sensor_timeout
-                        )
+                        try:
+                            rgb_img = sync["rgb"].get(
+                                carla_frame,
+                                timeout=args.sensor_timeout
+                            )
+                            depth_img = sync["depth"].get(
+                                carla_frame,
+                                timeout=args.sensor_timeout
+                            )
+                            semantic_img = sync["semantic"].get(
+                                carla_frame,
+                                timeout=args.sensor_timeout
+                            )
+                            instance_img = sync["instance"].get(
+                                carla_frame,
+                                timeout=args.sensor_timeout
+                            )
 
-                    except TimeoutError as exc:
+                        except TimeoutError as exc:
+                            total_drop_frames += 1
+                            print(
+                                f"[WARN] Drop frame_i={frame_i}, "
+                                f"carla_frame={carla_frame}: {exc}"
+                            )
+
+                            if total_drop_frames >= args.max_drop_frames:
+                                raise RuntimeError(
+                                    f"连续或累计丢帧过多：{total_drop_frames}。"
+                                    f"请降低分辨率/减少车辆行人/检查 CARLA API 版本。"
+                                )
+
+                            continue
+
+                        depth_m = decode_carla_depth_meters(depth_img)
+                        bad_view, bad_view_stats = is_bad_camera_view(
+                            depth_m,
+                            min_near_depth_m=args.min_near_depth_m,
+                            max_near_depth_ratio=args.max_near_depth_ratio
+                        )
+                        bad_view_stats["road_visible_ratio"] = road_visible_ratio(
+                            semantic_img,
+                            args.road_semantic_ids
+                        )
+                        last_bad_view_stats = bad_view_stats
+                        candidate_stats = dict(bad_view_stats)
+                        candidate_stats["bad_view"] = bool(bad_view)
+
+                        if best_view_stats is None:
+                            best_view_stats = candidate_stats
+                        else:
+                            best_bad = bool(best_view_stats.get("bad_view", True))
+                            best_road = float(best_view_stats.get("road_visible_ratio", -1.0))
+                            candidate_road = float(candidate_stats.get("road_visible_ratio", -1.0))
+                            if (
+                                (best_bad and not bad_view)
+                                or (best_bad == bool(bad_view) and candidate_road > best_road)
+                            ):
+                                best_view_stats = candidate_stats
+
+                        if (
+                            not bad_view
+                            and bad_view_stats["road_visible_ratio"] >= args.min_road_visible_ratio
+                        ):
+                            accepted_view = True
+                            break
+
+                    if not accepted_view:
                         total_drop_frames += 1
                         print(
-                            f"[WARN] Drop frame_i={frame_i}, "
-                            f"carla_frame={carla_frame}: {exc}"
+                            f"[WARN] Drop frame_i={frame_i}: bad camera view after "
+                            f"{args.max_camera_pose_retries} retries, "
+                            f"last_stats={last_bad_view_stats}, best_stats={best_view_stats}"
                         )
 
                         if total_drop_frames >= args.max_drop_frames:
                             raise RuntimeError(
-                                f"连续或累计丢帧过多：{total_drop_frames}。"
-                                f"请降低分辨率/减少车辆行人/检查 CARLA API 版本。"
+                                f"坏视角/丢帧过多：{total_drop_frames}。"
+                                f"请提高 safe_camera_min_z 或增大 radius_min。"
                             )
 
                         continue
@@ -2043,7 +2369,6 @@ def main() -> None:
                     # ------------------------------------------------
                     save_rgb(rgb_img, rgb_path)
 
-                    depth_m = decode_carla_depth_meters(depth_img)
                     save_depth(
                         depth_m,
                         depth_npy_path,
@@ -2261,6 +2586,7 @@ def main() -> None:
                         str(instance_path),
                         len(anns)
                     ])
+                    total_saved_frames += 1
 
                     if frame_i % 20 == 0:
                         print(
@@ -2317,7 +2643,15 @@ def main() -> None:
         # ------------------------------------------------------------
         # 写总 manifest
         # ------------------------------------------------------------
+        if total_saved_frames == 0:
+            raise RuntimeError(
+                "没有保存任何图像：所有帧都被视角过滤或同步超时丢弃。"
+                "请查看上方 WARN 中的 best_stats；通常需要降低 min_road_visible_ratio，"
+                "或调整 height/radius/pitch 让相机真正对准路面。"
+            )
+
         manifest["total_drop_frames"] = total_drop_frames
+        manifest["total_saved_frames"] = total_saved_frames
 
         (out_root / "dataset_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -2325,6 +2659,7 @@ def main() -> None:
         )
 
         print(f"[DONE] Dataset saved to: {out_root.resolve()}")
+        print(f"[DONE] total_saved_frames={total_saved_frames}")
         print(f"[DONE] total_drop_frames={total_drop_frames}")
 
     finally:
@@ -2370,6 +2705,8 @@ def main() -> None:
                 actor.destroy()
             except Exception:
                 pass
+
+        restore_static_map_vehicles(world, hidden_static_vehicle_ids)
 
         try:
             world.apply_settings(original_settings)

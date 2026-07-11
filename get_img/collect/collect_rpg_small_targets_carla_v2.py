@@ -10,23 +10,17 @@ CARLA / OpenHUTB 无人机视角小目标多模态数据集采集脚本。
 1. 连接 CARLA/OpenHUTB 模拟器；
 2. 设置同步模式；
 3. 创建空中“无人机视角”传感器平台；
-4. 同步采集：
+4. 同步采集四种模态：
+   - RGB / Visible 可见光图像
+   - Surface Normal 表面法线图
+   - Segmentation 语义分割图
+   - Depth 深度图
+5. 使用 OpenHUTB/CARLA actor 坐标、语义图和深度图生成目标 bbox；
+6. 输出：
    - RGB 图像
-   - 深度图 Depth
-   - 语义分割 Semantic Segmentation
-   - 实例分割 Instance Segmentation
-   - 可选 IMU / GNSS / LiDAR
-5. 使用 instance segmentation 的可见像素生成一实例一目标 bbox；
-6. 根据深度图保存每个目标区域的深度 crop / normalized disparity；
-7. 输出：
-   - RGB 图像
-   - depth npy
-   - depth 16-bit 可视化图
-   - semantic 图
-   - instance 图
-   - full-frame normalized disparity 图
-   - per-object mask / depth crop / disparity crop
-   - mask 图
+   - metric depth npy 与 16-bit 深度图
+   - semantic id 与语义彩色预览图
+   - camera-space surface normal npy 与法线图
    - YOLO 标签
    - JSON 标注
    - groundtruth.txt
@@ -477,18 +471,40 @@ def parse_args() -> argparse.Namespace:
         help="按 --weather 或 --random-weather 设置天气。"
     )
     parser.add_argument("--random-weather", action="store_true")
+    parser.add_argument(
+        "--collect-all-weather-presets",
+        dest="collect_all_weather_presets",
+        action="store_true",
+        default=False,
+        help="依次采集 weather_presets 中的全部天气，并按天气目录分类保存。"
+    )
+    parser.add_argument(
+        "--single-weather-mode",
+        dest="collect_all_weather_presets",
+        action="store_false",
+        help="仅使用 current、固定天气或随机天气采集。"
+    )
+    parser.add_argument(
+        "--weather-presets",
+        type=str,
+        nargs="+",
+        default=None,
+        help="全部天气模式下要采集的天气预设列表；未指定时动态读取当前 API 的全部预设。"
+    )
+    parser.add_argument(
+        "--weather-warmup-frames",
+        type=int,
+        default=10,
+        help="每次切换天气后预热的仿真帧数，用于稳定曝光、雨滴、雾和湿地效果。"
+    )
 
     # 目标类别
     parser.add_argument(
         "--annotation-source",
         type=str,
-        default="hybrid",
-        choices=["instance", "actor", "hybrid"],
-        help=(
-            "标注来源：instance=只用实例分割；"
-            "actor=车辆/行人只用 OpenHUTB/CARLA actor 坐标投影；"
-            "hybrid=车辆/行人用 actor，其他目标用实例分割。"
-        )
+        default="actor",
+        choices=["actor"],
+        help="四模态模式只使用 OpenHUTB/CARLA actor 坐标、语义和深度生成标注。"
     )
     parser.add_argument(
         "--target",
@@ -523,8 +539,12 @@ def parse_args() -> argparse.Namespace:
 
     # 深度图可视化最大距离
     parser.add_argument("--max-depth-vis", type=float, default=250.0)
-    parser.add_argument("--min-disparity-depth", type=float, default=1.0)
-    parser.add_argument("--max-disparity-depth", type=float, default=250.0)
+    parser.add_argument(
+        "--normal-max-depth-jump-m",
+        type=float,
+        default=5.0,
+        help="计算表面法线时允许的最大相邻深度突变，单位米；物体边界超过该值时法线置为无效。"
+    )
 
     # 交通流
     parser.add_argument("--vehicles", type=int, default=20)
@@ -552,8 +572,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-spawn-radius-max", type=float, default=80.0)
     parser.add_argument("--target-spawn-z-offset", type=float, default=0.2)
 
-    # 可选 LiDAR
-    parser.add_argument("--lidar", action="store_true")
+    parser.add_argument(
+        "--preserve-existing-sequences",
+        dest="preserve_existing_sequences",
+        action="store_true",
+        default=True,
+        help="保留已有序列并从下一个 seq_XXXX 继续采集，避免覆盖其他季节/天气的 RGB。"
+    )
+    parser.add_argument(
+        "--overwrite-sequences",
+        dest="preserve_existing_sequences",
+        action="store_false",
+        help="从 seq_0000 开始写入；同名文件可能被覆盖。"
+    )
 
     # 同步和稳定性
     parser.add_argument("--sensor-timeout", type=float, default=10.0)
@@ -574,24 +605,67 @@ def parse_args() -> argparse.Namespace:
 def make_dirs(seq_dir: Path) -> Dict[str, Path]:
     dirs = {
         "rgb": seq_dir / "rgb",
-        "depth_npy": seq_dir / "depth_npy",
-        "depth_vis": seq_dir / "depth_vis",
-        "disparity_vis": seq_dir / "disparity_vis",
-        "semantic": seq_dir / "semantic",
-        "instance": seq_dir / "instance",
-        "mask": seq_dir / "masks",
-        "object_depth_npy": seq_dir / "object_depth_npy",
-        "object_depth_vis": seq_dir / "object_depth_vis",
-        "object_disparity_vis": seq_dir / "object_disparity_vis",
+        "depth_npy": seq_dir / "depth" / "npy",
+        "depth_vis": seq_dir / "depth" / "vis_16bit",
+        "depth_color": seq_dir / "depth" / "color",
+        "surface_normal": seq_dir / "surface_normal" / "png",
+        "surface_normal_npy": seq_dir / "surface_normal" / "npy",
+        "segmentation": seq_dir / "segmentation" / "id",
+        "segmentation_color": seq_dir / "segmentation" / "color",
         "ann": seq_dir / "annotations",
-        "yolo": seq_dir / "labels_yolo",
-        "lidar": seq_dir / "lidar"
+        "yolo": seq_dir / "labels_yolo"
     }
 
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
 
     return dirs
+
+
+def existing_sequence_state(out_root: Path) -> Tuple[int, List[Dict[str, Any]]]:
+    """返回下一个序列编号和已有序列元数据，用于追加不同季节/天气的数据。"""
+    indices: List[int] = []
+    metadata: List[Dict[str, Any]] = []
+    for seq_dir in sorted(out_root.glob("seq_*")):
+        if not seq_dir.is_dir():
+            continue
+        try:
+            indices.append(int(seq_dir.name.split("_", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+
+        meta_path = seq_dir / "sequence_meta.json"
+        if meta_path.exists():
+            try:
+                sequence_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                sequence_meta = {"sequence": seq_dir.name}
+        else:
+            sequence_meta = {"sequence": seq_dir.name}
+
+        ann_paths = sorted((seq_dir / "annotations").glob("*.json"))
+        four_modalities_complete = False
+        if ann_paths:
+            try:
+                image_info = json.loads(
+                    ann_paths[0].read_text(encoding="utf-8")
+                ).get("image", {})
+                four_modalities_complete = all(
+                    image_info.get(key)
+                    for key in (
+                        "rgb",
+                        "depth_npy_meters",
+                        "surface_normal_npy",
+                        "segmentation"
+                    )
+                )
+            except (OSError, json.JSONDecodeError):
+                pass
+        sequence_meta["four_modalities_complete"] = four_modalities_complete
+        metadata.append(sequence_meta)
+
+    next_index = max(indices) + 1 if indices else 0
+    return next_index, metadata
 
 
 # ============================================================
@@ -657,6 +731,21 @@ def metric_depth_to_u16(depth_m: np.ndarray, max_depth_m: float) -> np.ndarray:
     return (d / max_depth_m * 65535.0).astype(np.uint16)
 
 
+def metric_depth_to_color_bgr(depth_m: np.ndarray, max_depth_m: float) -> np.ndarray:
+    """
+    生成仅用于人工 QA 的 8-bit 彩色深度预览图。
+    """
+    valid = np.isfinite(depth_m) & (depth_m > 0.0)
+    normalized = np.zeros(depth_m.shape, dtype=np.float32)
+    if np.any(valid):
+        clipped = np.clip(depth_m[valid].astype(np.float32), 0.0, max_depth_m)
+        normalized[valid] = clipped / float(max_depth_m)
+    gray = (normalized * 255.0).astype(np.uint8)
+    color = cv2.applyColorMap(gray, cv2.COLORMAP_TURBO)
+    color[~valid] = 0
+    return color
+
+
 def depth_to_disparity_u16(
     depth_m: np.ndarray,
     min_depth_m: float,
@@ -673,11 +762,36 @@ def depth_to_disparity_u16(
     if max_depth_m <= min_depth_m:
         raise ValueError("max_depth_m must be larger than min_depth_m")
 
+    normalized = depth_to_disparity_float32(
+        depth_m=depth_m,
+        min_depth_m=min_depth_m,
+        max_depth_m=max_depth_m,
+        valid_mask=valid_mask,
+        invalid_value=0.0
+    )
+    return (np.clip(normalized, 0.0, 1.0) * 65535.0).astype(np.uint16)
+
+
+def depth_to_disparity_float32(
+    depth_m: np.ndarray,
+    min_depth_m: float,
+    max_depth_m: float,
+    valid_mask: Optional[np.ndarray] = None,
+    invalid_value: float = 0.0
+) -> np.ndarray:
+    """
+    生成 [0, 1] float32 normalized disparity，近处更接近 1。
+    """
+    if min_depth_m <= 0.0:
+        raise ValueError("min_depth_m must be > 0")
+    if max_depth_m <= min_depth_m:
+        raise ValueError("max_depth_m must be larger than min_depth_m")
+
     valid = np.isfinite(depth_m) & (depth_m > 0.0)
     if valid_mask is not None:
         valid = valid & valid_mask.astype(bool)
 
-    out = np.zeros(depth_m.shape, dtype=np.uint16)
+    out = np.full(depth_m.shape, invalid_value, dtype=np.float32)
     if not np.any(valid):
         return out
 
@@ -687,11 +801,17 @@ def depth_to_disparity_u16(
     inv_max = 1.0 / min_depth_m
     normalized = (inv - inv_min) / (inv_max - inv_min)
     normalized = np.clip(normalized, 0.0, 1.0)
-    out[valid] = (normalized * 65535.0).astype(np.uint16)
+    out[valid] = normalized.astype(np.float32)
     return out
 
 
-def save_depth(depth_m: np.ndarray, npy_path: Path, vis_path: Path, max_depth_m: float) -> None:
+def save_depth(
+    depth_m: np.ndarray,
+    npy_path: Path,
+    vis_path: Path,
+    color_path: Path,
+    max_depth_m: float
+) -> None:
     """
     保存：
     1. 原始深度 npy，单位米；
@@ -700,17 +820,108 @@ def save_depth(depth_m: np.ndarray, npy_path: Path, vis_path: Path, max_depth_m:
     np.save(npy_path, depth_m.astype(np.float32))
 
     cv2.imwrite(str(vis_path), metric_depth_to_u16(depth_m, max_depth_m))
+    cv2.imwrite(str(color_path), metric_depth_to_color_bgr(depth_m, max_depth_m))
+
+
+def depth_to_surface_normals(
+    depth_m: np.ndarray,
+    fov_degrees: float,
+    max_depth_jump_m: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    从米制深度和相机内参计算相机坐标系表面法线。
+
+    npy 通道顺序为 (x-right, y-down, z-forward)，有效法线朝向相机；
+    PNG 使用常见的 RGB=(nx, ny, nz) 映射到 [0, 255]，无效像素为黑色。
+    """
+    height, width = depth_m.shape
+    fx = width / (2.0 * math.tan(math.radians(fov_degrees) / 2.0))
+    fy = fx
+    cx = (width - 1.0) / 2.0
+    cy = (height - 1.0) / 2.0
+
+    u, v = np.meshgrid(
+        np.arange(width, dtype=np.float32),
+        np.arange(height, dtype=np.float32)
+    )
+    z = depth_m.astype(np.float32)
+    points = np.stack(
+        (
+            (u - cx) * z / fx,
+            (v - cy) * z / fy,
+            z
+        ),
+        axis=-1
+    )
+
+    normals = np.zeros((height, width, 3), dtype=np.float32)
+    if height < 3 or width < 3:
+        return normals, np.zeros((height, width, 3), dtype=np.uint8)
+
+    du = points[1:-1, 2:, :] - points[1:-1, :-2, :]
+    dv = points[2:, 1:-1, :] - points[:-2, 1:-1, :]
+    interior = np.cross(du, dv)
+    norm = np.linalg.norm(interior, axis=2)
+
+    center_depth = z[1:-1, 1:-1]
+    neighbor_depths = (
+        z[1:-1, :-2],
+        z[1:-1, 2:],
+        z[:-2, 1:-1],
+        z[2:, 1:-1]
+    )
+    valid = np.isfinite(center_depth) & (center_depth > 0.0) & (norm > 1e-8)
+    for neighbor in neighbor_depths:
+        valid &= np.isfinite(neighbor) & (neighbor > 0.0)
+        valid &= np.abs(neighbor - center_depth) <= max_depth_jump_m
+
+    interior_normalized = np.zeros_like(interior, dtype=np.float32)
+    interior_normalized[valid] = (
+        interior[valid] / norm[valid, None]
+    ).astype(np.float32)
+
+    # 统一让法线朝向相机，避免同一平面出现随机正负方向。
+    center_points = points[1:-1, 1:-1, :]
+    away_from_camera = np.sum(interior_normalized * center_points, axis=2) > 0.0
+    interior_normalized[away_from_camera] *= -1.0
+    normals[1:-1, 1:-1, :] = interior_normalized
+
+    normal_rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    valid_full = np.linalg.norm(normals, axis=2) > 0.5
+    encoded = np.clip((normals + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
+    normal_rgb[valid_full] = encoded[valid_full]
+    return normals, normal_rgb
+
+
+def save_surface_normal(
+    depth_m: np.ndarray,
+    npy_path: Path,
+    png_path: Path,
+    fov_degrees: float,
+    max_depth_jump_m: float
+) -> np.ndarray:
+    normals, normal_rgb = depth_to_surface_normals(
+        depth_m=depth_m,
+        fov_degrees=fov_degrees,
+        max_depth_jump_m=max_depth_jump_m
+    )
+    np.save(npy_path, normals.astype(np.float32))
+    cv2.imwrite(str(png_path), cv2.cvtColor(normal_rgb, cv2.COLOR_RGB2BGR))
+    return normals
 
 
 def save_disparity(
     depth_m: np.ndarray,
-    path: Path,
+    npy_path: Path,
+    vis_path: Path,
     min_depth_m: float,
     max_depth_m: float
 ) -> None:
+    disparity = depth_to_disparity_float32(depth_m, min_depth_m, max_depth_m)
+    np.save(npy_path, disparity.astype(np.float32))
     cv2.imwrite(
-        str(path),
-        depth_to_disparity_u16(depth_m, min_depth_m, max_depth_m)
+        str(vis_path),
+        (np.clip(disparity, 0.0, 1.0) * 65535.0).astype(np.uint16)
     )
 
 
@@ -792,6 +1003,95 @@ def save_segmentation_raw(image: carla.Image, path: Path) -> np.ndarray:
     bgra = carla_image_to_bgra(image)
     cv2.imwrite(str(path), bgra[:, :, :3])
     return bgra
+
+
+def decode_semantic_segmentation(semantic_image: carla.Image) -> np.ndarray:
+    """
+    解码 semantic segmentation 为单通道 semantic id。
+
+    OpenHUTB/CARLA 常见 raw 格式是 BGRA 中 R 通道存 semantic id。
+    如果遇到调色板图像，保守返回信息量最大的低值通道，避免把全 0 通道当成语义图。
+    """
+    bgra = carla_image_to_bgra(semantic_image)
+    best_channel = 2
+    best_score = -1.0
+
+    for channel in range(3):
+        values = bgra[:, :, channel].astype(np.uint8)
+        unique = np.unique(values)
+        nonzero_ratio = float(np.mean(values != 0))
+        low_value_ratio = float(np.mean(values <= 40))
+        score = float(unique.size) + nonzero_ratio * 10.0 + low_value_ratio
+        if score > best_score:
+            best_channel = channel
+            best_score = score
+
+    return bgra[:, :, best_channel].astype(np.uint8)
+
+
+def save_semantic_id(semantic_id: np.ndarray, path: Path) -> None:
+    cv2.imwrite(str(path), semantic_id.astype(np.uint8))
+
+
+def colorize_semantic_id(semantic_id: np.ndarray) -> np.ndarray:
+    palette_bgr = {
+        0: (0, 0, 0),
+        1: (80, 80, 80),
+        2: (120, 120, 120),
+        3: (70, 70, 70),
+        4: (220, 20, 60),
+        6: (50, 234, 157),
+        7: (128, 64, 128),
+        8: (232, 35, 244),
+        9: (35, 142, 107),
+        10: (142, 0, 0),
+        11: (70, 0, 0),
+        12: (100, 60, 0),
+        14: (153, 153, 153),
+        18: (30, 170, 250),
+        20: (0, 220, 220),
+        21: (35, 100, 255),
+        22: (152, 251, 152),
+        24: (180, 130, 70),
+        25: (60, 20, 220),
+    }
+    out = np.zeros((*semantic_id.shape, 3), dtype=np.uint8)
+    for sem_id, color in palette_bgr.items():
+        out[semantic_id == sem_id] = color
+    unknown = ~np.isin(
+        semantic_id,
+        np.array(list(palette_bgr.keys()), dtype=np.uint8)
+    )
+    if np.any(unknown):
+        values = semantic_id[unknown].astype(np.uint16)
+        out[unknown, 0] = ((values * 37) % 255).astype(np.uint8)
+        out[unknown, 1] = ((values * 67) % 255).astype(np.uint8)
+        out[unknown, 2] = ((values * 97) % 255).astype(np.uint8)
+    return out
+
+
+def save_semantic_color(semantic_id: np.ndarray, path: Path) -> None:
+    cv2.imwrite(str(path), colorize_semantic_id(semantic_id))
+
+
+def save_instance_id(instance_id: np.ndarray, png_path: Path, npy_path: Path) -> None:
+    np.save(npy_path, instance_id.astype(np.uint16))
+    cv2.imwrite(str(png_path), instance_id.astype(np.uint16))
+
+
+def colorize_instance_id(instance_id: np.ndarray) -> np.ndarray:
+    values = instance_id.astype(np.uint32)
+    out = np.zeros((*instance_id.shape, 3), dtype=np.uint8)
+    nonzero = values != 0
+    out[:, :, 0] = ((values * 37 + 17) % 255).astype(np.uint8)
+    out[:, :, 1] = ((values * 67 + 29) % 255).astype(np.uint8)
+    out[:, :, 2] = ((values * 97 + 43) % 255).astype(np.uint8)
+    out[~nonzero] = 0
+    return out
+
+
+def save_instance_color(instance_id: np.ndarray, path: Path) -> None:
+    cv2.imwrite(str(path), colorize_instance_id(instance_id))
 
 
 def decode_instance_segmentation(instance_image: carla.Image) -> Tuple[np.ndarray, np.ndarray]:
@@ -1241,10 +1541,23 @@ def save_yolo_label(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def dataset_relative_path(path: Path, dataset_root: Path) -> str:
+    """
+    将文件路径写成相对数据集根目录的 POSIX 风格路径，方便跨机器移动数据集。
+    """
+    try:
+        return path.resolve().relative_to(dataset_root.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 def save_annotation_modalities(
+    dataset_root: Path,
     mask_dir: Path,
     object_depth_npy_dir: Path,
     object_depth_vis_dir: Path,
+    object_depth_color_dir: Path,
+    object_disparity_npy_dir: Path,
     object_disparity_vis_dir: Path,
     frame_stem: str,
     anns: List[Dict[str, Any]],
@@ -1310,25 +1623,37 @@ def save_annotation_modalities(
 
         depth_npy_path = object_depth_npy_dir / f"{frame_stem}_ann{ann['id']:03d}.npy"
         depth_vis_path = object_depth_vis_dir / f"{frame_stem}_ann{ann['id']:03d}.png"
+        depth_color_path = object_depth_color_dir / f"{frame_stem}_ann{ann['id']:03d}.png"
+        disparity_npy_path = object_disparity_npy_dir / f"{frame_stem}_ann{ann['id']:03d}.npy"
         disparity_path = object_disparity_vis_dir / f"{frame_stem}_ann{ann['id']:03d}.png"
 
         np.save(depth_npy_path, depth_crop_masked)
+        disparity_crop = depth_to_disparity_float32(
+            depth_crop,
+            min_disparity_depth_m,
+            max_disparity_depth_m,
+            valid_mask=mask_crop,
+            invalid_value=np.nan
+        )
+        np.save(disparity_npy_path, disparity_crop.astype(np.float32))
         cv2.imwrite(str(depth_vis_path), metric_depth_to_u16(depth_crop_masked, max_depth_vis_m))
+        cv2.imwrite(str(depth_color_path), metric_depth_to_color_bgr(depth_crop_masked, max_depth_vis_m))
         cv2.imwrite(
             str(disparity_path),
-            depth_to_disparity_u16(
-                depth_crop,
-                min_disparity_depth_m,
-                max_disparity_depth_m,
-                valid_mask=mask_crop
-            )
+            (np.nan_to_num(disparity_crop, nan=0.0) * 65535.0).astype(np.uint16)
         )
 
         ann["files"] = {
             "mask": str(mask_path),
             "object_depth_npy_meters": str(depth_npy_path),
             "object_depth_vis_16bit": str(depth_vis_path),
+            "object_depth_color": str(depth_color_path),
+            "object_disparity_npy": str(disparity_npy_path),
             "object_disparity_vis_16bit": str(disparity_path)
+        }
+        ann["files"] = {
+            key: dataset_relative_path(Path(value), dataset_root)
+            for key, value in ann["files"].items()
         }
 
 
@@ -1443,48 +1768,102 @@ def apply_weather(world: carla.World, preset_name: Optional[str]) -> str:
         print("[INFO] Keeping current simulator weather.")
         return "current"
 
-    presets = {
-        "ClearNoon": carla.WeatherParameters.ClearNoon,
-        "CloudyNoon": carla.WeatherParameters.CloudyNoon,
-        "WetNoon": carla.WeatherParameters.WetNoon,
-        "WetCloudyNoon": carla.WeatherParameters.WetCloudyNoon,
-        "SoftRainNoon": carla.WeatherParameters.SoftRainNoon,
-        "MidRainyNoon": carla.WeatherParameters.MidRainyNoon,
-        "HardRainNoon": carla.WeatherParameters.HardRainNoon,
-        "ClearSunset": carla.WeatherParameters.ClearSunset,
-        "CloudySunset": carla.WeatherParameters.CloudySunset,
-        "WetSunset": carla.WeatherParameters.WetSunset,
-        "SoftRainSunset": carla.WeatherParameters.SoftRainSunset,
-        "MidRainSunset": carla.WeatherParameters.MidRainSunset,
-        "HardRainSunset": carla.WeatherParameters.HardRainSunset
-    }
-
-    if preset_name not in presets:
-        print(f"[WARN] Unknown weather preset '{preset_name}', fallback to ClearNoon.")
-        preset_name = "ClearNoon"
-
-    weather = presets[preset_name]
+    weather = getattr(carla.WeatherParameters, preset_name, None)
+    if not isinstance(weather, carla.WeatherParameters):
+        raise RuntimeError(
+            f"当前 OpenHUTB/CARLA API 不支持天气预设：{preset_name}。"
+            "为避免目录标签与实际天气不一致，采集已停止。"
+        )
     world.set_weather(weather)
     print(f"[INFO] Applied weather: {preset_name}")
     return preset_name
 
 
 def get_weather_names() -> List[str]:
-    return [
-        "ClearNoon",
-        "CloudyNoon",
-        "WetNoon",
-        "WetCloudyNoon",
-        "SoftRainNoon",
-        "MidRainyNoon",
-        "HardRainNoon",
-        "ClearSunset",
-        "CloudySunset",
-        "WetSunset",
-        "SoftRainSunset",
-        "MidRainSunset",
-        "HardRainSunset"
-    ]
+    """动态读取当前 OpenHUTB/CARLA PythonAPI 实际提供的天气预设。"""
+    names = []
+    for name in dir(carla.WeatherParameters):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(carla.WeatherParameters, name)
+        except Exception:
+            continue
+        if isinstance(value, carla.WeatherParameters):
+            names.append(name)
+    return sorted(names)
+
+
+def freeze_dynamic_actors_for_weather_sweep(
+    vehicle_actors: List[carla.Actor],
+    walker_actors: List[carla.Actor],
+    walker_controllers: List[carla.Actor],
+    tm_port: int
+) -> List[Dict[str, Any]]:
+    """冻结车辆和行人，使不同天气 RGB 使用完全相同的场景几何。"""
+    snapshots: List[Dict[str, Any]] = []
+
+    for controller in walker_controllers:
+        try:
+            controller.stop()
+        except Exception:
+            pass
+
+    for actor in list(vehicle_actors) + list(walker_actors):
+        try:
+            snapshot = {
+                "actor": actor,
+                "transform": actor.get_transform(),
+                "is_vehicle": actor.type_id.startswith("vehicle.")
+            }
+            snapshots.append(snapshot)
+
+            if snapshot["is_vehicle"]:
+                actor.set_autopilot(False, tm_port)
+            actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+            actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+            actor.set_simulate_physics(False)
+            actor.set_transform(snapshot["transform"])
+        except Exception as exc:
+            print(f"[WARN] Failed to freeze actor {getattr(actor, 'id', '?')}: {exc}")
+
+    return snapshots
+
+
+def restore_frozen_actor_transforms(snapshots: List[Dict[str, Any]]) -> None:
+    for snapshot in snapshots:
+        try:
+            snapshot["actor"].set_transform(snapshot["transform"])
+        except Exception:
+            pass
+
+
+def resume_dynamic_actors_after_weather_sweep(
+    world: carla.World,
+    snapshots: List[Dict[str, Any]],
+    walker_controllers: List[carla.Actor],
+    tm_port: int
+) -> None:
+    """恢复车辆自动驾驶和行人控制器。"""
+    for snapshot in snapshots:
+        actor = snapshot["actor"]
+        try:
+            actor.set_transform(snapshot["transform"])
+            actor.set_simulate_physics(True)
+            if snapshot["is_vehicle"]:
+                actor.set_autopilot(True, tm_port)
+        except Exception as exc:
+            print(f"[WARN] Failed to resume actor {getattr(actor, 'id', '?')}: {exc}")
+
+    for controller in walker_controllers:
+        try:
+            controller.start()
+            destination = world.get_random_location_from_navigation()
+            if destination is not None:
+                controller.go_to_location(destination)
+            controller.set_max_speed(random.uniform(0.8, 1.6))
+        except Exception:
+            pass
 
 
 def setup_camera_blueprint(
@@ -1534,7 +1913,9 @@ def spawn_camera_set(
     enable_rgb_postprocess: bool
 ) -> Dict[str, carla.Sensor]:
     """
-    创建 RGB / depth / semantic / instance 四个相机。
+    创建 RGB / depth / semantic 三个原生相机。
+
+    Surface Normal 由同帧 depth 和相机内参离线计算，保证与 RGB 像素严格对齐。
 
     注意：
     这里不是 attach 到车辆，而是独立 spawn 到空中，
@@ -1545,8 +1926,7 @@ def spawn_camera_set(
     sensor_types = {
         "rgb": "sensor.camera.rgb",
         "depth": "sensor.camera.depth",
-        "semantic": "sensor.camera.semantic_segmentation",
-        "instance": "sensor.camera.instance_segmentation"
+        "semantic": "sensor.camera.semantic_segmentation"
     }
 
     sensors: Dict[str, carla.Sensor] = {}
@@ -1887,6 +2267,478 @@ def safe_get_optional_sensor(
         return None
 
 
+def weather_to_dict(weather) -> Dict[str, float]:
+    fields = [
+        "cloudiness",
+        "precipitation",
+        "precipitation_deposits",
+        "wind_intensity",
+        "sun_azimuth_angle",
+        "sun_altitude_angle",
+        "fog_density",
+        "fog_distance",
+        "fog_falloff",
+        "wetness",
+        "scattering_intensity",
+        "mie_scattering_scale",
+        "rayleigh_scattering_scale",
+        "dust_storm",
+    ]
+    out = {}
+    for field in fields:
+        if hasattr(weather, field):
+            out[field] = float(getattr(weather, field))
+    return out
+
+
+def number_stats(values: List[float]) -> Dict[str, Optional[float]]:
+    if len(values) == 0:
+        return {
+            "min": None,
+            "p25": None,
+            "median": None,
+            "p75": None,
+            "max": None,
+            "mean": None,
+        }
+    arr = np.array(values, dtype=np.float64)
+    return {
+        "min": float(np.min(arr)),
+        "p25": float(np.percentile(arr, 25)),
+        "median": float(np.median(arr)),
+        "p75": float(np.percentile(arr, 75)),
+        "max": float(np.max(arr)),
+        "mean": float(np.mean(arr)),
+    }
+
+
+def read_dataset_frame_records(out_root: Path) -> List[Dict[str, Any]]:
+    records = []
+    for ann_path in sorted(out_root.glob("**/seq_*/annotations/*.json")):
+        data = json.loads(ann_path.read_text(encoding="utf-8"))
+        image_info = data.get("image", {})
+        required_four_modalities = (
+            image_info.get("rgb"),
+            image_info.get("depth_npy_meters"),
+            image_info.get("surface_normal_npy"),
+            image_info.get("segmentation"),
+            image_info.get("yolo")
+        )
+        if not all(required_four_modalities):
+            # 保留旧季节 RGB，但不把缺少配对模态的旧帧混入四模态训练划分。
+            continue
+        records.append({
+            "annotation_path": ann_path,
+            "annotation_rel": dataset_relative_path(ann_path, out_root),
+            "data": data,
+            "rgb": str(data["image"]["rgb"]),
+            "yolo": str(data["image"]["yolo"]),
+        })
+    return records
+
+
+def split_frame_records(
+    records: List[Dict[str, Any]],
+    seed: int
+) -> Dict[str, List[Dict[str, Any]]]:
+    shuffled = list(records)
+    random.Random(seed).shuffle(shuffled)
+    n = len(shuffled)
+    if n == 0:
+        return {"train": [], "val": [], "test": []}
+    if n < 5:
+        return {"train": shuffled, "val": [], "test": []}
+
+    n_train = max(1, int(round(n * 0.70)))
+    n_val = max(1, int(round(n * 0.20)))
+    if n_train + n_val >= n:
+        n_val = max(1, n - n_train - 1)
+    n_test = n - n_train - n_val
+    if n_test <= 0:
+        n_test = 1
+        n_train = max(1, n_train - 1)
+
+    return {
+        "train": shuffled[:n_train],
+        "val": shuffled[n_train:n_train + n_val],
+        "test": shuffled[n_train + n_val:],
+    }
+
+
+def write_split_files(
+    out_root: Path,
+    splits: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, str]:
+    split_dir = out_root / "splits"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    rel_paths = {}
+    for name, records in splits.items():
+        split_path = split_dir / f"{name}.txt"
+        split_path.write_text(
+            "\n".join(record["rgb"] for record in records),
+            encoding="utf-8"
+        )
+        rel_paths[name] = dataset_relative_path(split_path, out_root)
+    return rel_paths
+
+
+def write_weather_split_files(
+    out_root: Path,
+    splits: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, Dict[str, str]]:
+    """为每个天气 RGB 生成与基础场景完全相同的 train/val/test 划分。"""
+    weather_names = sorted({
+        weather_name
+        for records in splits.values()
+        for record in records
+        for weather_name in record["data"].get("image", {}).get("rgb_by_weather", {})
+    })
+    result: Dict[str, Dict[str, str]] = {}
+    for weather_name in weather_names:
+        weather_dir = out_root / "splits_by_weather" / weather_name
+        weather_dir.mkdir(parents=True, exist_ok=True)
+        result[weather_name] = {}
+        for split_name, records in splits.items():
+            paths = []
+            for record in records:
+                path = record["data"].get("image", {}).get(
+                    "rgb_by_weather", {}
+                ).get(weather_name)
+                if path:
+                    paths.append(str(path))
+            split_path = weather_dir / f"{split_name}.txt"
+            split_path.write_text("\n".join(paths), encoding="utf-8")
+            result[weather_name][split_name] = dataset_relative_path(
+                split_path,
+                out_root
+            )
+    return result
+
+
+def write_yolo_dataset_files(
+    out_root: Path,
+    targets: List[TargetClass],
+    split_paths: Dict[str, str]
+) -> Dict[str, str]:
+    classes = sorted({int(t.class_id): t.name for t in targets}.items())
+    classes_path = out_root / "classes.txt"
+    classes_path.write_text(
+        "\n".join(name for _, name in classes),
+        encoding="utf-8"
+    )
+
+    yaml_lines = [
+        "path: .",
+        f"train: {split_paths.get('train', 'splits/train.txt')}",
+        f"val: {split_paths.get('val', 'splits/val.txt')}",
+        f"test: {split_paths.get('test', 'splits/test.txt')}",
+        "names:",
+    ]
+    for class_id, name in classes:
+        yaml_lines.append(f"  {class_id}: {name}")
+
+    data_yaml_path = out_root / "data.yaml"
+    data_yaml_path.write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
+    return {
+        "classes": dataset_relative_path(classes_path, out_root),
+        "data_yaml": dataset_relative_path(data_yaml_path, out_root),
+    }
+
+
+def build_coco_dict(
+    records: List[Dict[str, Any]],
+    targets: List[TargetClass],
+    dataset_name: str
+) -> Dict[str, Any]:
+    categories = [
+        {
+            "id": int(class_id) + 1,
+            "name": name,
+            "supercategory": "object",
+        }
+        for class_id, name in sorted({int(t.class_id): t.name for t in targets}.items())
+    ]
+    images = []
+    annotations = []
+    ann_id = 1
+    for image_id, record in enumerate(records, start=1):
+        data = record["data"]
+        image_info = data["image"]
+        images.append({
+            "id": image_id,
+            "file_name": image_info["rgb"],
+            "width": int(image_info["width"]),
+            "height": int(image_info["height"]),
+            "frame_id": int(data["frame_id"]),
+            "sequence": data["sequence"],
+        })
+        for ann in data.get("annotations", []):
+            x, y, w, h = [float(v) for v in ann["bbox_xywh"]]
+            annotations.append({
+                "id": ann_id,
+                "image_id": image_id,
+                "category_id": int(ann["class_id"]) + 1,
+                "bbox": [x, y, w, h],
+                "area": float(w * h),
+                "iscrowd": 0,
+                "track_id": ann.get("track_id"),
+                "carla_actor_id": ann.get("carla_actor_id"),
+                "annotation_source": ann.get("annotation_source"),
+            })
+            ann_id += 1
+    return {
+        "info": {
+            "description": dataset_name,
+            "version": "1.0",
+            "year": 2026,
+        },
+        "licenses": [],
+        "images": images,
+        "annotations": annotations,
+        "categories": categories,
+    }
+
+
+def write_coco_files(
+    out_root: Path,
+    records: List[Dict[str, Any]],
+    splits: Dict[str, List[Dict[str, Any]]],
+    targets: List[TargetClass],
+    dataset_name: str
+) -> Dict[str, str]:
+    coco_dir = out_root / "coco"
+    coco_dir.mkdir(parents=True, exist_ok=True)
+    paths = {}
+    all_path = coco_dir / "instances_all.json"
+    all_path.write_text(
+        json.dumps(build_coco_dict(records, targets, dataset_name), ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    paths["all"] = dataset_relative_path(all_path, out_root)
+    for split_name, split_records in splits.items():
+        split_path = coco_dir / f"instances_{split_name}.json"
+        split_path.write_text(
+            json.dumps(build_coco_dict(split_records, targets, dataset_name), ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        paths[split_name] = dataset_relative_path(split_path, out_root)
+    return paths
+
+
+def compute_dataset_quality_report(
+    out_root: Path,
+    records: List[Dict[str, Any]],
+    road_semantic_ids: List[int]
+) -> Dict[str, Any]:
+    frame_counts = []
+    bbox_w = []
+    bbox_h = []
+    bbox_area = []
+    bbox_max_side = []
+    bbox_area_ratio = []
+    depth_mean = []
+    road_ratios = []
+    rgb_small = []
+
+    for record in records:
+        data = record["data"]
+        anns = data.get("annotations", [])
+        frame_counts.append(len(anns))
+        width = float(data["image"]["width"])
+        height = float(data["image"]["height"])
+
+        rgb_path = out_root / data["image"]["rgb"]
+        rgb = cv2.imread(str(rgb_path), cv2.IMREAD_GRAYSCALE)
+        if rgb is not None:
+            rgb_small.append(cv2.resize(rgb, (64, 36)).astype(np.float32) / 255.0)
+
+        segmentation_rel = data["image"].get(
+            "segmentation",
+            data["image"].get("semantic_id")
+        )
+        semantic_id = None
+        if segmentation_rel is not None:
+            semantic_id = cv2.imread(
+                str(out_root / segmentation_rel),
+                cv2.IMREAD_UNCHANGED
+            )
+        if semantic_id is not None:
+            road_mask = np.isin(
+                semantic_id,
+                np.array(road_semantic_ids, dtype=np.uint8)
+            )
+            road_ratios.append(float(np.mean(road_mask)))
+
+        for ann in anns:
+            _, _, w, h = [float(v) for v in ann["bbox_xywh"]]
+            bbox_w.append(w)
+            bbox_h.append(h)
+            bbox_area.append(w * h)
+            bbox_max_side.append(max(w, h))
+            bbox_area_ratio.append((w * h) / (width * height))
+            d = ann.get("depth_m", {})
+            if d.get("mean") is not None:
+                depth_mean.append(float(d["mean"]))
+
+    adjacent_mad = []
+    for i in range(1, len(rgb_small)):
+        adjacent_mad.append(float(np.mean(np.abs(rgb_small[i] - rgb_small[i - 1]))))
+
+    empty_frames = int(sum(1 for count in frame_counts if count == 0))
+    small_96 = float(np.mean(np.array(bbox_max_side) <= 96.0)) if bbox_max_side else 0.0
+    small_48 = float(np.mean(np.array(bbox_max_side) <= 48.0)) if bbox_max_side else 0.0
+
+    return {
+        "frames": len(records),
+        "annotations": int(sum(frame_counts)),
+        "empty_frames": empty_frames,
+        "empty_frame_ratio": float(empty_frames / max(len(records), 1)),
+        "annotations_per_frame": number_stats([float(v) for v in frame_counts]),
+        "bbox_width_px": number_stats(bbox_w),
+        "bbox_height_px": number_stats(bbox_h),
+        "bbox_area_px": number_stats(bbox_area),
+        "bbox_max_side_px": number_stats(bbox_max_side),
+        "bbox_area_ratio": number_stats(bbox_area_ratio),
+        "depth_mean_m": number_stats(depth_mean),
+        "road_visible_ratio": number_stats(road_ratios),
+        "adjacent_rgb_mean_abs_diff_64x36": number_stats(adjacent_mad),
+        "small_target_ratio_max_side_le_96": small_96,
+        "very_small_target_ratio_max_side_le_48": small_48,
+    }
+
+
+def write_quality_report_files(
+    out_root: Path,
+    report: Dict[str, Any]
+) -> Dict[str, str]:
+    json_path = out_root / "quality_report.json"
+    md_path = out_root / "QUALITY_REPORT.md"
+    json_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    def format_metric(value: Optional[float], digits: int = 3) -> str:
+        return "n/a" if value is None else f"{float(value):.{digits}f}"
+
+    lines = [
+        "# Dataset Quality Report",
+        "",
+        f"- Frames: {report['frames']}",
+        f"- Annotations: {report['annotations']}",
+        f"- Empty frames: {report['empty_frames']} ({report['empty_frame_ratio']:.3f})",
+        f"- Small target ratio, max side <= 96 px: {report['small_target_ratio_max_side_le_96']:.3f}",
+        f"- Very small target ratio, max side <= 48 px: {report['very_small_target_ratio_max_side_le_48']:.3f}",
+        f"- Mean annotations/frame: {format_metric(report['annotations_per_frame']['mean'])}",
+        f"- Median bbox max side px: {format_metric(report['bbox_max_side_px']['median'])}",
+        f"- Mean road visible ratio: {format_metric(report['road_visible_ratio']['mean'])}",
+        f"- Mean adjacent RGB MAD: {format_metric(report['adjacent_rgb_mean_abs_diff_64x36']['mean'])}",
+        "",
+        "This report is generated automatically after collection.",
+    ]
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {
+        "quality_report_json": dataset_relative_path(json_path, out_root),
+        "quality_report_md": dataset_relative_path(md_path, out_root),
+    }
+
+
+def write_dataset_readme(
+    out_root: Path,
+    manifest: Dict[str, Any],
+    report: Dict[str, Any]
+) -> str:
+    path = out_root / "DATASET_README.md"
+    lines = [
+        "# OpenHUTB-CARLA UAV Small-Object Multimodal Dataset",
+        "",
+        "## Contents",
+        "",
+        "- `paired_weather/seq_XXXX/`: paired-weather sequences.",
+        "- `rgb/<preset>/`: multiple weather RGB images sharing the same geometry and labels.",
+        "- `surface_normal/png/`: camera-space surface-normal PNG.",
+        "- `surface_normal/npy/`: camera-space surface normals in float32, channel order x-right/y-down/z-forward.",
+        "- `segmentation/id/`: single-channel semantic id PNG.",
+        "- `segmentation/color/`: semantic color preview PNG.",
+        "- `depth/npy/`: metric depth arrays in meters, float32.",
+        "- `depth/vis_16bit/`: 16-bit depth visualization.",
+        "- `depth/color/`: 8-bit color depth preview for QA.",
+        "- `annotations/`: per-frame JSON annotations.",
+        "- `labels_yolo/`: YOLO detection labels.",
+        "- `splits/`: train/val/test image lists.",
+        "- `coco/`: COCO detection annotations.",
+        "",
+        "## Summary",
+        "",
+        f"- Frames: {report['frames']}",
+        f"- Annotations: {report['annotations']}",
+        f"- Image size: {manifest.get('image_size')}",
+        f"- Map: {manifest.get('map')}",
+        f"- FOV: {manifest.get('fov')}",
+        f"- FPS: {manifest.get('fps')}",
+        f"- Weather presets: {manifest.get('weather_policy', {}).get('weather_presets', [])}",
+        f"- Empty frame ratio: {report['empty_frame_ratio']:.3f}",
+        f"- Small target ratio max side <= 96 px: {report['small_target_ratio_max_side_le_96']:.3f}",
+        "",
+        "## Notes",
+        "",
+        "Paths inside JSON/CSV files are relative to the dataset root.",
+        "For each frame id, all `rgb/<preset>/<frame>.png` files share one frozen camera/actor geometry.",
+        "Depth, normals, segmentation and labels are stored once per frame and shared by all weather RGB variants.",
+        "Surface normals are derived from synchronized metric depth and camera intrinsics; invalid/discontinuity pixels are zero.",
+        "COCO category ids are one-based; YOLO class ids remain zero-based.",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return dataset_relative_path(path, out_root)
+
+
+def write_config_snapshot(out_root: Path, config_path: Optional[str]) -> Optional[str]:
+    if config_path is None or str(config_path).strip() == "":
+        return None
+    path = Path(config_path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.exists():
+        return None
+    out_path = out_root / "collection_config_snapshot.json"
+    out_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    return dataset_relative_path(out_path, out_root)
+
+
+def write_dataset_standard_artifacts(
+    out_root: Path,
+    args: argparse.Namespace,
+    manifest: Dict[str, Any]
+) -> Dict[str, Any]:
+    records = read_dataset_frame_records(out_root)
+    splits = split_frame_records(records, args.seed)
+    split_paths = write_split_files(out_root, splits)
+    weather_split_paths = write_weather_split_files(out_root, splits)
+    yolo_paths = write_yolo_dataset_files(out_root, args.target, split_paths)
+    coco_paths = write_coco_files(
+        out_root=out_root,
+        records=records,
+        splits=splits,
+        targets=args.target,
+        dataset_name=manifest["dataset"],
+    )
+    report = compute_dataset_quality_report(out_root, records, args.road_semantic_ids)
+    report_paths = write_quality_report_files(out_root, report)
+    readme_path = write_dataset_readme(out_root, manifest, report)
+    config_snapshot = write_config_snapshot(out_root, args.config)
+
+    return {
+        "splits": split_paths,
+        "splits_by_weather": weather_split_paths,
+        "yolo": yolo_paths,
+        "coco": coco_paths,
+        "quality": report_paths,
+        "readme": readme_path,
+        "config_snapshot": config_snapshot,
+        "split_counts": {name: len(items) for name, items in splits.items()},
+    }
+
+
 # ============================================================
 # 9. 主程序
 # ============================================================
@@ -1908,6 +2760,13 @@ def main() -> None:
             TargetClass("traffic_light", 3, [18])
         ]
 
+    if args.annotation_source != "actor":
+        print(
+            "[WARN] 四模态采集模式不使用实例分割传感器；"
+            "annotation_source 已强制改为 actor。"
+        )
+        args.annotation_source = "actor"
+
     if args.pitch_min is None:
         args.pitch_min = args.pitch
     if args.pitch_max is None:
@@ -1924,11 +2783,13 @@ def main() -> None:
     world = try_load_world(client, args.map)
 
     original_settings = world.get_settings()
+    original_weather = world.get_weather()
 
     fixed_delta_seconds = 1.0 / args.fps
 
     # 这些 actor 后面 cleanup 要销毁
     traffic_actors: List[carla.Actor] = []
+    vehicle_actors: List[carla.Actor] = []
     walker_actors: List[carla.Actor] = []
     walker_controllers: List[carla.Actor] = []
     sensors: Dict[str, carla.Sensor] = {}
@@ -1956,6 +2817,49 @@ def main() -> None:
         # 天气
         # ------------------------------------------------------------
         weather_names = get_weather_names()
+        collection_jobs: List[Dict[str, Any]] = []
+        existing_sequence_metadata: List[Dict[str, Any]] = []
+
+        if args.collect_all_weather_presets:
+            selected_weather_names = args.weather_presets or weather_names
+            unknown_weather_names = sorted(
+                set(selected_weather_names) - set(weather_names)
+            )
+            if unknown_weather_names:
+                raise RuntimeError(
+                    "当前 OpenHUTB/CARLA API 不支持这些天气预设："
+                    + ", ".join(unknown_weather_names)
+                )
+        else:
+            if args.keep_current_weather:
+                selected_weather_names = ["current"]
+            elif args.random_weather:
+                selected_weather_names = [random.choice(weather_names)]
+            else:
+                selected_weather_names = [args.weather]
+
+        paired_root = out_root / "paired_weather"
+        paired_root.mkdir(parents=True, exist_ok=True)
+        if args.preserve_existing_sequences:
+            _, legacy_metadata = existing_sequence_state(out_root)
+            start_index, paired_metadata = existing_sequence_state(paired_root)
+            existing_sequence_metadata = legacy_metadata + paired_metadata
+        else:
+            start_index = 0
+
+        for local_seq_idx in range(args.sequences):
+            collection_jobs.append({
+                "weather_variants": list(selected_weather_names),
+                "sequence_index": start_index + local_seq_idx,
+                "sequence_root": paired_root
+            })
+
+        print(
+            f"[INFO] Paired-weather sequences={len(collection_jobs)}, "
+            f"weather_variants={len(selected_weather_names)}, "
+            f"base_geometry_frames={len(collection_jobs) * args.frames}, "
+            f"rgb_images={len(collection_jobs) * args.frames * len(selected_weather_names)}"
+        )
 
         # ------------------------------------------------------------
         # 生成背景交通
@@ -1971,6 +2875,7 @@ def main() -> None:
             )
 
             traffic_actors.extend(vehicles)
+            vehicle_actors.extend(vehicles)
             walker_actors.extend(walkers)
             walker_controllers.extend(controllers)
 
@@ -2017,14 +2922,7 @@ def main() -> None:
             enable_rgb_postprocess=args.enable_rgb_postprocess
         )
 
-        optional_sensors = spawn_optional_sensors(
-            world=world,
-            sensor_tick=sensor_tick,
-            initial_transform=initial_transform,
-            enable_lidar=args.lidar
-        )
-
-        sensors = {**camera_sensors, **optional_sensors}
+        sensors = camera_sensors
 
         sync: Dict[str, SensorSync] = {
             name: SensorSync(name, sensor)
@@ -2074,19 +2972,16 @@ def main() -> None:
             },
             "annotation_policy": {
                 "source": args.annotation_source,
-                "actor_classes": "vehicle.* and walker.pedestrian.* use OpenHUTB/CARLA actor coordinates plus semantic/depth visibility filtering in hybrid/actor mode",
-                "instance_classes": "non-actor targets use instance segmentation in hybrid/instance mode",
-                "object_unit": "one actor bbox or one visible semantic_id + carla_instance_id per annotation",
-                "bbox": "visible actor pixels for vehicles/pedestrians, tight instance mask bbox for other targets",
-                "mask": "visible semantic/depth pixels for actor annotations, instance pixels for instance annotations",
+                "actor_classes": "vehicle.* and walker.pedestrian.* use OpenHUTB/CARLA actor coordinates plus semantic/depth visibility filtering",
+                "object_unit": "one OpenHUTB/CARLA actor bbox per annotation",
+                "bbox": "visible actor pixels filtered by metric depth",
                 "actor_visibility": {
                     "mode": args.actor_visibility_mode,
                     "min_actor_visible_px": args.min_actor_visible_px,
                     "min_actor_visible_ratio": args.min_actor_visible_ratio,
                     "actor_depth_margin": args.actor_depth_margin
                 },
-                "depth": "metric full-frame depth plus per-object masked depth crop",
-                "disparity": "normalized inverse-depth visualization"
+                "depth": "metric full-frame depth"
             },
             "target_actor_generation": {
                 "filters": args.target_actor_filter,
@@ -2111,24 +3006,23 @@ def main() -> None:
                 "hidden_environment_object_count": len(hidden_static_vehicle_ids)
             },
             "weather_policy": {
+                "collect_all_weather_presets": args.collect_all_weather_presets,
+                "weather_presets": list(selected_weather_names),
+                "directory_layout": "paired_weather/seq_XXXX/rgb/<preset>/frame.png",
+                "pairing_policy": "one geometry/label set shared by all weather RGB variants",
+                "weather_warmup_frames": args.weather_warmup_frames,
                 "keep_current_weather": args.keep_current_weather,
                 "random_weather": args.random_weather,
-                "configured_weather": args.weather
+                "configured_weather": args.weather,
+                "weather_parameters": weather_to_dict(world.get_weather())
             },
             "modalities": [
-                "rgb",
-                "depth_meters",
-                "normalized_disparity",
+                "rgb_visible",
+                "surface_normal",
                 "semantic_segmentation",
-                "instance_segmentation",
-                "object_masks",
-                "object_depth_crops",
-                "object_disparity_crops",
-                "imu_optional",
-                "gnss_optional",
-                "lidar_optional"
+                "metric_depth"
             ],
-            "sequences": []
+            "sequences": existing_sequence_metadata
         }
 
         # ------------------------------------------------------------
@@ -2137,19 +3031,22 @@ def main() -> None:
         total_drop_frames = 0
         total_saved_frames = 0
 
-        for seq_idx in range(args.sequences):
+        for job in collection_jobs:
+            seq_idx = int(job["sequence_index"])
             seq_name = f"seq_{seq_idx:04d}"
-            seq_dir = out_root / seq_name
+            seq_dir = Path(job["sequence_root"]) / seq_name
             dirs = make_dirs(seq_dir)
-
-            if args.keep_current_weather:
-                weather_name = "current"
-            elif args.random_weather:
-                weather_name = random.choice(weather_names)
-            else:
-                weather_name = args.weather
-
-            weather_name = apply_weather(world, weather_name)
+            weather_variants = [str(name) for name in job["weather_variants"]]
+            canonical_weather = (
+                "ClearNoon" if "ClearNoon" in weather_variants else weather_variants[0]
+            )
+            rgb_weather_dirs = {
+                weather_name: dirs["rgb"] / weather_name
+                for weather_name in weather_variants
+            }
+            for rgb_weather_dir in rgb_weather_dirs.values():
+                rgb_weather_dir.mkdir(parents=True, exist_ok=True)
+            sequence_id = dataset_relative_path(seq_dir, out_root)
 
             orbit_phase = random.uniform(0.0, 2.0 * math.pi)
             orbit_radius = random.uniform(args.radius_min, args.radius_max)
@@ -2160,8 +3057,20 @@ def main() -> None:
                 base_center_x, base_center_y = args.center_x, args.center_y
 
             seq_meta = {
-                "sequence": seq_name,
-                "weather": weather_name,
+                "sequence": sequence_id,
+                "sequence_name": seq_name,
+                "relative_sequence_path": sequence_id,
+                "paired_weather_rgb": True,
+                "four_modalities_complete": True,
+                "modalities": [
+                    "rgb_visible",
+                    "surface_normal",
+                    "semantic_segmentation",
+                    "metric_depth"
+                ],
+                "weather_variants": weather_variants,
+                "canonical_weather": canonical_weather,
+                "weather_warmup_frames": args.weather_warmup_frames,
                 "route": args.route,
                 "center_xy": [base_center_x, base_center_y],
                 "road_centered_camera": args.road_centered_camera,
@@ -2218,12 +3127,15 @@ def main() -> None:
                 index_writer.writerow([
                     "frame_id",
                     "carla_frame",
-                    "rgb",
+                    "rgb_canonical",
+                    "rgb_by_weather_json",
                     "depth_npy",
                     "depth_vis",
-                    "disparity_vis",
-                    "semantic",
-                    "instance",
+                    "depth_color",
+                    "surface_normal_npy",
+                    "surface_normal",
+                    "segmentation",
+                    "segmentation_color",
                     "num_annotations"
                 ])
 
@@ -2281,11 +3193,6 @@ def main() -> None:
                                 carla_frame,
                                 timeout=args.sensor_timeout
                             )
-                            instance_img = sync["instance"].get(
-                                carla_frame,
-                                timeout=args.sensor_timeout
-                            )
-
                         except TimeoutError as exc:
                             total_drop_frames += 1
                             print(
@@ -2355,65 +3262,49 @@ def main() -> None:
                     # ------------------------------------------------
                     stem = f"{frame_i:06d}"
 
-                    rgb_path = dirs["rgb"] / f"{stem}.png"
+                    rgb_paths_by_weather = {
+                        weather_name: rgb_weather_dirs[weather_name] / f"{stem}.png"
+                        for weather_name in weather_variants
+                    }
+                    rgb_path = rgb_paths_by_weather[canonical_weather]
                     depth_npy_path = dirs["depth_npy"] / f"{stem}.npy"
                     depth_vis_path = dirs["depth_vis"] / f"{stem}.png"
-                    disparity_vis_path = dirs["disparity_vis"] / f"{stem}.png"
-                    semantic_path = dirs["semantic"] / f"{stem}.png"
-                    instance_path = dirs["instance"] / f"{stem}.png"
+                    depth_color_path = dirs["depth_color"] / f"{stem}.png"
+                    surface_normal_npy_path = dirs["surface_normal_npy"] / f"{stem}.npy"
+                    surface_normal_path = dirs["surface_normal"] / f"{stem}.png"
+                    segmentation_path = dirs["segmentation"] / f"{stem}.png"
+                    segmentation_color_path = dirs["segmentation_color"] / f"{stem}.png"
                     yolo_path = dirs["yolo"] / f"{stem}.txt"
                     ann_path = dirs["ann"] / f"{stem}.json"
 
                     # ------------------------------------------------
-                    # 保存图像
+                    # 解码几何真值；每个基础帧只保存一份。
                     # ------------------------------------------------
-                    save_rgb(rgb_img, rgb_path)
-
-                    save_depth(
-                        depth_m,
-                        depth_npy_path,
-                        depth_vis_path,
-                        args.max_depth_vis
-                    )
-                    save_disparity(
-                        depth_m,
-                        disparity_vis_path,
-                        args.min_disparity_depth,
-                        args.max_disparity_depth
-                    )
-
-                    save_segmentation_raw(semantic_img, semantic_path)
-                    save_segmentation_raw(instance_img, instance_path)
+                    semantic_sensor_id = decode_semantic_segmentation(semantic_img)
 
                     # ------------------------------------------------
-                    # 生成标注
+                    # 冻结动态目标，对同一几何场景依次采集多天气 RGB。
                     # ------------------------------------------------
-                    if args.annotation_source == "hybrid":
-                        instance_targets = [
-                            target for target in args.target
-                            if not is_actor_target_class(target)
-                        ]
-                    elif args.annotation_source == "instance":
-                        instance_targets = args.target
-                    else:
-                        instance_targets = []
+                    frozen_snapshots: List[Dict[str, Any]] = []
+                    rgb_images_by_weather: Dict[str, carla.Image] = {}
+                    weather_capture_metadata: Dict[str, Dict[str, Any]] = {}
+                    traffic_lights_frozen = False
+                    try:
+                        frozen_snapshots = freeze_dynamic_actors_for_weather_sweep(
+                            vehicle_actors=vehicle_actors,
+                            walker_actors=walker_actors,
+                            walker_controllers=walker_controllers,
+                            tm_port=args.tm_port
+                        )
+                        if hasattr(world, "freeze_all_traffic_lights"):
+                            world.freeze_all_traffic_lights(True)
+                            traffic_lights_frozen = True
 
-                    instance_anns, semantic_id, instance_id = build_annotations_from_instance(
-                        instance_image=instance_img,
-                        depth_m=depth_m,
-                        targets=instance_targets,
-                        min_mask_px=args.min_mask_px,
-                        small_area_ratio=args.small_area_ratio,
-                        small_max_side_px=args.small_max_side_px,
-                        keep_all=args.keep_all
-                    )
-
-                    if args.annotation_source in ("actor", "hybrid"):
-                        actor_anns = build_annotations_from_actors(
+                        anns = build_annotations_from_actors(
                             world=world,
                             camera_transform=transform,
                             depth_m=depth_m,
-                            semantic_id=semantic_id,
+                            semantic_id=semantic_sensor_id,
                             targets=args.target,
                             width=args.width,
                             height=args.height_img,
@@ -2427,13 +3318,71 @@ def main() -> None:
                             actor_depth_margin=args.actor_depth_margin,
                             actor_visibility_mode=args.actor_visibility_mode
                         )
-                    else:
-                        actor_anns = []
 
-                    anns = combine_actor_and_instance_annotations(
-                        actor_anns=actor_anns,
-                        instance_anns=instance_anns
+                        for weather_variant in weather_variants:
+                            restore_frozen_actor_transforms(frozen_snapshots)
+                            applied_weather = apply_weather(world, weather_variant)
+                            if args.weather_warmup_frames > 0:
+                                for _ in range(args.weather_warmup_frames):
+                                    world.tick()
+                                for sensor_sync in sync.values():
+                                    sensor_sync.drain()
+
+                            restore_frozen_actor_transforms(frozen_snapshots)
+                            rgb_carla_frame = world.tick()
+                            weather_rgb_img = sync["rgb"].get(
+                                rgb_carla_frame,
+                                timeout=args.sensor_timeout
+                            )
+                            # 丢弃同一 tick 的几何相机输出，避免同步队列积压。
+                            sync["depth"].get(rgb_carla_frame, timeout=args.sensor_timeout)
+                            sync["semantic"].get(rgb_carla_frame, timeout=args.sensor_timeout)
+
+                            rgb_images_by_weather[weather_variant] = weather_rgb_img
+                            weather_capture_metadata[weather_variant] = {
+                                "applied_weather": applied_weather,
+                                "carla_frame": int(rgb_carla_frame),
+                                "timestamp": float(weather_rgb_img.timestamp),
+                                "weather_parameters": weather_to_dict(world.get_weather())
+                            }
+                    finally:
+                        if traffic_lights_frozen:
+                            try:
+                                world.freeze_all_traffic_lights(False)
+                            except Exception:
+                                pass
+                        resume_dynamic_actors_after_weather_sweep(
+                            world=world,
+                            snapshots=frozen_snapshots,
+                            walker_controllers=walker_controllers,
+                            tm_port=args.tm_port
+                        )
+
+                    if len(rgb_images_by_weather) != len(weather_variants):
+                        raise RuntimeError(
+                            f"frame {frame_i} 多天气 RGB 不完整："
+                            f"{len(rgb_images_by_weather)}/{len(weather_variants)}"
+                        )
+
+                    for weather_variant, weather_rgb_img in rgb_images_by_weather.items():
+                        save_rgb(weather_rgb_img, rgb_paths_by_weather[weather_variant])
+
+                    save_depth(
+                        depth_m,
+                        depth_npy_path,
+                        depth_vis_path,
+                        depth_color_path,
+                        args.max_depth_vis
                     )
+                    save_surface_normal(
+                        depth_m=depth_m,
+                        npy_path=surface_normal_npy_path,
+                        png_path=surface_normal_path,
+                        fov_degrees=args.fov,
+                        max_depth_jump_m=args.normal_max_depth_jump_m
+                    )
+                    save_semantic_id(semantic_sensor_id, segmentation_path)
+                    save_semantic_color(semantic_sensor_id, segmentation_color_path)
 
                     save_yolo_label(
                         yolo_path,
@@ -2442,93 +3391,37 @@ def main() -> None:
                         height=args.height_img
                     )
 
-                    save_annotation_modalities(
-                        mask_dir=dirs["mask"],
-                        object_depth_npy_dir=dirs["object_depth_npy"],
-                        object_depth_vis_dir=dirs["object_depth_vis"],
-                        object_disparity_vis_dir=dirs["object_disparity_vis"],
-                        frame_stem=stem,
-                        anns=anns,
-                        semantic_id=semantic_id,
-                        instance_id=instance_id,
-                        depth_m=depth_m,
-                        max_depth_vis_m=args.max_depth_vis,
-                        min_disparity_depth_m=args.min_disparity_depth,
-                        max_disparity_depth_m=args.max_disparity_depth
-                    )
-
-                    # ------------------------------------------------
-                    # 可选传感器
-                    # ------------------------------------------------
-                    imu_data = None
-                    gnss_data = None
-                    lidar_path = None
-
-                    imu = safe_get_optional_sensor(
-                        sync,
-                        "imu",
-                        carla_frame,
-                        timeout=1.0
-                    )
-
-                    if imu is not None:
-                        imu_data = {
-                            "accelerometer": vector_to_dict(imu.accelerometer),
-                            "gyroscope": vector_to_dict(imu.gyroscope),
-                            "compass": float(imu.compass)
-                        }
-
-                    gnss = safe_get_optional_sensor(
-                        sync,
-                        "gnss",
-                        carla_frame,
-                        timeout=1.0
-                    )
-
-                    if gnss is not None:
-                        gnss_data = {
-                            "latitude": float(gnss.latitude),
-                            "longitude": float(gnss.longitude),
-                            "altitude": float(gnss.altitude)
-                        }
-
-                    lidar = safe_get_optional_sensor(
-                        sync,
-                        "lidar",
-                        carla_frame,
-                        timeout=1.0
-                    )
-
-                    if lidar is not None:
-                        lidar_path = dirs["lidar"] / f"{stem}.npy"
-                        save_lidar_np(lidar, lidar_path)
-
                     # ------------------------------------------------
                     # JSON 标注
                     # ------------------------------------------------
                     ann_json = {
-                        "sequence": seq_name,
+                        "sequence": sequence_id,
                         "frame_id": frame_i,
                         "carla_frame": int(carla_frame),
-                        "timestamp": float(rgb_img.timestamp),
+                        "timestamp": float(depth_img.timestamp),
+                        "paired_weather_rgb": True,
+                        "canonical_weather": canonical_weather,
+                        "weather_variants": weather_variants,
+                        "weather_captures": weather_capture_metadata,
                         "camera_transform": transform_to_dict(transform),
                         "image": {
                             "width": args.width,
                             "height": args.height_img,
-                            "rgb": str(rgb_path),
-                            "depth_npy_meters": str(depth_npy_path),
-                            "depth_vis_16bit": str(depth_vis_path),
-                            "disparity_vis_16bit": str(disparity_vis_path),
-                            "semantic": str(semantic_path),
-                            "instance": str(instance_path),
-                            "yolo": str(yolo_path),
-                            "lidar": None if lidar_path is None else str(lidar_path)
+                            "rgb": dataset_relative_path(rgb_path, out_root),
+                            "rgb_by_weather": {
+                                weather_variant: dataset_relative_path(path, out_root)
+                                for weather_variant, path in rgb_paths_by_weather.items()
+                            },
+                            "depth_npy_meters": dataset_relative_path(depth_npy_path, out_root),
+                            "depth_vis_16bit": dataset_relative_path(depth_vis_path, out_root),
+                            "depth_color": dataset_relative_path(depth_color_path, out_root),
+                            "surface_normal_npy": dataset_relative_path(surface_normal_npy_path, out_root),
+                            "surface_normal": dataset_relative_path(surface_normal_path, out_root),
+                            "segmentation": dataset_relative_path(segmentation_path, out_root),
+                            "segmentation_color": dataset_relative_path(segmentation_color_path, out_root),
+                            "yolo": dataset_relative_path(yolo_path, out_root)
                         },
-                        "annotations": anns,
-                        "sensors": {
-                            "imu": imu_data,
-                            "gnss": gnss_data
-                        }
+                        "annotations": anns
                     }
 
                     ann_path.write_text(
@@ -2578,22 +3471,31 @@ def main() -> None:
                     index_writer.writerow([
                         frame_i,
                         int(carla_frame),
-                        str(rgb_path),
-                        str(depth_npy_path),
-                        str(depth_vis_path),
-                        str(disparity_vis_path),
-                        str(semantic_path),
-                        str(instance_path),
+                        dataset_relative_path(rgb_path, out_root),
+                        json.dumps(
+                            {
+                                weather_variant: dataset_relative_path(path, out_root)
+                                for weather_variant, path in rgb_paths_by_weather.items()
+                            },
+                            ensure_ascii=False
+                        ),
+                        dataset_relative_path(depth_npy_path, out_root),
+                        dataset_relative_path(depth_vis_path, out_root),
+                        dataset_relative_path(depth_color_path, out_root),
+                        dataset_relative_path(surface_normal_npy_path, out_root),
+                        dataset_relative_path(surface_normal_path, out_root),
+                        dataset_relative_path(segmentation_path, out_root),
+                        dataset_relative_path(segmentation_color_path, out_root),
                         len(anns)
                     ])
                     total_saved_frames += 1
 
                     if frame_i % 20 == 0:
                         print(
-                            f"[{seq_name}] frame={frame_i:06d}, "
+                            f"[{sequence_id}] frame={frame_i:06d}, "
                             f"carla_frame={carla_frame}, "
                             f"anns={len(anns)}, "
-                            f"weather={weather_name}"
+                            f"weather_rgb={len(weather_variants)}"
                         )
 
                 track_counts = Counter()
@@ -2650,8 +3552,20 @@ def main() -> None:
                 "或调整 height/radius/pitch 让相机真正对准路面。"
             )
 
-        manifest["total_drop_frames"] = total_drop_frames
-        manifest["total_saved_frames"] = total_saved_frames
+        all_frame_records = read_dataset_frame_records(out_root)
+        total_weather_rgb_images = sum(
+            len(record["data"].get("image", {}).get("rgb_by_weather", {}))
+            for record in all_frame_records
+        )
+        manifest["total_drop_frames_this_run"] = total_drop_frames
+        manifest["total_saved_frames_this_run"] = total_saved_frames
+        manifest["total_saved_frames"] = len(all_frame_records)
+        manifest["total_weather_rgb_images"] = total_weather_rgb_images
+        manifest["standard_artifacts"] = write_dataset_standard_artifacts(
+            out_root=out_root,
+            args=args,
+            manifest=manifest
+        )
 
         (out_root / "dataset_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -2659,8 +3573,10 @@ def main() -> None:
         )
 
         print(f"[DONE] Dataset saved to: {out_root.resolve()}")
-        print(f"[DONE] total_saved_frames={total_saved_frames}")
-        print(f"[DONE] total_drop_frames={total_drop_frames}")
+        print(f"[DONE] total_saved_frames_this_run={total_saved_frames}")
+        print(f"[DONE] total_saved_frames_all_sequences={len(all_frame_records)}")
+        print(f"[DONE] total_weather_rgb_images={total_weather_rgb_images}")
+        print(f"[DONE] total_drop_frames_this_run={total_drop_frames}")
 
     finally:
         # ------------------------------------------------------------
@@ -2707,6 +3623,12 @@ def main() -> None:
                 pass
 
         restore_static_map_vehicles(world, hidden_static_vehicle_ids)
+
+        try:
+            world.set_weather(original_weather)
+            print("[INFO] Restored simulator weather used before collection.")
+        except Exception as exc:
+            print(f"[WARN] Failed to restore original weather: {exc}")
 
         try:
             world.apply_settings(original_settings)

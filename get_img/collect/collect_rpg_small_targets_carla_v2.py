@@ -540,6 +540,25 @@ def parse_args() -> argparse.Namespace:
     # 深度图可视化最大距离
     parser.add_argument("--max-depth-vis", type=float, default=250.0)
     parser.add_argument(
+        "--enable-lidar",
+        dest="enable_lidar",
+        action="store_true",
+        default=True,
+        help="在 Depth 模态中同时采集 LiDAR 原始点云和相机对齐的稀疏深度图。"
+    )
+    parser.add_argument(
+        "--disable-lidar",
+        dest="enable_lidar",
+        action="store_false",
+        help="关闭 LiDAR 深度采集。"
+    )
+    parser.add_argument("--lidar-channels", type=int, default=64)
+    parser.add_argument("--lidar-range", type=float, default=250.0)
+    parser.add_argument("--lidar-points-per-second", type=int, default=400000)
+    parser.add_argument("--lidar-rotation-frequency", type=float, default=20.0)
+    parser.add_argument("--lidar-upper-fov", type=float, default=30.0)
+    parser.add_argument("--lidar-lower-fov", type=float, default=-30.0)
+    parser.add_argument(
         "--normal-max-depth-jump-m",
         type=float,
         default=5.0,
@@ -608,6 +627,10 @@ def make_dirs(seq_dir: Path) -> Dict[str, Path]:
         "depth_npy": seq_dir / "depth" / "npy",
         "depth_vis": seq_dir / "depth" / "vis_16bit",
         "depth_color": seq_dir / "depth" / "color",
+        "lidar_points": seq_dir / "depth" / "lidar" / "points",
+        "lidar_projected_npy": seq_dir / "depth" / "lidar" / "projected_npy",
+        "lidar_projected_vis": seq_dir / "depth" / "lidar" / "projected_vis_16bit",
+        "lidar_projected_color": seq_dir / "depth" / "lidar" / "projected_color",
         "surface_normal": seq_dir / "surface_normal" / "png",
         "surface_normal_npy": seq_dir / "surface_normal" / "npy",
         "segmentation": seq_dir / "segmentation" / "id",
@@ -680,7 +703,86 @@ def carla_image_to_bgra(image: carla.Image) -> np.ndarray:
     return arr.reshape((image.height, image.width, 4))
 
 
-def save_rgb(image: carla.Image, path: Path) -> np.ndarray:
+def apply_depth_fog_rgb_effect(
+    bgr: np.ndarray,
+    depth_m: Optional[np.ndarray]
+) -> np.ndarray:
+    """按相机深度生成高空仍可见的浓雾，保持几何和标注像素对齐。"""
+    if depth_m is None or depth_m.shape != bgr.shape[:2]:
+        return bgr.copy()
+    depth = np.nan_to_num(
+        depth_m.astype(np.float32),
+        nan=250.0,
+        posinf=250.0,
+        neginf=0.0
+    )
+    distance = np.maximum(depth - 20.0, 0.0)
+    fog_alpha = 0.08 + 0.78 * (1.0 - np.exp(-distance / 85.0))
+    fog_alpha = np.clip(fog_alpha, 0.08, 0.84)[:, :, None]
+    fog_color = np.array([205.0, 210.0, 214.0], dtype=np.float32)
+    image = bgr.astype(np.float32)
+    image = image * (1.0 - fog_alpha) + fog_color * fog_alpha
+    return np.clip(image, 0.0, 255.0).astype(np.uint8)
+
+
+def apply_snow_rgb_effect(
+    bgr: np.ndarray,
+    depth_m: Optional[np.ndarray],
+    random_seed: int
+) -> np.ndarray:
+    """生成确定性的阴雪、远距离雪雾和飘雪效果，不伪造地面积雪。"""
+    image = bgr.astype(np.float32)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    image = image * 0.78 + gray[:, :, None] * 0.22
+
+    haze_alpha = np.full(gray.shape, 0.06, dtype=np.float32)
+    if depth_m is not None and depth_m.shape == gray.shape:
+        distance_haze = np.clip((depth_m.astype(np.float32) - 30.0) / 180.0, 0.0, 1.0)
+        haze_alpha += 0.20 * distance_haze
+    snow_haze_color = np.array([238.0, 241.0, 245.0], dtype=np.float32)
+    image = image * (1.0 - haze_alpha[:, :, None]) + snow_haze_color * haze_alpha[:, :, None]
+
+    height, width = gray.shape
+    rng = np.random.default_rng(int(random_seed))
+    flake_mask = np.zeros((height, width), dtype=np.float32)
+    small_count = max(120, (height * width) // 3500)
+    large_count = max(20, (height * width) // 30000)
+
+    for _ in range(small_count):
+        x = int(rng.integers(0, width))
+        y = int(rng.integers(0, height))
+        radius = int(rng.integers(1, 3))
+        strength = float(rng.uniform(0.35, 0.75))
+        cv2.circle(flake_mask, (x, y), radius, strength, -1, cv2.LINE_AA)
+
+    for _ in range(large_count):
+        x = int(rng.integers(0, width))
+        y = int(rng.integers(0, height))
+        length = int(rng.integers(4, 10))
+        thickness = int(rng.integers(1, 3))
+        strength = float(rng.uniform(0.55, 0.95))
+        cv2.line(
+            flake_mask,
+            (x, y),
+            (min(width - 1, x + length // 3), min(height - 1, y + length)),
+            strength,
+            thickness,
+            cv2.LINE_AA
+        )
+
+    flake_mask = cv2.GaussianBlur(flake_mask, (3, 3), 0.55)
+    flake_mask = np.clip(flake_mask, 0.0, 0.92)[:, :, None]
+    image = image * (1.0 - flake_mask) + 255.0 * flake_mask
+    return np.clip(image, 0.0, 255.0).astype(np.uint8)
+
+
+def save_rgb(
+    image: carla.Image,
+    path: Path,
+    weather_name: Optional[str] = None,
+    depth_m: Optional[np.ndarray] = None,
+    random_seed: int = 0
+) -> np.ndarray:
     """
     保存 RGB 相机图像。
 
@@ -688,7 +790,11 @@ def save_rgb(image: carla.Image, path: Path) -> np.ndarray:
     OpenCV 保存需要 BGR。
     """
     bgra = carla_image_to_bgra(image)
-    bgr = bgra[:, :, :3]
+    bgr = bgra[:, :, :3].copy()
+    if weather_name == "FoggyNoon":
+        bgr = apply_depth_fog_rgb_effect(bgr, depth_m)
+    elif weather_name == "SnowNoon":
+        bgr = apply_snow_rgb_effect(bgr, depth_m, random_seed)
     cv2.imwrite(str(path), bgr)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return rgb
@@ -1758,6 +1864,77 @@ def restore_static_map_vehicles(world: carla.World, env_ids: List[int]) -> None:
         print(f"[WARN] Failed to restore static map vehicles: {exc}")
 
 
+WEATHER_PARAMETER_FIELDS = (
+    "cloudiness",
+    "precipitation",
+    "precipitation_deposits",
+    "wind_intensity",
+    "sun_azimuth_angle",
+    "sun_altitude_angle",
+    "fog_density",
+    "fog_distance",
+    "fog_falloff",
+    "wetness",
+    "scattering_intensity",
+    "mie_scattering_scale",
+    "rayleigh_scattering_scale",
+    "dust_storm",
+)
+
+CUSTOM_WEATHER_PRESETS = {
+    "FoggyNoon": {
+        "base": "CloudyNoon",
+        "overrides": {
+            "cloudiness": 80.0,
+            "fog_density": 72.0,
+            "fog_distance": 0.0,
+            "fog_falloff": 0.0,
+            "precipitation": 0.0,
+            "precipitation_deposits": 0.0,
+            "wetness": 10.0,
+            "wind_intensity": 8.0,
+        },
+        "rendering": "custom_carla_weather_plus_depth_based_rgb_fog",
+    },
+    "SnowNoon": {
+        "base": "CloudyNoon",
+        "overrides": {
+            "cloudiness": 100.0,
+            "fog_density": 28.0,
+            "fog_distance": 8.0,
+            "fog_falloff": 0.55,
+            "precipitation": 0.0,
+            "precipitation_deposits": 0.0,
+            "wetness": 0.0,
+            "wind_intensity": 35.0,
+            "sun_altitude_angle": 35.0,
+        },
+        "rendering": "custom_carla_weather_plus_deterministic_rgb_snowfall",
+        "surface_snow_accumulation": False,
+    },
+}
+
+
+def clone_weather_parameters(base_name: str, overrides: Dict[str, float]):
+    base = getattr(carla.WeatherParameters, base_name)
+    weather = carla.WeatherParameters()
+    for field in WEATHER_PARAMETER_FIELDS:
+        if hasattr(base, field) and hasattr(weather, field):
+            setattr(weather, field, float(getattr(base, field)))
+    for field, value in overrides.items():
+        if not hasattr(weather, field):
+            raise RuntimeError(f"当前天气 API 不支持参数：{field}")
+        setattr(weather, field, float(value))
+    return weather
+
+
+def weather_rendering_metadata(preset_name: str) -> Dict[str, Any]:
+    custom = CUSTOM_WEATHER_PRESETS.get(preset_name)
+    if custom is None:
+        return {"rendering": "native_carla_weather_preset"}
+    return dict(custom)
+
+
 def apply_weather(world: carla.World, preset_name: Optional[str]) -> str:
     if preset_name is None:
         print("[INFO] Keeping current simulator weather.")
@@ -1768,7 +1945,11 @@ def apply_weather(world: carla.World, preset_name: Optional[str]) -> str:
         print("[INFO] Keeping current simulator weather.")
         return "current"
 
-    weather = getattr(carla.WeatherParameters, preset_name, None)
+    custom = CUSTOM_WEATHER_PRESETS.get(preset_name)
+    if custom is not None:
+        weather = clone_weather_parameters(custom["base"], custom["overrides"])
+    else:
+        weather = getattr(carla.WeatherParameters, preset_name, None)
     if not isinstance(weather, carla.WeatherParameters):
         raise RuntimeError(
             f"当前 OpenHUTB/CARLA API 不支持天气预设：{preset_name}。"
@@ -1791,7 +1972,8 @@ def get_weather_names() -> List[str]:
             continue
         if isinstance(value, carla.WeatherParameters):
             names.append(name)
-    return sorted(names)
+    names.extend(CUSTOM_WEATHER_PRESETS)
+    return sorted(set(names))
 
 
 def freeze_dynamic_actors_for_weather_sweep(
@@ -1948,53 +2130,41 @@ def spawn_camera_set(
     return sensors
 
 
-def spawn_optional_sensors(
+def spawn_lidar_sensor(
     world: carla.World,
     sensor_tick: float,
     initial_transform: carla.Transform,
-    enable_lidar: bool
-) -> Dict[str, carla.Sensor]:
-    """
-    创建 IMU / GNSS / 可选 LiDAR。
-    """
-    blueprint_library = world.get_blueprint_library()
-    sensors: Dict[str, carla.Sensor] = {}
-
-    try:
-        imu_bp = blueprint_library.find("sensor.other.imu")
-        if imu_bp.has_attribute("sensor_tick"):
-            imu_bp.set_attribute("sensor_tick", str(sensor_tick))
-        sensors["imu"] = world.spawn_actor(imu_bp, initial_transform)
-        print("[INFO] Spawning sensor: imu")
-    except Exception as exc:
-        print(f"[WARN] IMU unavailable: {exc}")
-
-    try:
-        gnss_bp = blueprint_library.find("sensor.other.gnss")
-        if gnss_bp.has_attribute("sensor_tick"):
-            gnss_bp.set_attribute("sensor_tick", str(sensor_tick))
-        sensors["gnss"] = world.spawn_actor(gnss_bp, initial_transform)
-        print("[INFO] Spawning sensor: gnss")
-    except Exception as exc:
-        print(f"[WARN] GNSS unavailable: {exc}")
-
-    if enable_lidar:
-        try:
-            lidar_bp = blueprint_library.find("sensor.lidar.ray_cast")
-            lidar_bp.set_attribute("channels", "32")
-            lidar_bp.set_attribute("range", "150")
-            lidar_bp.set_attribute("points_per_second", "56000")
-            lidar_bp.set_attribute("rotation_frequency", "20")
-
-            if lidar_bp.has_attribute("sensor_tick"):
-                lidar_bp.set_attribute("sensor_tick", str(sensor_tick))
-
-            sensors["lidar"] = world.spawn_actor(lidar_bp, initial_transform)
-            print("[INFO] Spawning sensor: lidar")
-        except Exception as exc:
-            print(f"[WARN] LiDAR unavailable: {exc}")
-
-    return sensors
+    channels: int,
+    lidar_range: float,
+    points_per_second: int,
+    rotation_frequency: float,
+    upper_fov: float,
+    lower_fov: float
+) -> carla.Sensor:
+    """创建与相机共位姿的机械式 LiDAR，作为 Depth 模态的稀疏深度来源。"""
+    bp = world.get_blueprint_library().find("sensor.lidar.ray_cast")
+    attributes = {
+        "channels": channels,
+        "range": lidar_range,
+        "points_per_second": points_per_second,
+        "rotation_frequency": rotation_frequency,
+        "upper_fov": upper_fov,
+        "lower_fov": lower_fov,
+        "sensor_tick": sensor_tick,
+        "dropoff_general_rate": 0.0,
+        "dropoff_intensity_limit": 0.0,
+        "dropoff_zero_intensity": 0.0,
+        "noise_stddev": 0.0
+    }
+    for name, value in attributes.items():
+        if bp.has_attribute(name):
+            bp.set_attribute(name, str(value))
+    sensor = world.spawn_actor(bp, initial_transform)
+    print(
+        "[INFO] Spawning sensor: lidar -> sensor.lidar.ray_cast "
+        f"channels={channels}, range={lidar_range}, pps={points_per_second}"
+    )
+    return sensor
 
 
 def set_all_sensor_transform(
@@ -2245,10 +2415,119 @@ def spawn_target_actors(
     return actors
 
 
-def save_lidar_np(lidar_data, path: Path) -> None:
-    arr = np.frombuffer(lidar_data.raw_data, dtype=np.float32)
-    arr = arr.reshape((-1, 4))
-    np.save(path, arr)
+def decode_lidar_points(lidar_data) -> np.ndarray:
+    """返回 LiDAR 局部坐标点云 [x-forward, y-right, z-up, intensity]。"""
+    points = np.frombuffer(lidar_data.raw_data, dtype=np.float32)
+    return points.reshape((-1, 4)).copy()
+
+
+def project_lidar_to_camera_depth(
+    lidar_points: np.ndarray,
+    lidar_to_camera: np.ndarray,
+    width: int,
+    height: int,
+    fov_degrees: float,
+    max_range_m: float
+) -> np.ndarray:
+    """将共位姿 LiDAR 点云投影为与 RGB 对齐的稀疏米制深度图。"""
+    sparse_depth = np.zeros((height, width), dtype=np.float32)
+    if lidar_points.size == 0:
+        return sparse_depth
+
+    lidar_xyz = lidar_points[:, :3].astype(np.float64)
+    homogeneous = np.column_stack(
+        (lidar_xyz, np.ones(lidar_xyz.shape[0], dtype=np.float64))
+    )
+    xyz = (lidar_to_camera @ homogeneous.T).T[:, :3].astype(np.float32)
+    forward = xyz[:, 0]
+    ranges = np.linalg.norm(xyz, axis=1)
+    valid = (
+        np.isfinite(xyz).all(axis=1)
+        & np.isfinite(ranges)
+        & (forward > 0.01)
+        & (ranges > 0.0)
+        & (ranges <= max_range_m)
+    )
+    if not np.any(valid):
+        return sparse_depth
+
+    xyz = xyz[valid]
+    forward = xyz[:, 0]
+    ranges = ranges[valid]
+    focal = width / (2.0 * math.tan(math.radians(fov_degrees) / 2.0))
+    cx = (width - 1.0) / 2.0
+    cy = (height - 1.0) / 2.0
+    u = cx + focal * (xyz[:, 1] / forward)
+    v = cy - focal * (xyz[:, 2] / forward)
+    px = np.rint(u).astype(np.int32)
+    py = np.rint(v).astype(np.int32)
+    inside = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+    if not np.any(inside):
+        return sparse_depth
+
+    px = px[inside]
+    py = py[inside]
+    camera_forward_depth = forward[inside]
+    flat_indices = py * width + px
+    flat_depth = np.full(height * width, np.inf, dtype=np.float32)
+    np.minimum.at(flat_depth, flat_indices, camera_forward_depth)
+    finite = np.isfinite(flat_depth)
+    flat_depth[~finite] = 0.0
+    return flat_depth.reshape((height, width))
+
+
+def save_lidar_depth(
+    lidar_data,
+    camera_data,
+    points_path: Path,
+    projected_npy_path: Path,
+    projected_vis_path: Path,
+    projected_color_path: Path,
+    width: int,
+    height: int,
+    fov_degrees: float,
+    max_range_m: float,
+    max_depth_vis_m: float
+) -> Dict[str, Any]:
+    points = decode_lidar_points(lidar_data)
+    lidar_to_world = np.asarray(
+        lidar_data.transform.get_matrix(),
+        dtype=np.float64
+    )
+    world_to_camera = np.asarray(
+        camera_data.transform.get_inverse_matrix(),
+        dtype=np.float64
+    )
+    lidar_to_camera = world_to_camera @ lidar_to_world
+    sparse_depth = project_lidar_to_camera_depth(
+        lidar_points=points,
+        lidar_to_camera=lidar_to_camera,
+        width=width,
+        height=height,
+        fov_degrees=fov_degrees,
+        max_range_m=max_range_m
+    )
+    np.save(points_path, points.astype(np.float32))
+    np.save(projected_npy_path, sparse_depth.astype(np.float32))
+    cv2.imwrite(
+        str(projected_vis_path),
+        metric_depth_to_u16(sparse_depth, max_depth_vis_m)
+    )
+    cv2.imwrite(
+        str(projected_color_path),
+        metric_depth_to_color_bgr(sparse_depth, max_depth_vis_m)
+    )
+    valid_projected = sparse_depth > 0.0
+    return {
+        "point_count": int(points.shape[0]),
+        "projected_pixel_count": int(np.count_nonzero(valid_projected)),
+        "projected_pixel_ratio": float(np.mean(valid_projected)),
+        "coordinate_system": "x-forward, y-right, z-up",
+        "projected_depth_value": "camera-forward depth in meters",
+        "lidar_measurement_transform": transform_to_dict(lidar_data.transform),
+        "camera_measurement_transform": transform_to_dict(camera_data.transform),
+        "lidar_to_camera_matrix": lidar_to_camera.tolist()
+    }
 
 
 def safe_get_optional_sensor(
@@ -2268,24 +2547,8 @@ def safe_get_optional_sensor(
 
 
 def weather_to_dict(weather) -> Dict[str, float]:
-    fields = [
-        "cloudiness",
-        "precipitation",
-        "precipitation_deposits",
-        "wind_intensity",
-        "sun_azimuth_angle",
-        "sun_altitude_angle",
-        "fog_density",
-        "fog_distance",
-        "fog_falloff",
-        "wetness",
-        "scattering_intensity",
-        "mie_scattering_scale",
-        "rayleigh_scattering_scale",
-        "dust_storm",
-    ]
     out = {}
-    for field in fields:
+    for field in WEATHER_PARAMETER_FIELDS:
         if hasattr(weather, field):
             out[field] = float(getattr(weather, field))
     return out
@@ -2663,6 +2926,10 @@ def write_dataset_readme(
         "- `depth/npy/`: metric depth arrays in meters, float32.",
         "- `depth/vis_16bit/`: 16-bit depth visualization.",
         "- `depth/color/`: 8-bit color depth preview for QA.",
+        "- `depth/lidar/points/`: raw LiDAR point clouds in float32 Nx4 (x, y, z, intensity).",
+        "- `depth/lidar/projected_npy/`: RGB-aligned sparse LiDAR camera-forward depth maps in meters, float32; zero means no return.",
+        "- `depth/lidar/projected_vis_16bit/`: 16-bit sparse LiDAR depth visualization.",
+        "- `depth/lidar/projected_color/`: 8-bit sparse LiDAR depth preview for QA.",
         "- `annotations/`: per-frame JSON annotations.",
         "- `labels_yolo/`: YOLO detection labels.",
         "- `splits/`: train/val/test image lists.",
@@ -2685,6 +2952,9 @@ def write_dataset_readme(
         "Paths inside JSON/CSV files are relative to the dataset root.",
         "For each frame id, all `rgb/<preset>/<frame>.png` files share one frozen camera/actor geometry.",
         "Depth, normals, segmentation and labels are stored once per frame and shared by all weather RGB variants.",
+        "Camera depth is dense; LiDAR depth is sparse and is projected into RGB pixel coordinates using a co-located sensor transform.",
+        "FoggyNoon combines custom CARLA fog parameters with depth-based RGB visibility attenuation for high-altitude views.",
+        "SnowNoon combines an overcast CARLA setup with deterministic depth haze and falling-snow RGB rendering; it does not simulate snow accumulation on surfaces.",
         "Surface normals are derived from synchronized metric depth and camera intrinsics; invalid/discontinuity pixels are zero.",
         "COCO category ids are one-based; YOLO class ids remain zero-based.",
     ]
@@ -2922,7 +3192,19 @@ def main() -> None:
             enable_rgb_postprocess=args.enable_rgb_postprocess
         )
 
-        sensors = camera_sensors
+        sensors = dict(camera_sensors)
+        if args.enable_lidar:
+            sensors["lidar"] = spawn_lidar_sensor(
+                world=world,
+                sensor_tick=sensor_tick,
+                initial_transform=initial_transform,
+                channels=args.lidar_channels,
+                lidar_range=args.lidar_range,
+                points_per_second=args.lidar_points_per_second,
+                rotation_frequency=args.lidar_rotation_frequency,
+                upper_fov=args.lidar_upper_fov,
+                lower_fov=args.lidar_lower_fov
+            )
 
         sync: Dict[str, SensorSync] = {
             name: SensorSync(name, sensor)
@@ -3008,6 +3290,10 @@ def main() -> None:
             "weather_policy": {
                 "collect_all_weather_presets": args.collect_all_weather_presets,
                 "weather_presets": list(selected_weather_names),
+                "weather_rendering_definitions": {
+                    name: weather_rendering_metadata(name)
+                    for name in selected_weather_names
+                },
                 "directory_layout": "paired_weather/seq_XXXX/rgb/<preset>/frame.png",
                 "pairing_policy": "one geometry/label set shared by all weather RGB variants",
                 "weather_warmup_frames": args.weather_warmup_frames,
@@ -3022,6 +3308,26 @@ def main() -> None:
                 "semantic_segmentation",
                 "metric_depth"
             ],
+            "depth_sources": {
+                "camera_depth": {
+                    "dense": True,
+                    "unit": "meters",
+                    "aligned_to_rgb": True
+                },
+                "lidar": {
+                    "enabled": args.enable_lidar,
+                    "dense": False,
+                    "projected_value": "camera-forward depth",
+                    "unit": "meters",
+                    "channels": args.lidar_channels,
+                    "range_m": args.lidar_range,
+                    "points_per_second": args.lidar_points_per_second,
+                    "rotation_frequency_hz": args.lidar_rotation_frequency,
+                    "upper_fov_degrees": args.lidar_upper_fov,
+                    "lower_fov_degrees": args.lidar_lower_fov,
+                    "aligned_to_rgb": True
+                }
+            },
             "sequences": existing_sequence_metadata
         }
 
@@ -3132,6 +3438,10 @@ def main() -> None:
                     "depth_npy",
                     "depth_vis",
                     "depth_color",
+                    "lidar_points",
+                    "lidar_projected_npy",
+                    "lidar_projected_vis",
+                    "lidar_projected_color",
                     "surface_normal_npy",
                     "surface_normal",
                     "segmentation",
@@ -3180,6 +3490,7 @@ def main() -> None:
                         set_all_sensor_transform(sensors, transform)
                         carla_frame = world.tick()
 
+                        lidar_data = None
                         try:
                             rgb_img = sync["rgb"].get(
                                 carla_frame,
@@ -3193,6 +3504,11 @@ def main() -> None:
                                 carla_frame,
                                 timeout=args.sensor_timeout
                             )
+                            if args.enable_lidar:
+                                lidar_data = sync["lidar"].get(
+                                    carla_frame,
+                                    timeout=args.sensor_timeout
+                                )
                         except TimeoutError as exc:
                             total_drop_frames += 1
                             print(
@@ -3270,6 +3586,10 @@ def main() -> None:
                     depth_npy_path = dirs["depth_npy"] / f"{stem}.npy"
                     depth_vis_path = dirs["depth_vis"] / f"{stem}.png"
                     depth_color_path = dirs["depth_color"] / f"{stem}.png"
+                    lidar_points_path = dirs["lidar_points"] / f"{stem}.npy"
+                    lidar_projected_npy_path = dirs["lidar_projected_npy"] / f"{stem}.npy"
+                    lidar_projected_vis_path = dirs["lidar_projected_vis"] / f"{stem}.png"
+                    lidar_projected_color_path = dirs["lidar_projected_color"] / f"{stem}.png"
                     surface_normal_npy_path = dirs["surface_normal_npy"] / f"{stem}.npy"
                     surface_normal_path = dirs["surface_normal"] / f"{stem}.png"
                     segmentation_path = dirs["segmentation"] / f"{stem}.png"
@@ -3337,13 +3657,19 @@ def main() -> None:
                             # 丢弃同一 tick 的几何相机输出，避免同步队列积压。
                             sync["depth"].get(rgb_carla_frame, timeout=args.sensor_timeout)
                             sync["semantic"].get(rgb_carla_frame, timeout=args.sensor_timeout)
+                            if args.enable_lidar:
+                                sync["lidar"].get(
+                                    rgb_carla_frame,
+                                    timeout=args.sensor_timeout
+                                )
 
                             rgb_images_by_weather[weather_variant] = weather_rgb_img
                             weather_capture_metadata[weather_variant] = {
                                 "applied_weather": applied_weather,
                                 "carla_frame": int(rgb_carla_frame),
                                 "timestamp": float(weather_rgb_img.timestamp),
-                                "weather_parameters": weather_to_dict(world.get_weather())
+                                "weather_parameters": weather_to_dict(world.get_weather()),
+                                "rendering": weather_rendering_metadata(weather_variant)
                             }
                     finally:
                         if traffic_lights_frozen:
@@ -3365,7 +3691,13 @@ def main() -> None:
                         )
 
                     for weather_variant, weather_rgb_img in rgb_images_by_weather.items():
-                        save_rgb(weather_rgb_img, rgb_paths_by_weather[weather_variant])
+                        save_rgb(
+                            weather_rgb_img,
+                            rgb_paths_by_weather[weather_variant],
+                            weather_name=weather_variant,
+                            depth_m=depth_m,
+                            random_seed=(args.seed * 1000003 + seq_idx * 1009 + frame_i)
+                        )
 
                     save_depth(
                         depth_m,
@@ -3374,6 +3706,25 @@ def main() -> None:
                         depth_color_path,
                         args.max_depth_vis
                     )
+                    lidar_metadata = None
+                    if args.enable_lidar:
+                        if lidar_data is None:
+                            raise RuntimeError(
+                                f"frame {frame_i} 缺少同步 LiDAR 数据。"
+                            )
+                        lidar_metadata = save_lidar_depth(
+                            lidar_data=lidar_data,
+                            camera_data=depth_img,
+                            points_path=lidar_points_path,
+                            projected_npy_path=lidar_projected_npy_path,
+                            projected_vis_path=lidar_projected_vis_path,
+                            projected_color_path=lidar_projected_color_path,
+                            width=args.width,
+                            height=args.height_img,
+                            fov_degrees=args.fov,
+                            max_range_m=args.lidar_range,
+                            max_depth_vis_m=args.max_depth_vis
+                        )
                     save_surface_normal(
                         depth_m=depth_m,
                         npy_path=surface_normal_npy_path,
@@ -3415,12 +3766,29 @@ def main() -> None:
                             "depth_npy_meters": dataset_relative_path(depth_npy_path, out_root),
                             "depth_vis_16bit": dataset_relative_path(depth_vis_path, out_root),
                             "depth_color": dataset_relative_path(depth_color_path, out_root),
+                            "lidar_points": (
+                                dataset_relative_path(lidar_points_path, out_root)
+                                if args.enable_lidar else None
+                            ),
+                            "lidar_projected_npy_meters": (
+                                dataset_relative_path(lidar_projected_npy_path, out_root)
+                                if args.enable_lidar else None
+                            ),
+                            "lidar_projected_vis_16bit": (
+                                dataset_relative_path(lidar_projected_vis_path, out_root)
+                                if args.enable_lidar else None
+                            ),
+                            "lidar_projected_color": (
+                                dataset_relative_path(lidar_projected_color_path, out_root)
+                                if args.enable_lidar else None
+                            ),
                             "surface_normal_npy": dataset_relative_path(surface_normal_npy_path, out_root),
                             "surface_normal": dataset_relative_path(surface_normal_path, out_root),
                             "segmentation": dataset_relative_path(segmentation_path, out_root),
                             "segmentation_color": dataset_relative_path(segmentation_color_path, out_root),
                             "yolo": dataset_relative_path(yolo_path, out_root)
                         },
+                        "lidar": lidar_metadata,
                         "annotations": anns
                     }
 
@@ -3482,6 +3850,10 @@ def main() -> None:
                         dataset_relative_path(depth_npy_path, out_root),
                         dataset_relative_path(depth_vis_path, out_root),
                         dataset_relative_path(depth_color_path, out_root),
+                        dataset_relative_path(lidar_points_path, out_root) if args.enable_lidar else "",
+                        dataset_relative_path(lidar_projected_npy_path, out_root) if args.enable_lidar else "",
+                        dataset_relative_path(lidar_projected_vis_path, out_root) if args.enable_lidar else "",
+                        dataset_relative_path(lidar_projected_color_path, out_root) if args.enable_lidar else "",
                         dataset_relative_path(surface_normal_npy_path, out_root),
                         dataset_relative_path(surface_normal_path, out_root),
                         dataset_relative_path(segmentation_path, out_root),

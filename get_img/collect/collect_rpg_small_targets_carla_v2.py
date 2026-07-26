@@ -169,6 +169,24 @@ class TargetClass:
     semantic_ids: List[int]
 
 
+TARGET_BACKGROUND_ID = 0
+TARGET_VEHICLE_ID = 1
+TARGET_PEDESTRIAN_ID = 2
+TARGET_IGNORE_ID = 255
+TWO_WHEEL_TYPE_TOKENS = (
+    "bike",
+    "bicycle",
+    "motorcycle",
+    "vespa",
+    "yamaha",
+    "harley",
+    "kawasaki",
+    "diamondback",
+    "gazelle",
+    "crossbike",
+)
+
+
 # ============================================================
 # 3. 稳健传感器同步队列
 # ============================================================
@@ -467,6 +485,12 @@ def parse_args() -> argparse.Namespace:
         default=0.75,
         help="随机路线下优先围绕行人选择道路上方相机位姿的概率。"
     )
+    parser.add_argument(
+        "--vehicle-centered-camera-probability",
+        type=float,
+        default=0.0,
+        help="随机路线下优先围绕四轮车辆选择道路上方相机位姿的概率。"
+    )
     parser.add_argument("--max-camera-pose-retries", type=int, default=120)
     parser.add_argument("--min-near-depth-m", type=float, default=5.0)
     parser.add_argument("--max-near-depth-ratio", type=float, default=0.05)
@@ -593,6 +617,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-all", action="store_true")
     parser.add_argument("--min-actor-visible-px", type=int, default=24)
     parser.add_argument("--min-actor-visible-ratio", type=float, default=0.50)
+    parser.add_argument(
+        "--min-vehicle-projected-fill-ratio",
+        type=float,
+        default=0.25,
+        help="车辆可见像素占 3D 投影框的最低比例。"
+    )
+    parser.add_argument(
+        "--min-pedestrian-projected-fill-ratio",
+        type=float,
+        default=0.40,
+        help="行人可见像素占 3D 投影框的最低比例。"
+    )
+    parser.add_argument(
+        "--min-vehicle-visible-equivalent-side-px",
+        type=float,
+        default=40.0,
+        help="目标语义图中车辆可见掩码的最小等效边长。"
+    )
+    parser.add_argument(
+        "--min-pedestrian-visible-equivalent-side-px",
+        type=float,
+        default=48.0,
+        help="目标语义图中行人可见掩码的最小等效边长。"
+    )
+    parser.add_argument(
+        "--min-largest-component-ratio",
+        type=float,
+        default=0.75,
+        help="最大连通区域占实例可见像素的最低比例，用于过滤严重遮挡。"
+    )
     parser.add_argument("--actor-depth-margin", type=float, default=5.0)
     parser.add_argument(
         "--actor-visibility-mode",
@@ -1275,7 +1329,7 @@ def decode_instance_segmentation(instance_image: carla.Image) -> Tuple[np.ndarra
 
     CARLA instance segmentation 中：
     - R 通道通常为 semantic id；
-    - G/B 通道编码 instance id。
+    - G/B 通道编码 instance id，其中 G 是低 8 位，B 是高 8 位。
 
     raw_data 是 BGRA：
     - B = bgra[:, :, 0]
@@ -1291,11 +1345,238 @@ def decode_instance_segmentation(instance_image: carla.Image) -> Tuple[np.ndarra
     semantic_id = bgra[:, :, 2].astype(np.uint8)
 
     instance_id = (
-        bgra[:, :, 1].astype(np.uint16) * 256
-        + bgra[:, :, 0].astype(np.uint16)
+        bgra[:, :, 0].astype(np.uint16) * 256
+        + bgra[:, :, 1].astype(np.uint16)
     )
 
     return semantic_id, instance_id
+
+
+def largest_connected_component(
+    mask: np.ndarray,
+) -> Tuple[np.ndarray, float]:
+    mask_u8 = mask.astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_u8,
+        connectivity=8,
+    )
+    total = int(np.count_nonzero(mask_u8))
+    if count <= 1 or total == 0:
+        return mask.astype(bool), 1.0 if total else 0.0
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    component_index = int(np.argmax(areas)) + 1
+    component_area = int(areas[component_index - 1])
+    return labels == component_index, component_area / float(total)
+
+
+def filled_external_instance_contour(mask: np.ndarray) -> Optional[np.ndarray]:
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    perimeter = cv2.arcLength(contour, True)
+    contour = cv2.approxPolyDP(
+        contour,
+        max(0.5, 0.001 * perimeter),
+        True,
+    )
+    filled = np.zeros(mask.shape, dtype=np.uint8)
+    cv2.fillPoly(filled, [contour], 1)
+    return filled.astype(bool)
+
+
+def bbox_intersection_over_instance(
+    instance_bbox: Tuple[int, int, int, int],
+    actor_bbox: List[int],
+) -> float:
+    ix1, iy1, ix2, iy2 = instance_bbox
+    ax1, ay1, ax2, ay2 = (int(value) for value in actor_bbox)
+    x1 = max(ix1, ax1)
+    y1 = max(iy1, ay1)
+    x2 = min(ix2, ax2)
+    y2 = min(iy2, ay2)
+    intersection = max(0, x2 - x1 + 1) * max(0, y2 - y1 + 1)
+    instance_area = max(1, ix2 - ix1 + 1) * max(1, iy2 - iy1 + 1)
+    return intersection / float(instance_area)
+
+
+def target_mask_id_for_class(class_name: str) -> int:
+    normalized = class_name.lower()
+    if normalized in ("vehicle", "car", "truck", "bus"):
+        return TARGET_VEHICLE_ID
+    if normalized in ("pedestrian", "person", "walker"):
+        return TARGET_PEDESTRIAN_ID
+    raise ValueError(f"总采集器只发布 vehicle/pedestrian，收到：{class_name}")
+
+
+def build_optimized_target_semantic_mask(
+    instance_image: carla.Image,
+    actor_annotations: List[Dict[str, Any]],
+    min_mask_px: int,
+    min_vehicle_projected_fill_ratio: float,
+    min_pedestrian_projected_fill_ratio: float,
+    min_vehicle_visible_equivalent_side_px: float,
+    min_pedestrian_visible_equivalent_side_px: float,
+    min_largest_component_ratio: float,
+) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    _, instance_id = decode_instance_segmentation(instance_image)
+    target_mask = np.full(
+        instance_id.shape,
+        TARGET_BACKGROUND_ID,
+        dtype=np.uint8,
+    )
+    instances: List[Dict[str, Any]] = []
+
+    # OpenHUTB 中动态 Actor 的 semantic tag 不稳定。Actor 提供类别和 3D
+    # 投影框，instance 相机按完全相同的 Actor ID 提供目标轮廓。
+    all_candidates: List[Dict[str, Any]] = []
+    image_height, image_width = instance_id.shape
+    for annotation in actor_annotations:
+        x1, y1, x2, y2 = (
+            int(value)
+            for value in annotation.get(
+                "projected_bbox_xyxy",
+                annotation["bbox_xyxy"],
+            )
+        )
+        x1 = min(max(0, x1), image_width - 1)
+        x2 = min(max(0, x2), image_width - 1)
+        y1 = min(max(0, y1), image_height - 1)
+        y2 = min(max(0, y2), image_height - 1)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        instance_crop = instance_id[y1:y2 + 1, x1:x2 + 1]
+        projected_area = int(instance_crop.size)
+        mask_id = target_mask_id_for_class(str(annotation["class_name"]))
+        class_fill_threshold = (
+            min_vehicle_projected_fill_ratio
+            if mask_id == TARGET_VEHICLE_ID
+            else min_pedestrian_projected_fill_ratio
+        )
+
+        for value in np.unique(instance_crop):
+            current_id = int(value)
+            if current_id != int(annotation["carla_actor_id"]):
+                continue
+            instance_pixels = instance_crop == value
+            instance_px = int(np.count_nonzero(instance_pixels))
+            if instance_px < min_mask_px:
+                continue
+            consistent_pixels = instance_pixels
+            overlap_px = int(np.count_nonzero(consistent_pixels))
+            if overlap_px < min_mask_px:
+                continue
+            depth_consistency = 1.0
+            projected_fill_ratio = overlap_px / float(projected_area)
+            if projected_fill_ratio < class_fill_threshold:
+                continue
+
+            raw_mask = np.zeros(instance_id.shape, dtype=bool)
+            raw_mask[y1:y2 + 1, x1:x2 + 1] = consistent_pixels
+            score = (
+                102.0
+                + math.log1p(overlap_px) / 10.0
+                + min(projected_fill_ratio, 0.5)
+            )
+            all_candidates.append({
+                "score": score,
+                "instance_id": current_id,
+                "annotation": annotation,
+                "mask_id": mask_id,
+                "raw_mask": raw_mask,
+                "depth_consistency": depth_consistency,
+                "projected_fill_ratio": projected_fill_ratio,
+                "mask_source": "exact_actor_instance",
+            })
+
+    used_actor_ids = set()
+    used_instance_ids = set()
+    for candidate in sorted(
+        all_candidates,
+        key=lambda item: float(item["score"]),
+        reverse=True,
+    ):
+        annotation = candidate["annotation"]
+        actor_id = int(annotation["carla_actor_id"])
+        current_id = int(candidate["instance_id"])
+        if actor_id in used_actor_ids or current_id in used_instance_ids:
+            continue
+        used_actor_ids.add(actor_id)
+        used_instance_ids.add(current_id)
+
+        raw_mask = candidate["raw_mask"]
+        target_mask[raw_mask] = np.uint8(TARGET_IGNORE_ID)
+        component, component_ratio = largest_connected_component(raw_mask)
+        equivalent_side = float(np.sqrt(float(np.count_nonzero(component))))
+        mask_id = int(candidate["mask_id"])
+        visible_threshold = (
+            min_vehicle_visible_equivalent_side_px
+            if mask_id == TARGET_VEHICLE_ID
+            else min_pedestrian_visible_equivalent_side_px
+        )
+        trainable = bool(
+            equivalent_side >= visible_threshold
+            and component_ratio >= min_largest_component_ratio
+        )
+        if mask_id == TARGET_PEDESTRIAN_ID:
+            training_mask = component
+        else:
+            training_mask = filled_external_instance_contour(component)
+            if training_mask is None:
+                trainable = False
+                training_mask = component
+        ys, xs = np.where(training_mask)
+        if xs.size == 0:
+            trainable = False
+            bbox = [0, 0, 0, 0]
+        else:
+            bbox = [
+                int(xs.min()),
+                int(ys.min()),
+                int(xs.max()),
+                int(ys.max()),
+            ]
+        if trainable:
+            target_mask[training_mask] = np.uint8(mask_id)
+
+        instances.append({
+            "class_id": int(annotation["class_id"]),
+            "class_name": str(annotation["class_name"]),
+            "mask_id": mask_id,
+            "carla_instance_id": current_id,
+            "carla_actor_id": actor_id,
+            "actor_type_id": annotation.get("actor_type_id"),
+            "bbox_xyxy": bbox,
+            "projected_bbox_xyxy": list(
+                annotation.get(
+                    "projected_bbox_xyxy",
+                    annotation["bbox_xyxy"],
+                )
+            ),
+            "raw_visible_area_px": int(np.count_nonzero(raw_mask)),
+            "training_area_px": int(np.count_nonzero(training_mask)),
+            "visible_equivalent_side_px": equivalent_side,
+            "largest_component_ratio": float(component_ratio),
+            "depth_consistency": float(candidate["depth_consistency"]),
+            "projected_fill_ratio": float(candidate["projected_fill_ratio"]),
+            "mask_source": str(candidate["mask_source"]),
+            "trainable": trainable,
+        })
+
+    return target_mask, instances
+
+
+def colorize_target_semantic_mask(mask: np.ndarray) -> np.ndarray:
+    color = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    color[mask == TARGET_VEHICLE_ID] = (0, 220, 0)
+    color[mask == TARGET_PEDESTRIAN_ID] = (255, 80, 20)
+    color[mask == TARGET_IGNORE_ID] = (255, 0, 255)
+    return color
 
 
 # ============================================================
@@ -1452,7 +1733,7 @@ def target_for_actor(
     """
     type_id = actor.type_id
 
-    if type_id.startswith("vehicle."):
+    if type_id.startswith("vehicle.") and not is_two_wheel_type(type_id):
         for target in targets:
             if target.name.lower() in ("vehicle", "car", "truck", "bus"):
                 return target
@@ -1513,6 +1794,8 @@ def build_annotations_from_actors(
     keep_all: bool,
     min_actor_visible_px: int,
     min_actor_visible_ratio: float,
+    min_vehicle_projected_fill_ratio: float,
+    min_pedestrian_projected_fill_ratio: float,
     actor_depth_margin: float,
     actor_visibility_mode: str
 ) -> List[Dict[str, Any]]:
@@ -1604,9 +1887,15 @@ def build_annotations_from_actors(
         visible_px = int(np.count_nonzero(visible_mask))
         visible_ratio_projected = visible_px / float(projected_area)
 
+        class_fill_ratio = (
+            min_vehicle_projected_fill_ratio
+            if target.name.lower() in ("vehicle", "car", "truck", "bus")
+            else min_pedestrian_projected_fill_ratio
+        )
+        visible_ratio_threshold = class_fill_ratio
         if (
             visible_px < min_actor_visible_px
-            or visible_ratio_projected < min_actor_visible_ratio
+            or visible_ratio_projected < visible_ratio_threshold
         ):
             continue
 
@@ -2164,7 +2453,7 @@ def spawn_camera_set(
     enable_rgb_postprocess: bool
 ) -> Dict[str, carla.Sensor]:
     """
-    创建 RGB / depth / semantic 三个原生相机。
+    创建 RGB / depth / semantic 三个公开模态相机，以及内部实例标注相机。
 
     Surface Normal 由同帧 depth 和相机内参离线计算，保证与 RGB 像素严格对齐。
 
@@ -2177,7 +2466,8 @@ def spawn_camera_set(
     sensor_types = {
         "rgb": "sensor.camera.rgb",
         "depth": "sensor.camera.depth",
-        "semantic": "sensor.camera.semantic_segmentation"
+        "semantic": "sensor.camera.semantic_segmentation",
+        "instance": "sensor.camera.instance_segmentation"
     }
 
     sensors: Dict[str, carla.Sensor] = {}
@@ -2476,6 +2766,59 @@ def random_road_center(carla_map) -> Tuple[float, float]:
     return float(sp.location.x), float(sp.location.y)
 
 
+def is_two_wheel_type(type_id: str) -> bool:
+    normalized = type_id.lower()
+    return any(token in normalized for token in TWO_WHEEL_TYPE_TOKENS)
+
+
+def vehicle_blueprint_wheel_count(blueprint: carla.ActorBlueprint) -> int:
+    if not blueprint.has_attribute("number_of_wheels"):
+        return 0
+    try:
+        return int(blueprint.get_attribute("number_of_wheels").as_int())
+    except Exception:
+        try:
+            return int(str(blueprint.get_attribute("number_of_wheels")))
+        except Exception:
+            return 0
+
+
+def is_supported_vehicle_blueprint(
+    blueprint: carla.ActorBlueprint,
+) -> bool:
+    return (
+        not is_two_wheel_type(blueprint.id)
+        and vehicle_blueprint_wheel_count(blueprint) >= 4
+    )
+
+
+def vehicle_actor_wheel_count(actor: carla.Actor) -> Optional[int]:
+    try:
+        value = actor.attributes.get("number_of_wheels")
+        return int(value) if value is not None else None
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return None
+
+
+def destroy_live_two_wheel_vehicles(world: carla.World) -> int:
+    removed = 0
+    for actor in list(world.get_actors().filter("vehicle.*")):
+        wheel_count = vehicle_actor_wheel_count(actor)
+        is_two_wheel = (
+            (wheel_count is not None and wheel_count < 4)
+            or is_two_wheel_type(actor.type_id)
+        )
+        if not is_two_wheel:
+            continue
+        try:
+            actor.destroy()
+            removed += 1
+        except Exception:
+            pass
+    print(f"[INFO] Removed live bicycle/motorcycle actors: {removed}")
+    return removed
+
+
 def spawn_background_traffic(
     client: carla.Client,
     world: carla.World,
@@ -2511,7 +2854,13 @@ def spawn_background_traffic(
     walkers: List[carla.Actor] = []
     walker_controllers: List[carla.Actor] = []
 
-    vehicle_bps = blueprint_library.filter("vehicle.*")
+    vehicle_bps = [
+        blueprint
+        for blueprint in blueprint_library.filter("vehicle.*")
+        if is_supported_vehicle_blueprint(blueprint)
+    ]
+    if not vehicle_bps:
+        raise RuntimeError("没有可用的四轮 vehicle blueprint。")
     random.shuffle(spawn_points)
 
     for sp in spawn_points[:number_of_vehicles]:
@@ -3178,8 +3527,8 @@ def write_dataset_readme(
         f"- `rgb/<preset>/`: {rgb_description}.",
         "- `surface_normal/png/`: camera-space surface-normal PNG.",
         "- `surface_normal/npy/`: camera-space surface normals in float32, channel order x-right/y-down/z-forward.",
-        "- `segmentation/id/`: single-channel semantic id PNG.",
-        "- `segmentation/color/`: semantic color preview PNG.",
+        "- `segmentation/id/`: target semantic PNG (0 background, 1 vehicle, 2 pedestrian, 255 ignore).",
+        "- `segmentation/color/`: target semantic color preview PNG.",
         "- `depth/npy/`: metric depth arrays in meters, float32.",
         "- `depth/vis_16bit/`: 16-bit depth visualization.",
         "- `depth/color/`: 8-bit color depth preview for QA.",
@@ -3316,6 +3665,45 @@ def main() -> None:
         raise ValueError(
             "--pedestrian-centered-camera-probability 必须在 0 到 1 之间"
         )
+    if not 0.0 <= args.vehicle_centered_camera_probability <= 1.0:
+        raise ValueError(
+            "--vehicle-centered-camera-probability 必须在 0 到 1 之间"
+        )
+    if (
+        args.pedestrian_centered_camera_probability
+        + args.vehicle_centered_camera_probability
+        > 1.0
+    ):
+        raise ValueError("行人中心与车辆中心视角概率之和不能超过 1")
+    for value, name in (
+        (
+            args.min_vehicle_projected_fill_ratio,
+            "--min-vehicle-projected-fill-ratio",
+        ),
+        (
+            args.min_pedestrian_projected_fill_ratio,
+            "--min-pedestrian-projected-fill-ratio",
+        ),
+        (
+            args.min_largest_component_ratio,
+            "--min-largest-component-ratio",
+        ),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} 必须在 0 到 1 之间")
+    released_classes = {
+        (target_mask_id_for_class(target.name), int(target.class_id))
+        for target in args.target
+    }
+    if released_classes != {
+        (TARGET_VEHICLE_ID, 0),
+        (TARGET_PEDESTRIAN_ID, 1),
+    }:
+        raise ValueError(
+            "当前总采集器只允许 vehicle:0:10 和 pedestrian:1:4 两类。"
+        )
+    if args.target_actor_filter or args.target_actor_count:
+        raise ValueError("当前总采集器已禁用车辆/行人以外的自定义目标。")
 
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -3353,6 +3741,7 @@ def main() -> None:
         # ------------------------------------------------------------
         # 隐藏地图自带静态车辆，只保留脚本生成的 vehicle actor。
         # ------------------------------------------------------------
+        destroy_live_two_wheel_vehicles(world)
         if args.hide_static_map_vehicles:
             hidden_static_vehicle_ids = hide_static_map_vehicles(world)
 
@@ -3565,7 +3954,29 @@ def main() -> None:
                     "mode": args.actor_visibility_mode,
                     "min_actor_visible_px": args.min_actor_visible_px,
                     "min_actor_visible_ratio": args.min_actor_visible_ratio,
+                    "min_vehicle_projected_fill_ratio": (
+                        args.min_vehicle_projected_fill_ratio
+                    ),
+                    "min_pedestrian_projected_fill_ratio": (
+                        args.min_pedestrian_projected_fill_ratio
+                    ),
                     "actor_depth_margin": args.actor_depth_margin
+                },
+                "target_semantic": {
+                    "internal_sensor": "sensor.camera.instance_segmentation",
+                    "published_classes": ["vehicle", "pedestrian"],
+                    "mask_values": {
+                        "background": TARGET_BACKGROUND_ID,
+                        "vehicle": TARGET_VEHICLE_ID,
+                        "pedestrian": TARGET_PEDESTRIAN_ID,
+                        "ignore": TARGET_IGNORE_ID,
+                    },
+                    "min_largest_component_ratio": (
+                        args.min_largest_component_ratio
+                    ),
+                    "training_mask_source": (
+                        "filled_largest_external_instance_contour"
+                    ),
                 },
                 "depth": "metric full-frame depth"
             },
@@ -3626,7 +4037,7 @@ def main() -> None:
             "modalities": [
                 "rgb_visible",
                 "surface_normal",
-                "semantic_segmentation",
+                "target_semantic_segmentation",
                 "metric_depth"
             ],
             "depth_sources": {
@@ -3707,7 +4118,7 @@ def main() -> None:
                 "modalities": [
                     "rgb_visible",
                     "surface_normal",
-                    "semantic_segmentation",
+                    "target_semantic_segmentation",
                     "metric_depth"
                 ],
                 "weather_candidates": weather_candidates,
@@ -3836,6 +4247,8 @@ def main() -> None:
                     best_view_stats: Optional[Dict[str, Any]] = None
                     accepted_annotations: Optional[List[Dict[str, Any]]] = None
                     accepted_semantic_sensor_id: Optional[np.ndarray] = None
+                    accepted_target_semantic_id: Optional[np.ndarray] = None
+                    accepted_target_instances: Optional[List[Dict[str, Any]]] = None
 
                     for pose_try in range(max(1, args.max_camera_pose_retries)):
                         if args.route == "orbit" and pose_try == 0:
@@ -3855,16 +4268,45 @@ def main() -> None:
                                 center_x, center_y = args.center_x, args.center_y
 
                             if args.camera_origin_over_road:
+                                centered_draw = random.random()
                                 use_pedestrian_center = bool(
                                     walker_actors
-                                    and random.random()
+                                    and centered_draw
                                     < args.pedestrian_centered_camera_probability
+                                )
+                                use_vehicle_center = bool(
+                                    vehicle_actors
+                                    and not use_pedestrian_center
+                                    and centered_draw
+                                    < (
+                                        args.pedestrian_centered_camera_probability
+                                        + args.vehicle_centered_camera_probability
+                                    )
                                 )
                                 if use_pedestrian_center:
                                     transform = (
                                         random_pedestrian_centered_road_uav_transform(
                                             carla_map=world.get_map(),
                                             pedestrian_actors=walker_actors,
+                                            height_min=max(
+                                                args.height_min,
+                                                args.safe_camera_min_z
+                                            ),
+                                            height_max=max(
+                                                args.height_max,
+                                                args.safe_camera_min_z
+                                            ),
+                                            radius_min=args.radius_min,
+                                            radius_max=args.radius_max,
+                                            pitch_min=args.pitch_min,
+                                            pitch_max=args.pitch_max
+                                        )
+                                    )
+                                elif use_vehicle_center:
+                                    transform = (
+                                        random_pedestrian_centered_road_uav_transform(
+                                            carla_map=world.get_map(),
+                                            pedestrian_actors=vehicle_actors,
                                             height_min=max(
                                                 args.height_min,
                                                 args.safe_camera_min_z
@@ -3930,6 +4372,10 @@ def main() -> None:
                                 carla_frame,
                                 timeout=args.sensor_timeout
                             )
+                            instance_img = sync["instance"].get(
+                                carla_frame,
+                                timeout=args.sensor_timeout
+                            )
                             if args.enable_lidar:
                                 lidar_data = sync["lidar"].get(
                                     carla_frame,
@@ -3978,8 +4424,110 @@ def main() -> None:
                             keep_all=args.keep_all,
                             min_actor_visible_px=args.min_actor_visible_px,
                             min_actor_visible_ratio=args.min_actor_visible_ratio,
+                            min_vehicle_projected_fill_ratio=(
+                                args.min_vehicle_projected_fill_ratio
+                            ),
+                            min_pedestrian_projected_fill_ratio=(
+                                args.min_pedestrian_projected_fill_ratio
+                            ),
                             actor_depth_margin=args.actor_depth_margin,
                             actor_visibility_mode=args.actor_visibility_mode
+                        )
+                        boundary_margin = args.annotation_boundary_margin_px
+                        filtered_boundary_annotation_count = sum(
+                            int(annotation["bbox_xywh"][0]) <= boundary_margin
+                            or int(annotation["bbox_xywh"][1]) <= boundary_margin
+                            or (
+                                int(annotation["bbox_xywh"][0])
+                                + int(annotation["bbox_xywh"][2])
+                                >= args.width - boundary_margin
+                            )
+                            or (
+                                int(annotation["bbox_xywh"][1])
+                                + int(annotation["bbox_xywh"][3])
+                                >= args.height_img - boundary_margin
+                            )
+                            for annotation in candidate_annotations
+                        )
+                        if (
+                            args.reject_boundary_annotations
+                            and filtered_boundary_annotation_count
+                        ):
+                            candidate_annotations = [
+                                annotation
+                                for annotation in candidate_annotations
+                                if not (
+                                    int(annotation["bbox_xywh"][0])
+                                    <= boundary_margin
+                                    or int(annotation["bbox_xywh"][1])
+                                    <= boundary_margin
+                                    or (
+                                        int(annotation["bbox_xywh"][0])
+                                        + int(annotation["bbox_xywh"][2])
+                                        >= args.width - boundary_margin
+                                    )
+                                    or (
+                                        int(annotation["bbox_xywh"][1])
+                                        + int(annotation["bbox_xywh"][3])
+                                        >= args.height_img - boundary_margin
+                                    )
+                                )
+                            ]
+                        (
+                            candidate_target_semantic_id,
+                            candidate_target_instances,
+                        ) = build_optimized_target_semantic_mask(
+                            instance_image=instance_img,
+                            actor_annotations=candidate_annotations,
+                            min_mask_px=args.min_mask_px,
+                            min_vehicle_projected_fill_ratio=(
+                                args.min_vehicle_projected_fill_ratio
+                            ),
+                            min_pedestrian_projected_fill_ratio=(
+                                args.min_pedestrian_projected_fill_ratio
+                            ),
+                            min_vehicle_visible_equivalent_side_px=(
+                                args.min_vehicle_visible_equivalent_side_px
+                            ),
+                            min_pedestrian_visible_equivalent_side_px=(
+                                args.min_pedestrian_visible_equivalent_side_px
+                            ),
+                            min_largest_component_ratio=(
+                                args.min_largest_component_ratio
+                            ),
+                        )
+                        target_vehicle_count = int(
+                            np.count_nonzero(
+                                candidate_target_semantic_id
+                                == TARGET_VEHICLE_ID
+                            )
+                            > 0
+                        )
+                        target_pedestrian_count = int(
+                            np.count_nonzero(
+                                candidate_target_semantic_id
+                                == TARGET_PEDESTRIAN_ID
+                            )
+                            > 0
+                        )
+                        bad_view_stats["target_vehicle_present"] = bool(
+                            target_vehicle_count
+                        )
+                        bad_view_stats["target_pedestrian_present"] = bool(
+                            target_pedestrian_count
+                        )
+                        bad_view_stats["target_trainable_instances"] = int(
+                            sum(
+                                bool(instance["trainable"])
+                                for instance in candidate_target_instances
+                            )
+                        )
+                        bad_view_stats["target_unmatched_instances"] = int(
+                            sum(
+                                not bool(instance["trainable"])
+                                and instance["carla_actor_id"] is None
+                                for instance in candidate_target_instances
+                            )
                         )
                         equivalent_sides = [
                             math.sqrt(
@@ -4048,12 +4596,17 @@ def main() -> None:
                         bad_view_stats["boundary_annotation_count"] = int(
                             boundary_annotation_count
                         )
+                        bad_view_stats[
+                            "ignored_boundary_annotation_count"
+                        ] = int(filtered_boundary_annotation_count)
                         bad_view = bool(
                             near_depth_bad_view
                             or tiny_target_count > 0
                             or undersized_pedestrian_count > 0
                             or len(pedestrian_equivalent_sides)
                             < args.min_pedestrians_per_frame
+                            or target_vehicle_count == 0
+                            or target_pedestrian_count == 0
                             or (
                                 args.reject_boundary_annotations
                                 and boundary_annotation_count > 0
@@ -4083,6 +4636,12 @@ def main() -> None:
                             accepted_semantic_sensor_id = (
                                 candidate_semantic_sensor_id
                             )
+                            accepted_target_semantic_id = (
+                                candidate_target_semantic_id
+                            )
+                            accepted_target_instances = (
+                                candidate_target_instances
+                            )
                             accepted_view = True
                             break
 
@@ -4105,12 +4664,16 @@ def main() -> None:
                     if (
                         accepted_annotations is None
                         or accepted_semantic_sensor_id is None
+                        or accepted_target_semantic_id is None
+                        or accepted_target_instances is None
                     ):
                         raise RuntimeError(
                             f"frame {frame_i} 已接受位姿但缺少同步标注或语义图"
                         )
                     anns = accepted_annotations
                     semantic_sensor_id = accepted_semantic_sensor_id
+                    target_semantic_id = accepted_target_semantic_id
+                    target_semantic_instances = accepted_target_instances
 
                     # ------------------------------------------------
                     # 文件路径
@@ -4173,6 +4736,10 @@ def main() -> None:
                                     timeout=args.sensor_timeout
                                 )
                                 sync["semantic"].get(
+                                    rgb_carla_frame,
+                                    timeout=args.sensor_timeout
+                                )
+                                sync["instance"].get(
                                     rgb_carla_frame,
                                     timeout=args.sensor_timeout
                                 )
@@ -4262,8 +4829,11 @@ def main() -> None:
                         fov_degrees=args.fov,
                         max_depth_jump_m=args.normal_max_depth_jump_m
                     )
-                    save_semantic_id(semantic_sensor_id, segmentation_path)
-                    save_semantic_color(semantic_sensor_id, segmentation_color_path)
+                    save_semantic_id(target_semantic_id, segmentation_path)
+                    cv2.imwrite(
+                        str(segmentation_color_path),
+                        colorize_target_semantic_mask(target_semantic_id),
+                    )
 
                     save_yolo_label(
                         yolo_path,
@@ -4322,6 +4892,18 @@ def main() -> None:
                             "yolo": dataset_relative_path(yolo_path, out_root)
                         },
                         "lidar": lidar_metadata,
+                        "target_semantic": {
+                            "mask_values": {
+                                "background": TARGET_BACKGROUND_ID,
+                                "vehicle": TARGET_VEHICLE_ID,
+                                "pedestrian": TARGET_PEDESTRIAN_ID,
+                                "ignore": TARGET_IGNORE_ID,
+                            },
+                            "training_mask_source": (
+                                "filled_largest_external_instance_contour"
+                            ),
+                            "instances": target_semantic_instances,
+                        },
                         "annotations": anns
                     }
 

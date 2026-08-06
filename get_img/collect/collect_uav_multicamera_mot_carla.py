@@ -82,6 +82,8 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
         config["out"] = str(args.out)
     if args.frames_per_scene is not None:
         config["frames_per_scene"] = args.frames_per_scene
+        config["train_frames_per_scene"] = args.frames_per_scene
+        config["eval_frames_per_scene"] = args.frames_per_scene
     if args.scenes_per_weather is not None:
         config["scenes_per_weather"] = args.scenes_per_weather
     if args.weather_presets is not None:
@@ -107,6 +109,9 @@ def validate_config(config: Dict[str, Any]) -> None:
     for key in positive:
         if float(config[key]) <= 0:
             raise ValueError(f"{key} 必须大于 0")
+    for key in ("train_frames_per_scene", "eval_frames_per_scene"):
+        if key in config and int(config[key]) <= 0:
+            raise ValueError(f"{key} must be greater than 0")
     if int(config["num_cameras"]) < 2:
         raise ValueError("跨相机数据至少需要 2 台相机")
     if int(config["scenes_per_weather"]) < 4:
@@ -116,6 +121,14 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("min_visible_ratio 必须在 (0, 1] 内")
     if not config["weather_presets"]:
         raise ValueError("weather_presets 不能为空")
+
+
+def frames_for_scene(spec: SceneSpec, config: Dict[str, Any]) -> int:
+    if spec.split == "train":
+        return int(
+            config.get("train_frames_per_scene", config["frames_per_scene"])
+        )
+    return int(config.get("eval_frames_per_scene", config["frames_per_scene"]))
 
 
 def resolve_output(config: Dict[str, Any]) -> Path:
@@ -153,7 +166,16 @@ def build_scene_specs(config: Dict[str, Any]) -> List[SceneSpec]:
     count = int(config["scenes_per_weather"])
     for weather_index, weather in enumerate(config["weather_presets"]):
         for index in range(count):
-            if index < count - 2:
+            if count >= 8:
+                # Reserve one vehicle and one pedestrian scene for both val/test.
+                split = (
+                    "train"
+                    if index < count - 4
+                    else "val"
+                    if index < count - 2
+                    else "test"
+                )
+            elif index < count - 2:
                 split = "train"
             else:
                 validation_index = (
@@ -671,6 +693,7 @@ def dataset_global_id(scene_id: int, carla_actor_id: int) -> int:
 
 def frame_quality(
     camera_payloads: Dict[str, Dict[str, Any]],
+    anchor_class: str,
     config: Dict[str, Any],
 ) -> Tuple[bool, List[int], Dict[int, int]]:
     counts = {
@@ -691,8 +714,28 @@ def frame_quality(
         len(payload["annotations"]) >= int(config["min_objects_per_camera"])
         for payload in camera_payloads.values()
     )
+    anchor_class_id = next(
+        class_id
+        for class_id, class_name in CLASS_NAMES.items()
+        if class_name == anchor_class
+    )
+    minimum_anchor_objects = int(config.get("min_anchor_class_per_camera", 0))
+    enough_anchor_objects = all(
+        sum(
+            int(annotation["class_id"]) == anchor_class_id
+            for annotation in payload["annotations"]
+        )
+        >= minimum_anchor_objects
+        for payload in camera_payloads.values()
+    )
+    no_boundary_targets = all(
+        int(payload.get("boundary_annotation_count", 0)) == 0
+        for payload in camera_payloads.values()
+    )
     valid = (
         enough_objects
+        and enough_anchor_objects
+        and no_boundary_targets
         and len(common) >= int(config["min_common_ids_per_frame"])
     )
     return valid, common, counts
@@ -735,12 +778,31 @@ def inspect_camera_frame(
         road_ratio >= float(config["min_road_visible_ratio"])
         and near_ratio <= float(config["max_near_depth_ratio"])
     )
+    boundary_count = 0
+    if bool(config.get("reject_boundary_annotations", False)):
+        margin = float(config.get("annotation_boundary_margin_px", 0.0))
+        image_width = float(config["width"])
+        image_height = float(config["height"])
+        boundary_count = sum(
+            (
+                float(annotation["bbox_xywh"][0]) <= margin
+                or float(annotation["bbox_xywh"][1]) <= margin
+                or float(annotation["bbox_xywh"][0])
+                + float(annotation["bbox_xywh"][2])
+                >= image_width - margin
+                or float(annotation["bbox_xywh"][1])
+                + float(annotation["bbox_xywh"][3])
+                >= image_height - margin
+            )
+            for annotation in annotations
+        )
     return {
         "rgb_bgr": rgb_bgr,
         "annotations": annotations,
         "road_visible_ratio": road_ratio,
         "near_depth_ratio": near_ratio,
         "view_valid": view_valid,
+        "boundary_annotation_count": boundary_count,
     }
 
 
@@ -907,7 +969,7 @@ def collect_scene_attempt(
             calibration_dict(unit.name, unit.transform, config, ground_z),
         )
 
-    frames_required = int(config["frames_per_scene"])
+    frames_required = frames_for_scene(spec, config)
     qa_count = min(int(config["qa_frames_per_camera"]), frames_required)
     qa_indices = sorted(
         set(
@@ -944,6 +1006,7 @@ def collect_scene_attempt(
             all_views_valid = all_views_valid and bool(payload["view_valid"])
         valid, common_ids, visibility_counts = frame_quality(
             camera_payloads,
+            spec.anchor_class,
             config,
         )
         required_visible = int(required_global_id) in set(map(int, common_ids))
@@ -964,6 +1027,7 @@ def collect_scene_attempt(
                     f"common={len(common_ids)}, "
                     f"anchor_common={required_visible}, "
                     f"objects={[len(p['annotations']) for p in camera_payloads.values()]}, "
+                    f"boundary={[p['boundary_annotation_count'] for p in camera_payloads.values()]}, "
                     f"views={view_stats}"
                 ),
             }
@@ -1493,7 +1557,7 @@ def write_dataset_manifest(
 ) -> None:
     manifest = {
         "name": "OpenHUTB UAV Multi-Camera MOT RGB",
-        "version": "1.0",
+        "version": "2.0",
         "task": [
             "object_detection",
             "multi_object_tracking",
@@ -1511,6 +1575,12 @@ def write_dataset_manifest(
             "num_cameras": int(config["num_cameras"]),
             "fps": float(config["fps"]),
             "frames_per_scene": int(config["frames_per_scene"]),
+            "train_frames_per_scene": int(
+                config.get("train_frames_per_scene", config["frames_per_scene"])
+            ),
+            "eval_frames_per_scene": int(
+                config.get("eval_frames_per_scene", config["frames_per_scene"])
+            ),
             "weather_presets": list(config["weather_presets"]),
             "camera_height_m": [
                 float(config["camera_height_min_m"]),
@@ -1675,6 +1745,38 @@ def run_collection(
                 f"[INFO] Scene {scene_index + 1}/{len(specs)}: "
                 f"{spec.name} ({spec.split}, anchor={spec.anchor_class})"
             )
+            # A fresh actor population per scene prevents hidden identity leakage
+            # across train, validation, and test splits.
+            destroy_actors(controllers)
+            destroy_actors(walkers)
+            destroy_actors(vehicles)
+            controllers, walkers, vehicles = [], [], []
+            for _ in range(2):
+                world.tick()
+            scene_seed = int(config["seed"]) + spec.scene_id * 1009
+            vehicles, walkers, controllers = base.spawn_background_traffic(
+                client,
+                world,
+                int(config["vehicles"]),
+                int(config["walkers"]),
+                int(config["tm_port"]),
+                scene_seed,
+            )
+            if bool(config["remove_two_wheel_vehicles"]):
+                base.destroy_live_two_wheel_vehicles(world)
+                vehicles = [
+                    actor
+                    for actor in vehicles
+                    if actor is not None and actor.is_alive
+                ]
+            traffic_actors = live_target_actors(vehicles, walkers)
+            if not traffic_actors:
+                raise RuntimeError(
+                    f"No vehicle or pedestrian was spawned for {spec.name}"
+                )
+            for _ in range(int(config.get("actor_spawn_warmup_ticks", 8))):
+                world.tick()
+            drain_camera_units(units)
             result = collect_scene(
                 world,
                 units,
@@ -1683,8 +1785,9 @@ def run_collection(
                 spec,
                 paths,
                 config,
-                rng,
+                random.Random(scene_seed + 101),
             )
+            result["actor_seed"] = scene_seed
             results.append(result)
     finally:
         destroy_actors(

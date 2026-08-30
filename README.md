@@ -1,6 +1,119 @@
-# 空地一体数据集
+# 空地一体无人机多模态数据集
 
-该项目为空地一体数据集相关的源代码和运行说明，收集好的数据位于[huggingface](https://huggingface.co/datasets/yutiangu/HUBT_from_a_drones_perspective)。
+本项目包含基于 OpenHUTB/CARLA 的无人机视角多地图数据采集、质量检查和标注工具。
+整理后的数据集发布在
+[Hugging Face：HUTB From a Drone's Perspective](https://huggingface.co/datasets/yutiangu/HUBT_from_a_drones_perspective)。
+
+## 当前数据集
+
+当前版本包含 8 张仿真地图中的 4,081 组同步数据，图像分辨率为
+1920 x 1080。数据覆盖车辆和行人检测、目标语义分割、深度估计、表面法向估计、
+LiDAR 与跨地图/跨天气鲁棒性研究。
+
+| 项目 | 数量 |
+|---|---:|
+| 地图 | 8 |
+| 同步帧 | 4,081 |
+| 训练集 | 2,856 |
+| 验证集 | 816 |
+| 测试集 | 409 |
+| 车辆框 | 6,707 |
+| 行人框 | 9,568 |
+| 可训练目标实例 | 16,275 |
+| 天气与光照条件 | 6 |
+
+每一帧只属于一种天气，因此不同天气目录中的 RGB 文件是互不重复的帧，并不是
+同一帧的多天气渲染。
+
+## 地图分布
+
+| 地图 | 帧数 | 训练 | 验证 | 测试 | 车辆 | 行人 |
+|---|---:|---:|---:|---:|---:|---:|
+| `CCSP_Zhongdian_Software_Park` | 181 | 126 | 36 | 19 | 182 | 311 |
+| `HutbCarlaCity` | 300 | 210 | 60 | 30 | 533 | 618 |
+| `Town02_Opt` | 600 | 420 | 120 | 60 | 1,244 | 1,108 |
+| `Town03_Opt` | 600 | 420 | 120 | 60 | 864 | 1,198 |
+| `Town04_Opt` | 600 | 420 | 120 | 60 | 698 | 2,081 |
+| `Town05_Opt` | 600 | 420 | 120 | 60 | 880 | 883 |
+| `Town07_Opt` | 600 | 420 | 120 | 60 | 901 | 2,342 |
+| `Town10HD` | 600 | 420 | 120 | 60 | 1,405 | 1,027 |
+| **总计** | **4,081** | **2,856** | **816** | **409** | **6,707** | **9,568** |
+
+## 同步模态与标注
+
+每一组已发布数据均包含以下同步内容：
+
+| 内容 | 格式 |
+|---|---|
+| 可见光 RGB | 按天气分类的 8 位 PNG |
+| 相机深度 | 米制 `float32` NPY、16 位 PNG 和彩色预览图 |
+| 表面法向 | 相机坐标系 `float32` NPY 和 PNG 预览图 |
+| 目标语义分割 | 类别 ID PNG 和彩色预览图 |
+| LiDAR | 原始点云 NPY、RGB 对齐投影 NPY 和预览图 |
+| 目标检测 | YOLO TXT、COCO JSON 和逐帧 JSON |
+
+检测类别采用零起始 YOLO ID：`0` 为 `vehicle`，`1` 为 `pedestrian`。
+目标语义分割中，像素值 `0` 为背景，`1` 为可训练车辆，`2` 为可训练行人，
+`255` 为识别到但不用于训练的目标。
+
+## 天气分布
+
+| 天气 | 帧数 |
+|---|---:|
+| `ClearNoon` | 692 |
+| `ClearSunset` | 690 |
+| `ClearNight` | 682 |
+| `FoggyNoon` | 681 |
+| `SnowNoon` | 669 |
+| `DustStorm` | 667 |
+| **总计** | **4,081** |
+
+## 数据目录
+
+每张地图独立保存，整合后的序列目录使用地图名称，不再使用多个 `seq_xxxx`
+目录：
+
+```text
+<MapName>/
+|-- paired_weather/<MapName>/
+|   |-- rgb/<Weather>/<frame>.png
+|   |-- depth/
+|   |-- surface_normal/
+|   |-- segmentation/
+|   |-- labels_yolo/
+|   |-- annotations/
+|   `-- frame_index.csv
+|-- splits/{train,val,test}.txt
+|-- splits_by_weather/
+|-- coco/{train,val,test}.json
+|-- data.yaml
+|-- dataset_manifest.json
+`-- quality_report.json
+```
+
+JSON、CSV、COCO 和数据划分文件中的路径均相对于对应的地图目录。
+
+## YOLO 使用示例
+
+每张地图都包含独立的 `data.yaml`。下载完整数据后，可在数据集根目录运行：
+
+```powershell
+yolo detect train model=yolo11x.pt data=Town02_Opt/data.yaml imgsz=1920 epochs=100
+```
+
+进行跨地图泛化实验时，建议保留一张或多张完整地图作为测试域，而不是将所有地图
+随机混合后再划分。
+
+## 质量与限制
+
+- 4,081 帧均通过同步模态文件检查，并具有匹配的 RGB、深度、表面法向、目标分割、
+  LiDAR、YOLO 和 JSON 数据。
+- 数据来自仿真环境，与真实无人机数据之间存在域差异。
+- 检测标注面向 CARLA 车辆与行人 Actor；没有 Actor 身份的烘焙静态网格不保证
+  获得检测标签。
+- 中电软件园自定义地图仍可能出现少量资源流送、网格或贴图瑕疵，训练前应按任务需要
+  进行额外视觉检查。
+- 天气效果是仿真近似；例如雪天不表示路面已有真实积雪。
 
 
 # Python 脚本说明

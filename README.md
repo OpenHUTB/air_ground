@@ -131,9 +131,9 @@ yolo detect train model=yolo11x.pt data=Town02_Opt/data.yaml imgsz=1920 epochs=1
 
 | Python 文件 | 类型 | 是否需要模拟器 | 主要用途 |
 |---|---|---:|---|
-| `collect_rpg_small_targets_carla_v2.py` | 采集 | 是 | 采集 RGB、Surface Normal、Segmentation、Depth 四模态无人机小目标数据 |
-| `collect_uav_single_object_vot_carla.py` | 采集 | 是 | 采集 VOT 格式的无人机单目标跟踪数据 |
-| `collect_uav_multicamera_mot_carla.py` | 采集 | 是 | 采集三相机同步的跨相机多目标跟踪数据 |
+| `get_img/collect/multimodal/collect_rpg_small_targets_carla_v2.py` | 采集 | 是 | 采集 RGB、Surface Normal、Segmentation、Depth 四模态无人机小目标数据 |
+| `get_img/collect/single_camera_tracking/collect_uav_single_object_vot_carla.py` | 采集 | 是 | 采集 VOT 格式的无人机单目标跟踪数据 |
+| `get_img/collect/multi_camera_tracking/collect_uav_multicamera_mot_carla.py` | 采集 | 是 | 采集三相机同步的跨相机多目标跟踪数据 |
 
 
 ## 四模态总采集脚本
@@ -157,14 +157,14 @@ JSON 配置，因此可以临时覆盖帧数、分辨率、高度、天气和目
 推荐运行：
 
 ```powershell
-& $PYTHON "E:\pythonProject\air_groud\get_img\collect\collect_rpg_small_targets_carla_v2.py" `
-  --config "E:\pythonProject\air_groud\get_img\collect\collection_config.json"
+& $PYTHON "E:\pythonProject\air_groud\get_img\collect\multimodal\collect_rpg_small_targets_carla_v2.py" `
+  --config "E:\pythonProject\air_groud\get_img\collect\multimodal\collection_config.json"
 ```
 
 查看全部参数：
 
 ```powershell
-& $PYTHON "E:\pythonProject\air_groud\get_img\collect\collect_rpg_small_targets_carla_v2.py" --help
+& $PYTHON "E:\pythonProject\air_groud\get_img\collect\multimodal\collect_rpg_small_targets_carla_v2.py" --help
 ```
 
 重要参数：
@@ -197,8 +197,8 @@ JSON 配置，因此可以临时覆盖帧数、分辨率、高度、天气和目
 - `quality_audit.json` 和数据集清单。
 
 ```powershell
-& $PYTHON "E:\pythonProject\air_groud\get_img\collect\collect_uav_single_object_vot_carla.py" `
-  --config "E:\pythonProject\air_groud\get_img\collect\single_object_vot_config.json" `
+& $PYTHON "E:\pythonProject\air_groud\get_img\collect\single_camera_tracking\collect_uav_single_object_vot_carla.py" `
+  --config "E:\pythonProject\air_groud\get_img\collect\single_camera_tracking\single_object_vot_config.json" `
   --overwrite
 ```
 

@@ -87,6 +87,23 @@ import cv2
 import numpy as np
 
 
+PNG_COMPRESSION_LEVEL = 1
+
+
+def write_image(path: Any, image: np.ndarray) -> bool:
+    """以低压缩级别无损写入 PNG，减少四模态保存等待。"""
+    output_path = str(path)
+    if Path(output_path).suffix.lower() == ".png":
+        return bool(
+            cv2.imwrite(
+                output_path,
+                image,
+                [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION_LEVEL],
+            )
+        )
+    return bool(cv2.imwrite(output_path, image))
+
+
 # ============================================================
 # 1. 可选：强制指定 OpenHUTB / CARLA 自带 PythonAPI
 # ============================================================
@@ -259,6 +276,33 @@ class SensorSync:
             f"Last received frame: {last_frame}. "
             f"建议：降低分辨率/减少交通/增大 timeout/修复 CARLA API 版本不匹配。"
         )
+
+
+def capture_synchronized_sensor_frame(
+    world: carla.World,
+    sync: Dict[str, SensorSync],
+    sensor_timeout: float,
+    enable_lidar: bool,
+) -> Tuple[int, carla.Image, carla.Image, carla.Image, carla.Image, Any]:
+    """Tick once and return one strictly synchronized multimodal bundle."""
+    carla_frame = world.tick()
+    rgb_img = sync["rgb"].get(carla_frame, timeout=sensor_timeout)
+    depth_img = sync["depth"].get(carla_frame, timeout=sensor_timeout)
+    semantic_img = sync["semantic"].get(carla_frame, timeout=sensor_timeout)
+    instance_img = sync["instance"].get(carla_frame, timeout=sensor_timeout)
+    lidar_data = (
+        sync["lidar"].get(carla_frame, timeout=sensor_timeout)
+        if enable_lidar
+        else None
+    )
+    return (
+        carla_frame,
+        rgb_img,
+        depth_img,
+        semantic_img,
+        instance_img,
+        lidar_data,
+    )
 
 
 # ============================================================
@@ -445,6 +489,15 @@ def parse_args() -> argparse.Namespace:
         help="关闭 RGB 相机后处理，减少自动曝光/运动模糊等影响。"
     )
     parser.add_argument("--fps", type=float, default=20.0)
+    parser.add_argument(
+        "--png-compression-level",
+        type=int,
+        default=1,
+        help=(
+            "PNG 无损压缩级别 0 到 9；1 写入较快且不损失像素，"
+            "代价是文件略大。"
+        )
+    )
 
     # UAV 视角参数
     parser.add_argument("--center-x", type=float, default=0.0)
@@ -491,11 +544,171 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="随机路线下优先围绕四轮车辆选择道路上方相机位姿的概率。"
     )
-    parser.add_argument("--max-camera-pose-retries", type=int, default=120)
+    parser.add_argument("--max-camera-pose-retries", type=int, default=50)
+    parser.add_argument(
+        "--max-expensive-pose-retries",
+        type=int,
+        default=12,
+        help=(
+            "每帧最多执行多少次完整四传感器候选检查；快速投影预检"
+            "失败不计入。达到上限后丢弃该场景，不降低最终接受标准。"
+        )
+    )
     parser.add_argument("--min-near-depth-m", type=float, default=5.0)
     parser.add_argument("--max-near-depth-ratio", type=float, default=0.05)
     parser.add_argument("--min-road-visible-ratio", type=float, default=0.35)
     parser.add_argument("--road-semantic-ids", type=int, nargs="+", default=[1, 2, 6, 7, 8])
+    parser.add_argument(
+        "--road-validation-mode",
+        choices=["semantic", "geometry", "auto"],
+        default="semantic",
+        help=(
+            "道路视角验证方式。semantic 使用语义像素比例；geometry 验证相机"
+            "正下方和镜头中心落点均贴合驾驶道路 waypoint；auto 在自定义地图"
+            "语义标记覆盖不足时自动使用几何验证。"
+        ),
+    )
+    parser.add_argument(
+        "--camera-roi-center-x",
+        type=float,
+        default=0.0,
+        help="相机道路采样区域中心 X；camera_roi_radius_m 大于 0 时生效。"
+    )
+    parser.add_argument(
+        "--camera-roi-center-y",
+        type=float,
+        default=0.0,
+        help="相机道路采样区域中心 Y；camera_roi_radius_m 大于 0 时生效。"
+    )
+    parser.add_argument(
+        "--camera-roi-radius-m",
+        type=float,
+        default=0.0,
+        help=(
+            "相机和背景目标允许出现的圆形区域半径，单位米；"
+            "0 表示不限制。适合避免大地图随机采到无建筑的外围道路。"
+        )
+    )
+    parser.add_argument(
+        "--camera-min-position-distance-m",
+        type=float,
+        default=0.0,
+        help=(
+            "已保存相机位姿之间的最小水平距离，单位米；0 表示关闭。"
+            "距离不足时，仅当航向差达到 camera_min_yaw_difference_deg 才允许保存。"
+        )
+    )
+    parser.add_argument(
+        "--camera-min-yaw-difference-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "相机位置过近时要求的最小航向差，单位度；0 表示近距离位姿全部拒绝。"
+        )
+    )
+    parser.add_argument(
+        "--camera-pose-history-window",
+        type=int,
+        default=0,
+        help=(
+            "位置和航向去重时检查最近多少个已保存位姿；0 表示检查当前输出目录中的全部历史。"
+        )
+    )
+    parser.add_argument(
+        "--camera-grid-size-m",
+        type=float,
+        default=0.0,
+        help="相机位置均衡采样网格边长，单位米；0 表示关闭网格限制。"
+    )
+    parser.add_argument(
+        "--max-frames-per-camera-grid",
+        type=int,
+        default=0,
+        help="每个相机采样网格允许保存的最大帧数；0 表示不限制。"
+    )
+    parser.add_argument(
+        "--spectator-follow-camera",
+        action="store_true",
+        default=False,
+        help=(
+            "每次移动采集传感器时同步移动 spectator，"
+            "用于触发自定义大地图的建筑和地面子关卡流式加载。"
+        )
+    )
+    parser.add_argument(
+        "--no-spectator-follow-camera",
+        dest="spectator_follow_camera",
+        action="store_false",
+        help="不移动模拟器窗口 spectator。"
+    )
+    parser.add_argument(
+        "--streaming-warmup-frames",
+        type=int,
+        default=0,
+        help=(
+            "相机瞬移后等待的流式加载帧数；0 保持原来的一帧刷新。"
+            "中电园建议 30 到 60。"
+        )
+    )
+    parser.add_argument(
+        "--streaming-rewarm-distance-m",
+        type=float,
+        default=120.0,
+        help=(
+            "相机距离上一次完整流式预热位置超过该距离时，才再次等待"
+            "全部 streaming_warmup_frames；同一区域内只刷新 1 帧。"
+            "设为 0 可恢复每个候选位姿都完整预热的旧行为。"
+        )
+    )
+    parser.add_argument(
+        "--streaming-min-geometry-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "流送就绪检查要求的近场有效深度像素比例；0 表示关闭。"
+            "用于拒绝建筑/地面子关卡尚未加载而出现大片虚空的画面。"
+        )
+    )
+    parser.add_argument(
+        "--streaming-min-labeled-ratio",
+        type=float,
+        default=0.0,
+        help="流送就绪检查要求的非 Unlabeled 语义像素比例；0 表示关闭。"
+    )
+    parser.add_argument(
+        "--streaming-geometry-max-depth-m",
+        type=float,
+        default=250.0,
+        help="流送就绪检查中视为已加载近场几何的最大深度，单位米。"
+    )
+    parser.add_argument(
+        "--streaming-readiness-retries",
+        type=int,
+        default=0,
+        help="场景未就绪时在同一机位追加等待和重采的次数；0 表示不重试。"
+    )
+    parser.add_argument(
+        "--streaming-readiness-step-frames",
+        type=int,
+        default=20,
+        help="每次场景就绪重试前追加等待的仿真帧数。"
+    )
+    parser.add_argument(
+        "--fast-pose-precheck",
+        dest="fast_pose_precheck",
+        action="store_true",
+        default=True,
+        help=(
+            "在移动传感器和等待地图流送前，用 actor 3D 投影快速排除"
+            "不可能满足目标数量或尺寸硬标准的候选位姿。"
+        )
+    )
+    parser.add_argument(
+        "--no-fast-pose-precheck",
+        dest="fast_pose_precheck",
+        action="store_false",
+        help="关闭候选位姿快速预检。"
+    )
 
     # 天气
     parser.add_argument("--weather", type=str, default="ClearNoon")
@@ -559,6 +772,16 @@ def parse_args() -> argparse.Namespace:
         help="四模态模式只使用 OpenHUTB/CARLA actor 坐标、语义和深度生成标注。"
     )
     parser.add_argument(
+        "--target-semantic-source",
+        type=str,
+        default="instance_actor_id",
+        choices=["instance_actor_id", "actor_semantic_depth"],
+        help=(
+            "目标语义掩码来源；instance_actor_id 用于标准 OpenHUTB，"
+            "actor_semantic_depth 用于实例 ID 不等于 actor ID 的旧专用地图。"
+        )
+    )
+    parser.add_argument(
         "--target",
         type=parse_target,
         action="append",
@@ -591,10 +814,22 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
+        "--min-vehicles-per-frame",
+        type=int,
+        default=1,
+        help="每个正式保存帧至少包含的合格车辆标注数量；设为 0 可允许纯行人帧。"
+    )
+    parser.add_argument(
         "--min-pedestrians-per-frame",
         type=int,
         default=1,
         help="每个正式保存帧至少包含的合格行人标注数量。"
+    )
+    parser.add_argument(
+        "--min-targets-per-frame",
+        type=int,
+        default=1,
+        help="每个正式保存帧至少包含的车辆与行人合格标注总数。"
     )
     parser.add_argument(
         "--reject-boundary-annotations",
@@ -693,6 +928,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--walkers", type=int, default=10)
     parser.add_argument("--no-traffic", action="store_true")
     parser.add_argument(
+        "--ground-vehicles-on-spawn",
+        dest="ground_vehicles_on_spawn",
+        action="store_true",
+        default=False,
+        help=(
+            "生成车辆时向下射线探测真实路面，冻结并贴地放置，"
+            "稳定后再开启自动驾驶；用于出生点高度异常的自定义地图。"
+        )
+    )
+    parser.add_argument(
+        "--no-ground-vehicles-on-spawn",
+        dest="ground_vehicles_on_spawn",
+        action="store_false",
+        help="使用地图原始车辆出生点，不执行额外贴地处理。"
+    )
+    parser.add_argument(
+        "--vehicle-ground-clearance-m",
+        type=float,
+        default=0.05,
+        help="贴地生成时车轮包围盒底部与路面的预留高度，单位米。"
+    )
+    parser.add_argument(
+        "--vehicle-settle-frames",
+        type=int,
+        default=10,
+        help="恢复车辆物理后、开启自动驾驶前等待的稳定帧数。"
+    )
+    parser.add_argument(
+        "--vehicle-spawn-min-distance-m",
+        type=float,
+        default=3.0,
+        help="新生成车辆与其他车辆之间允许的最小水平距离，单位米。"
+    )
+    parser.add_argument(
+        "--vehicle-motion-mode",
+        type=str,
+        choices=["autopilot", "static"],
+        default="autopilot",
+        help=(
+            "车辆运动方式：autopilot 使用 Traffic Manager；"
+            "static 将车辆贴地冻结，适合道路碰撞或 OpenDRIVE 不稳定的自定义地图。"
+        )
+    )
+    parser.add_argument(
         "--hide-static-map-vehicles",
         action="store_true",
         default=True,
@@ -727,7 +1006,6 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="从 seq_0000 开始写入；同名文件可能被覆盖。"
     )
-
     # 同步和稳定性
     parser.add_argument("--sensor-timeout", type=float, default=10.0)
     parser.add_argument("--warmup-frames", type=int, default=20)
@@ -918,7 +1196,7 @@ def save_rgb(
         bgr = apply_depth_fog_rgb_effect(bgr, depth_m)
     elif weather_name == "SnowNoon":
         bgr = apply_snow_rgb_effect(bgr, depth_m, random_seed)
-    cv2.imwrite(str(path), bgr)
+    write_image(path, bgr)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return rgb
 
@@ -1048,8 +1326,8 @@ def save_depth(
     """
     np.save(npy_path, depth_m.astype(np.float32))
 
-    cv2.imwrite(str(vis_path), metric_depth_to_u16(depth_m, max_depth_m))
-    cv2.imwrite(str(color_path), metric_depth_to_color_bgr(depth_m, max_depth_m))
+    write_image(vis_path, metric_depth_to_u16(depth_m, max_depth_m))
+    write_image(color_path, metric_depth_to_color_bgr(depth_m, max_depth_m))
 
 
 def depth_to_surface_normals(
@@ -1135,7 +1413,7 @@ def save_surface_normal(
         max_depth_jump_m=max_depth_jump_m
     )
     np.save(npy_path, normals.astype(np.float32))
-    cv2.imwrite(str(png_path), cv2.cvtColor(normal_rgb, cv2.COLOR_RGB2BGR))
+    write_image(png_path, cv2.cvtColor(normal_rgb, cv2.COLOR_RGB2BGR))
     return normals
 
 
@@ -1148,7 +1426,7 @@ def save_disparity(
 ) -> None:
     disparity = depth_to_disparity_float32(depth_m, min_depth_m, max_depth_m)
     np.save(npy_path, disparity.astype(np.float32))
-    cv2.imwrite(
+    write_image(
         str(vis_path),
         (np.clip(disparity, 0.0, 1.0) * 65535.0).astype(np.uint16)
     )
@@ -1181,6 +1459,61 @@ def is_bad_camera_view(
         "near_depth_ratio": near_ratio,
         "valid_ratio": valid_ratio,
         "min_depth": min_depth
+    }
+
+
+def streaming_scene_readiness(
+    depth_m: np.ndarray,
+    semantic_id: np.ndarray,
+    max_geometry_depth_m: float,
+    min_geometry_ratio: float,
+    min_labeled_ratio: float,
+) -> Tuple[bool, Dict[str, float]]:
+    """Check whether nearby streamed geometry and semantic tiles are present."""
+    finite_depth = np.isfinite(depth_m) & (depth_m > 0.0)
+    geometry_ratio = float(np.mean(
+        finite_depth & (depth_m <= max_geometry_depth_m)
+    ))
+    labeled_ratio = float(np.mean(semantic_id != 0))
+    ready = bool(
+        geometry_ratio >= min_geometry_ratio
+        and labeled_ratio >= min_labeled_ratio
+    )
+    return ready, {
+        "streaming_scene_ready": ready,
+        "streaming_readiness_mode": (
+            "coverage_threshold" if ready else "waiting_for_streaming"
+        ),
+        "streaming_geometry_ratio": geometry_ratio,
+        "streaming_labeled_ratio": labeled_ratio,
+        "streaming_geometry_max_depth_m": float(max_geometry_depth_m),
+    }
+
+
+def streaming_scene_has_settled(
+    history: List[Dict[str, float]],
+    window: int = 3,
+    tolerance: float = 0.002,
+    min_geometry_ratio: float = 0.98,
+) -> Tuple[bool, Dict[str, float]]:
+    """Treat stable coverage as loaded even when a view contains far scenery."""
+    if len(history) < window:
+        return False, {}
+    recent = history[-window:]
+    geometry_values = [item["streaming_geometry_ratio"] for item in recent]
+    labeled_values = [item["streaming_labeled_ratio"] for item in recent]
+    geometry_span = float(max(geometry_values) - min(geometry_values))
+    labeled_span = float(max(labeled_values) - min(labeled_values))
+    settled = bool(
+        geometry_values[-1] >= min_geometry_ratio
+        and geometry_span <= tolerance
+        and labeled_span <= tolerance
+    )
+    return settled, {
+        "streaming_settle_window": int(window),
+        "streaming_geometry_span": geometry_span,
+        "streaming_labeled_span": labeled_span,
+        "streaming_settle_tolerance": float(tolerance),
     }
 
 
@@ -1225,12 +1558,92 @@ def road_visible_ratio(
     return max(raw_ratio, palette_ratio)
 
 
+def camera_road_alignment_stats(
+    carla_map,
+    camera_transform: carla.Transform,
+) -> Dict[str, Any]:
+    """Validate that an oblique camera starts above and aims onto a driving lane."""
+    failed = {
+        "road_geometry_aligned": False,
+        "road_origin_offset_m": None,
+        "road_aim_offset_m": None,
+        "road_aim_distance_m": None,
+    }
+    try:
+        origin_waypoint = carla_map.get_waypoint(
+            camera_transform.location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+        if origin_waypoint is None:
+            return failed
+
+        origin_road = origin_waypoint.transform.location
+        origin_offset = math.hypot(
+            float(camera_transform.location.x - origin_road.x),
+            float(camera_transform.location.y - origin_road.y),
+        )
+        forward = camera_transform.get_forward_vector()
+        if float(forward.z) >= -1e-4:
+            failed["road_origin_offset_m"] = origin_offset
+            return failed
+
+        ray_scale = (
+            float(origin_road.z - camera_transform.location.z)
+            / float(forward.z)
+        )
+        if ray_scale <= 0.0:
+            failed["road_origin_offset_m"] = origin_offset
+            return failed
+
+        aim_location = carla.Location(
+            x=float(camera_transform.location.x + forward.x * ray_scale),
+            y=float(camera_transform.location.y + forward.y * ray_scale),
+            z=float(origin_road.z),
+        )
+        aim_waypoint = carla_map.get_waypoint(
+            aim_location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+        if aim_waypoint is None:
+            failed["road_origin_offset_m"] = origin_offset
+            failed["road_aim_distance_m"] = math.hypot(
+                float(aim_location.x - camera_transform.location.x),
+                float(aim_location.y - camera_transform.location.y),
+            )
+            return failed
+
+        aim_road = aim_waypoint.transform.location
+        aim_offset = math.hypot(
+            float(aim_location.x - aim_road.x),
+            float(aim_location.y - aim_road.y),
+        )
+        origin_limit = max(2.5, float(origin_waypoint.lane_width) * 0.65)
+        aim_limit = max(3.0, float(aim_waypoint.lane_width) * 0.8)
+        return {
+            "road_geometry_aligned": bool(
+                origin_offset <= origin_limit and aim_offset <= aim_limit
+            ),
+            "road_origin_offset_m": origin_offset,
+            "road_aim_offset_m": aim_offset,
+            "road_aim_distance_m": math.hypot(
+                float(aim_location.x - camera_transform.location.x),
+                float(aim_location.y - camera_transform.location.y),
+            ),
+            "road_origin_offset_limit_m": origin_limit,
+            "road_aim_offset_limit_m": aim_limit,
+        }
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return failed
+
+
 def save_segmentation_raw(image: carla.Image, path: Path) -> np.ndarray:
     """
     保存 semantic / instance 原始图像。
     """
     bgra = carla_image_to_bgra(image)
-    cv2.imwrite(str(path), bgra[:, :, :3])
+    write_image(path, bgra[:, :, :3])
     return bgra
 
 
@@ -1259,7 +1672,7 @@ def decode_semantic_segmentation(semantic_image: carla.Image) -> np.ndarray:
 
 
 def save_semantic_id(semantic_id: np.ndarray, path: Path) -> None:
-    cv2.imwrite(str(path), semantic_id.astype(np.uint8))
+    write_image(path, semantic_id.astype(np.uint8))
 
 
 def colorize_semantic_id(semantic_id: np.ndarray) -> np.ndarray:
@@ -1300,12 +1713,12 @@ def colorize_semantic_id(semantic_id: np.ndarray) -> np.ndarray:
 
 
 def save_semantic_color(semantic_id: np.ndarray, path: Path) -> None:
-    cv2.imwrite(str(path), colorize_semantic_id(semantic_id))
+    write_image(path, colorize_semantic_id(semantic_id))
 
 
 def save_instance_id(instance_id: np.ndarray, png_path: Path, npy_path: Path) -> None:
     np.save(npy_path, instance_id.astype(np.uint16))
-    cv2.imwrite(str(png_path), instance_id.astype(np.uint16))
+    write_image(png_path, instance_id.astype(np.uint16))
 
 
 def colorize_instance_id(instance_id: np.ndarray) -> np.ndarray:
@@ -1320,7 +1733,7 @@ def colorize_instance_id(instance_id: np.ndarray) -> np.ndarray:
 
 
 def save_instance_color(instance_id: np.ndarray, path: Path) -> None:
-    cv2.imwrite(str(path), colorize_instance_id(instance_id))
+    write_image(path, colorize_instance_id(instance_id))
 
 
 def decode_instance_segmentation(instance_image: carla.Image) -> Tuple[np.ndarray, np.ndarray]:
@@ -1571,6 +1984,243 @@ def build_optimized_target_semantic_mask(
     return target_mask, instances
 
 
+def build_actor_semantic_depth_target_mask(
+    instance_image: carla.Image,
+    semantic_id: np.ndarray,
+    depth_m: np.ndarray,
+    actor_annotations: List[Dict[str, Any]],
+    min_mask_px: int,
+    min_vehicle_projected_fill_ratio: float,
+    min_pedestrian_projected_fill_ratio: float,
+    min_vehicle_visible_equivalent_side_px: float,
+    min_pedestrian_visible_equivalent_side_px: float,
+    min_largest_component_ratio: float,
+) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    """兼容旧专用地图：用投影、深度和类别匹配随机 instance ID。"""
+    instance_semantic_id, instance_id = decode_instance_segmentation(
+        instance_image
+    )
+    target_mask = np.full(
+        instance_id.shape,
+        TARGET_BACKGROUND_ID,
+        dtype=np.uint8,
+    )
+    instances: List[Dict[str, Any]] = []
+    image_height, image_width = instance_id.shape
+
+    # 旧版专用地图会给动态物体分配与 actor.id 无关的 instance id。
+    # 先为每个 actor 保留多个候选，再全局一对一分配，防止相邻目标抢到
+    # 同一个轮廓。语义标签只参与评分，不作为硬条件，以兼容标签不稳定的包。
+    all_candidates: List[Dict[str, Any]] = []
+    for annotation in actor_annotations:
+        x1, y1, x2, y2 = (
+            int(value)
+            for value in annotation.get(
+                "projected_bbox_xyxy",
+                annotation["bbox_xyxy"],
+            )
+        )
+        x1 = min(max(0, x1), image_width - 1)
+        x2 = min(max(0, x2), image_width - 1)
+        y1 = min(max(0, y1), image_height - 1)
+        y2 = min(max(0, y2), image_height - 1)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        projected_instance = instance_id[y1:y2 + 1, x1:x2 + 1]
+        projected_instance_semantic = instance_semantic_id[
+            y1:y2 + 1,
+            x1:x2 + 1,
+        ]
+        projected_semantic = semantic_id[y1:y2 + 1, x1:x2 + 1]
+        projected_depth = depth_m[y1:y2 + 1, x1:x2 + 1]
+        depth_min, depth_max = annotation["visibility_depth_range_m"]
+        depth_visible = (
+            np.isfinite(projected_depth)
+            & (projected_depth > 0.0)
+            & (projected_depth >= float(depth_min))
+            & (projected_depth <= float(depth_max))
+        )
+        projected_area = int(projected_instance.size)
+        mask_id = target_mask_id_for_class(str(annotation["class_name"]))
+        expected_semantic_ids = np.array(
+            annotation["semantic_ids"],
+            dtype=np.uint8,
+        )
+        actor_cx = 0.5 * (x1 + x2)
+        actor_cy = 0.5 * (y1 + y2)
+        actor_diag = max(1.0, math.hypot(x2 - x1 + 1, y2 - y1 + 1))
+
+        actor_candidates: List[Dict[str, Any]] = []
+        for value in np.unique(projected_instance):
+            current_id = int(value)
+            if current_id == 0:
+                continue
+            instance_pixels = projected_instance == value
+            instance_px = int(np.count_nonzero(instance_pixels))
+            if instance_px < min_mask_px:
+                continue
+
+            consistent_pixels = instance_pixels & depth_visible
+            overlap_px = int(np.count_nonzero(consistent_pixels))
+            if overlap_px < min_mask_px:
+                continue
+            depth_consistency = overlap_px / float(instance_px)
+            if depth_consistency < 0.50:
+                continue
+
+            ys_crop, xs_crop = np.where(consistent_pixels)
+            candidate_cx = float(xs_crop.mean() + x1)
+            candidate_cy = float(ys_crop.mean() + y1)
+            center_score = max(
+                0.0,
+                1.0 - math.hypot(
+                    candidate_cx - actor_cx,
+                    candidate_cy - actor_cy,
+                ) / actor_diag,
+            )
+            projected_fill_ratio = overlap_px / float(max(projected_area, 1))
+            instance_semantic_ratio = float(np.count_nonzero(
+                np.isin(
+                    projected_instance_semantic[consistent_pixels],
+                    expected_semantic_ids,
+                )
+            )) / float(overlap_px)
+            sensor_semantic_ratio = float(np.count_nonzero(
+                np.isin(
+                    projected_semantic[consistent_pixels],
+                    expected_semantic_ids,
+                )
+            )) / float(overlap_px)
+            semantic_score = max(
+                instance_semantic_ratio,
+                sensor_semantic_ratio,
+            )
+
+            # 精确 ID 仍享有最高优先级；旧地图主要依赖后三项。
+            score = (
+                (100.0 if current_id == int(annotation["carla_actor_id"]) else 0.0)
+                + 6.0 * semantic_score
+                + 4.0 * depth_consistency
+                + 1.5 * center_score
+                + min(projected_fill_ratio, 0.6)
+                + math.log1p(overlap_px) / 20.0
+            )
+            raw_mask = np.zeros(instance_id.shape, dtype=bool)
+            raw_mask[y1:y2 + 1, x1:x2 + 1] = consistent_pixels
+            actor_candidates.append({
+                "score": score,
+                "instance_id": current_id,
+                "annotation": annotation,
+                "mask_id": mask_id,
+                "raw_mask": raw_mask,
+                "depth_consistency": depth_consistency,
+                "projected_fill_ratio": projected_fill_ratio,
+                "instance_semantic_ratio": instance_semantic_ratio,
+                "sensor_semantic_ratio": sensor_semantic_ratio,
+                "mask_source": "matched_legacy_instance_contour",
+            })
+
+        all_candidates.extend(sorted(
+            actor_candidates,
+            key=lambda item: float(item["score"]),
+            reverse=True,
+        )[:8])
+
+    used_actor_ids = set()
+    used_instance_ids = set()
+    selected_candidates: List[Dict[str, Any]] = []
+    for candidate in sorted(
+        all_candidates,
+        key=lambda item: float(item["score"]),
+        reverse=True,
+    ):
+        annotation = candidate["annotation"]
+        actor_id = int(annotation["carla_actor_id"])
+        current_id = int(candidate["instance_id"])
+        if actor_id in used_actor_ids or current_id in used_instance_ids:
+            continue
+        used_actor_ids.add(actor_id)
+        used_instance_ids.add(current_id)
+        selected_candidates.append(candidate)
+
+    # 远处轮廓先写，近处轮廓后写，重叠区域归属于可见的近处目标。
+    selected_candidates.sort(
+        key=lambda item: float(
+            item["annotation"].get("depth_m", {}).get("median") or 0.0
+        ),
+        reverse=True,
+    )
+    for candidate in selected_candidates:
+        annotation = candidate["annotation"]
+        mask_id = int(candidate["mask_id"])
+        raw_mask = candidate["raw_mask"]
+        component, component_ratio = largest_connected_component(raw_mask)
+        component_px = int(np.count_nonzero(component))
+        if component_px < min_mask_px:
+            continue
+        equivalent_side = float(np.sqrt(float(component_px)))
+        class_fill_threshold = (
+            min_vehicle_projected_fill_ratio
+            if mask_id == TARGET_VEHICLE_ID
+            else min_pedestrian_projected_fill_ratio
+        )
+        visible_threshold = (
+            min_vehicle_visible_equivalent_side_px
+            if mask_id == TARGET_VEHICLE_ID
+            else min_pedestrian_visible_equivalent_side_px
+        )
+        trainable = bool(
+            equivalent_side >= visible_threshold
+            and component_ratio >= min_largest_component_ratio
+            and float(candidate["projected_fill_ratio"])
+            >= 0.50 * class_fill_threshold
+        )
+        target_mask[component] = np.uint8(
+            mask_id if trainable else TARGET_IGNORE_ID
+        )
+        ys, xs = np.where(component)
+        bbox = [
+            int(xs.min()),
+            int(ys.min()),
+            int(xs.max()),
+            int(ys.max()),
+        ]
+        actor_id = int(annotation["carla_actor_id"])
+        instances.append({
+            "class_id": int(annotation["class_id"]),
+            "class_name": str(annotation["class_name"]),
+            "mask_id": mask_id,
+            "carla_instance_id": int(candidate["instance_id"]),
+            "carla_actor_id": actor_id,
+            "actor_type_id": annotation.get("actor_type_id"),
+            "bbox_xyxy": bbox,
+            "projected_bbox_xyxy": list(annotation.get(
+                "projected_bbox_xyxy",
+                annotation["bbox_xyxy"],
+            )),
+            "raw_visible_area_px": int(np.count_nonzero(raw_mask)),
+            "training_area_px": component_px,
+            "visible_equivalent_side_px": equivalent_side,
+            "largest_component_ratio": float(component_ratio),
+            "depth_consistency": float(candidate["depth_consistency"]),
+            "projected_fill_ratio": float(
+                candidate["projected_fill_ratio"]
+            ),
+            "instance_semantic_ratio": float(
+                candidate["instance_semantic_ratio"]
+            ),
+            "sensor_semantic_ratio": float(
+                candidate["sensor_semantic_ratio"]
+            ),
+            "match_score": float(candidate["score"]),
+            "mask_source": str(candidate["mask_source"]),
+            "trainable": trainable,
+        })
+
+    return target_mask, instances
+
+
 def colorize_target_semantic_mask(mask: np.ndarray) -> np.ndarray:
     color = np.zeros((*mask.shape, 3), dtype=np.uint8)
     color[mask == TARGET_VEHICLE_ID] = (0, 220, 0)
@@ -1779,6 +2429,106 @@ def project_world_location_to_image(
     return u, v, depth
 
 
+def fast_projected_target_precheck(
+    world: carla.World,
+    camera_transform: carla.Transform,
+    targets: List[TargetClass],
+    width: int,
+    height: int,
+    fov: float,
+    min_target_equivalent_side_px: float,
+    min_pedestrian_equivalent_side_px: float,
+    min_vehicle_visible_equivalent_side_px: float,
+    min_pedestrian_visible_equivalent_side_px: float,
+    min_vehicles_per_frame: int,
+    min_pedestrians_per_frame: int,
+    min_targets_per_frame: int,
+) -> Dict[str, Any]:
+    """快速排除从几何投影上就不可能满足硬标准的相机位姿。
+
+    这里只使用 actor 3D 框的最大可能投影，不替代正式的语义、深度、
+    遮挡、连通域和边界检查。能通过预检不代表合格；不能通过则一定
+    无法达到正式检查要求，因此不会降低数据集标准。
+    """
+    world_to_camera = np.array(
+        camera_transform.get_inverse_matrix(),
+        dtype=np.float64,
+    )
+    feasible_vehicles = 0
+    feasible_pedestrians = 0
+
+    vehicle_min_side = max(
+        float(min_target_equivalent_side_px),
+        float(min_vehicle_visible_equivalent_side_px),
+    )
+    pedestrian_min_side = max(
+        float(min_target_equivalent_side_px),
+        float(min_pedestrian_equivalent_side_px),
+        float(min_pedestrian_visible_equivalent_side_px),
+    )
+
+    actors = list(world.get_actors().filter("vehicle.*"))
+    actors.extend(list(world.get_actors().filter("walker.pedestrian.*")))
+    for actor in actors:
+        if actor is None or not actor.is_alive:
+            continue
+        target = target_for_actor(actor, targets)
+        if target is None:
+            continue
+        try:
+            vertices = actor.bounding_box.get_world_vertices(actor.get_transform())
+        except Exception:
+            continue
+        projected = [
+            point
+            for point in (
+                project_world_location_to_image(
+                    vertex,
+                    world_to_camera,
+                    width,
+                    height,
+                    fov,
+                )
+                for vertex in vertices
+            )
+            if point is not None
+        ]
+        if not projected:
+            continue
+
+        x1 = max(0.0, min(point[0] for point in projected))
+        y1 = max(0.0, min(point[1] for point in projected))
+        x2 = min(float(width - 1), max(point[0] for point in projected))
+        y2 = min(float(height - 1), max(point[1] for point in projected))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        equivalent_side = math.sqrt((x2 - x1 + 1.0) * (y2 - y1 + 1.0))
+
+        normalized_name = target.name.lower()
+        if normalized_name in ("vehicle", "car", "truck", "bus"):
+            if equivalent_side >= vehicle_min_side:
+                feasible_vehicles += 1
+        elif normalized_name in ("pedestrian", "person", "walker"):
+            if equivalent_side >= pedestrian_min_side:
+                feasible_pedestrians += 1
+
+    feasible_targets = feasible_vehicles + feasible_pedestrians
+    passes = bool(
+        feasible_vehicles >= int(min_vehicles_per_frame)
+        and feasible_pedestrians >= int(min_pedestrians_per_frame)
+        and feasible_targets >= int(min_targets_per_frame)
+    )
+    return {
+        "fast_pose_precheck": True,
+        "passes": passes,
+        "feasible_vehicle_count": feasible_vehicles,
+        "feasible_pedestrian_count": feasible_pedestrians,
+        "feasible_target_count": feasible_targets,
+        "vehicle_min_projected_side_px": vehicle_min_side,
+        "pedestrian_min_projected_side_px": pedestrian_min_side,
+    }
+
+
 def build_annotations_from_actors(
     world: carla.World,
     camera_transform: carla.Transform,
@@ -1846,10 +2596,14 @@ def build_annotations_from_actors(
         vs = [p[1] for p in projected]
         depths = [p[2] for p in projected]
 
-        x1 = max(0, int(math.floor(min(us))))
-        y1 = max(0, int(math.floor(min(vs))))
-        x2 = min(width - 1, int(math.ceil(max(us))))
-        y2 = min(height - 1, int(math.ceil(max(vs))))
+        raw_x1 = int(math.floor(min(us)))
+        raw_y1 = int(math.floor(min(vs)))
+        raw_x2 = int(math.ceil(max(us)))
+        raw_y2 = int(math.ceil(max(vs)))
+        x1 = max(0, raw_x1)
+        y1 = max(0, raw_y1)
+        x2 = min(width - 1, raw_x2)
+        y2 = min(height - 1, raw_y2)
 
         if x2 <= x1 or y2 <= y1:
             continue
@@ -1857,6 +2611,13 @@ def build_annotations_from_actors(
         projected_bw = x2 - x1 + 1
         projected_bh = y2 - y1 + 1
         projected_area = int(projected_bw * projected_bh)
+        raw_projected_bw = max(1, raw_x2 - raw_x1 + 1)
+        raw_projected_bh = max(1, raw_y2 - raw_y1 + 1)
+        raw_projected_area = int(raw_projected_bw * raw_projected_bh)
+        truncation_ratio = 1.0 - min(
+            1.0,
+            projected_area / float(raw_projected_area),
+        )
 
         if projected_area < min_mask_px:
             continue
@@ -1892,7 +2653,12 @@ def build_annotations_from_actors(
             if target.name.lower() in ("vehicle", "car", "truck", "bus")
             else min_pedestrian_projected_fill_ratio
         )
-        visible_ratio_threshold = class_fill_ratio
+        # 同时满足类别轮廓填充率和用户设置的遮挡阈值。此前这里只使用
+        # class_fill_ratio，会让 visible_ratio < 0.50 的严重遮挡目标漏过。
+        visible_ratio_threshold = max(
+            float(class_fill_ratio),
+            float(min_actor_visible_ratio),
+        )
         if (
             visible_px < min_actor_visible_px
             or visible_ratio_projected < visible_ratio_threshold
@@ -1950,6 +2716,19 @@ def build_annotations_from_actors(
             "bbox_xyxy": [x1_visible, y1_visible, x2_visible, y2_visible],
             "projected_bbox_xywh": [x1, y1, projected_bw, projected_bh],
             "projected_bbox_xyxy": [x1, y1, x2, y2],
+            "projected_bbox_unclipped_xywh": [
+                raw_x1,
+                raw_y1,
+                raw_projected_bw,
+                raw_projected_bh,
+            ],
+            "projected_bbox_unclipped_xyxy": [
+                raw_x1,
+                raw_y1,
+                raw_x2,
+                raw_y2,
+            ],
+            "truncation_ratio": float(truncation_ratio),
             "area_px": area,
             "bbox_area_px": bbox_area,
             "area_ratio": float(area_ratio),
@@ -2079,7 +2858,7 @@ def save_annotation_modalities(
         mask_u8 = (mask.astype(np.uint8) * 255)
 
         mask_path = mask_dir / f"{frame_stem}_ann{ann['id']:03d}.png"
-        cv2.imwrite(str(mask_path), mask_u8)
+        write_image(mask_path, mask_u8)
 
         depth_crop = depth_m[y:y + h, x:x + w].astype(np.float32)
         mask_crop = mask[y:y + h, x:x + w]
@@ -2100,9 +2879,9 @@ def save_annotation_modalities(
             invalid_value=np.nan
         )
         np.save(disparity_npy_path, disparity_crop.astype(np.float32))
-        cv2.imwrite(str(depth_vis_path), metric_depth_to_u16(depth_crop_masked, max_depth_vis_m))
-        cv2.imwrite(str(depth_color_path), metric_depth_to_color_bgr(depth_crop_masked, max_depth_vis_m))
-        cv2.imwrite(
+        write_image(depth_vis_path, metric_depth_to_u16(depth_crop_masked, max_depth_vis_m))
+        write_image(depth_color_path, metric_depth_to_color_bgr(depth_crop_masked, max_depth_vis_m))
+        write_image(
             str(disparity_path),
             (np.nan_to_num(disparity_crop, nan=0.0) * 65535.0).astype(np.uint16)
         )
@@ -2431,14 +3210,17 @@ def setup_camera_blueprint(
                 "enable_postprocess_effects",
                 "true" if enable_rgb_postprocess else "false"
             )
-        if not enable_rgb_postprocess:
-            for attr_name in (
-                "motion_blur_intensity",
-                "motion_blur_max_distortion",
-                "motion_blur_min_object_screen_size"
-            ):
-                if bp.has_attribute(attr_name):
-                    bp.set_attribute(attr_name, "0.0")
+        # The random UAV route teleports the camera between road locations.
+        # Keep exposure/weather post-processing, but always disable temporal
+        # motion blur so the first image at a new pose does not contain foliage
+        # streaks or geometry ghosts from the previous pose.
+        for attr_name in (
+            "motion_blur_intensity",
+            "motion_blur_max_distortion",
+            "motion_blur_min_object_screen_size"
+        ):
+            if bp.has_attribute(attr_name):
+                bp.set_attribute(attr_name, "0.0")
 
     return bp
 
@@ -2593,10 +3375,18 @@ def random_road_uav_transform(
     radius_min: float,
     radius_max: float,
     pitch_min: float,
-    pitch_max: float
+    pitch_max: float,
+    roi_center_x: float = 0.0,
+    roi_center_y: float = 0.0,
+    roi_radius_m: float = 0.0
 ) -> carla.Transform:
     """Generate an oblique UAV pose whose horizontal origin is over a road."""
-    spawn_points = carla_map.get_spawn_points()
+    spawn_points = road_spawn_points_in_roi(
+        carla_map,
+        roi_center_x,
+        roi_center_y,
+        roi_radius_m
+    )
     if len(spawn_points) == 0:
         raise RuntimeError("地图没有车辆 spawn point，无法生成道路上方相机位姿。")
 
@@ -2659,12 +3449,24 @@ def random_pedestrian_centered_road_uav_transform(
     radius_min: float,
     radius_max: float,
     pitch_min: float,
-    pitch_max: float
+    pitch_max: float,
+    roi_center_x: float = 0.0,
+    roi_center_y: float = 0.0,
+    roi_radius_m: float = 0.0
 ) -> carla.Transform:
     """Aim from a road waypoint above ground toward a live pedestrian."""
     live_pedestrians = [
         actor for actor in pedestrian_actors
-        if actor is not None and actor.is_alive
+        if (
+            actor is not None
+            and actor.is_alive
+            and location_in_camera_roi(
+                actor.get_location(),
+                roi_center_x,
+                roi_center_y,
+                roi_radius_m
+            )
+        )
     ]
     if not live_pedestrians:
         return random_road_uav_transform(
@@ -2674,7 +3476,10 @@ def random_pedestrian_centered_road_uav_transform(
             radius_min=radius_min,
             radius_max=radius_max,
             pitch_min=pitch_min,
-            pitch_max=pitch_max
+            pitch_max=pitch_max,
+            roi_center_x=roi_center_x,
+            roi_center_y=roi_center_y,
+            roi_radius_m=roi_radius_m
         )
 
     target_actor = random.choice(live_pedestrians)
@@ -2691,7 +3496,10 @@ def random_pedestrian_centered_road_uav_transform(
             radius_min=radius_min,
             radius_max=radius_max,
             pitch_min=pitch_min,
-            pitch_max=pitch_max
+            pitch_max=pitch_max,
+            roi_center_x=roi_center_x,
+            roi_center_y=roi_center_y,
+            roi_radius_m=roi_radius_m
         )
 
     altitude = random.uniform(height_min, height_max)
@@ -2710,7 +3518,16 @@ def random_pedestrian_centered_road_uav_transform(
         step = getattr(target_waypoint, direction_name, None)
         if not callable(step):
             continue
-        candidates = step(aim_distance)
+        candidates = [
+            candidate
+            for candidate in step(aim_distance)
+            if location_in_camera_roi(
+                candidate.transform.location,
+                roi_center_x,
+                roi_center_y,
+                roi_radius_m
+            )
+        ]
         if candidates:
             camera_waypoint = random.choice(candidates)
             break
@@ -2723,7 +3540,10 @@ def random_pedestrian_centered_road_uav_transform(
             radius_min=radius_min,
             radius_max=radius_max,
             pitch_min=pitch_min,
-            pitch_max=pitch_max
+            pitch_max=pitch_max,
+            roi_center_x=roi_center_x,
+            roi_center_y=roi_center_y,
+            roi_radius_m=roi_radius_m
         )
 
     camera_ground = camera_waypoint.transform.location
@@ -2757,8 +3577,185 @@ def ground_aim_radius(
     return min(max(radius, float(radius_min)), float(radius_max))
 
 
-def random_road_center(carla_map) -> Tuple[float, float]:
-    spawn_points = carla_map.get_spawn_points()
+def location_in_camera_roi(
+    location: carla.Location,
+    center_x: float,
+    center_y: float,
+    radius_m: float
+) -> bool:
+    """判断位置是否位于配置的圆形相机采样区域内。"""
+    if radius_m <= 0.0:
+        return True
+    dx = float(location.x) - float(center_x)
+    dy = float(location.y) - float(center_y)
+    return dx * dx + dy * dy <= float(radius_m) * float(radius_m)
+
+
+def camera_yaw_difference_deg(yaw_a: float, yaw_b: float) -> float:
+    """返回两个航向角之间的最小夹角，范围为 0 到 180 度。"""
+    return abs((float(yaw_a) - float(yaw_b) + 180.0) % 360.0 - 180.0)
+
+
+def camera_grid_key(x: float, y: float, grid_size_m: float) -> Tuple[int, int]:
+    """把世界坐标转换为稳定的二维采样网格编号。"""
+    return (
+        int(math.floor(float(x) / float(grid_size_m))),
+        int(math.floor(float(y) / float(grid_size_m))),
+    )
+
+
+def camera_pose_record(
+    transform: carla.Transform,
+    sequence: str = "",
+    frame_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """把 CARLA 位姿转换为可用于跨序列去重的轻量记录。"""
+    return {
+        "x": float(transform.location.x),
+        "y": float(transform.location.y),
+        "z": float(transform.location.z),
+        "yaw": float(transform.rotation.yaw),
+        "pitch": float(transform.rotation.pitch),
+        "sequence": str(sequence),
+        "frame_id": frame_id,
+    }
+
+
+def load_saved_camera_pose_history(out_root: Path) -> List[Dict[str, Any]]:
+    """从已有标注恢复位姿，使续采的 seq 不会重新拍摄相同位置。"""
+    history: List[Dict[str, Any]] = []
+    for ann_path in sorted(out_root.glob("paired_weather/seq_*/annotations/*.json")):
+        try:
+            payload = json.loads(ann_path.read_text(encoding="utf-8"))
+            transform = payload["camera_transform"]
+            location = transform["location"]
+            rotation = transform["rotation"]
+            history.append({
+                "x": float(location["x"]),
+                "y": float(location["y"]),
+                "z": float(location.get("z", 0.0)),
+                "yaw": float(rotation["yaw"]),
+                "pitch": float(rotation.get("pitch", 0.0)),
+                "sequence": str(payload.get("sequence", "")),
+                "frame_id": payload.get("frame_id"),
+            })
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
+            print(f"[WARN] 无法读取已有相机位姿，已跳过：{ann_path}")
+    return history
+
+
+def build_camera_grid_counts(
+    history: List[Dict[str, Any]],
+    grid_size_m: float,
+) -> Counter:
+    """统计已有数据在各相机网格中的帧数。"""
+    if grid_size_m <= 0.0:
+        return Counter()
+    return Counter(
+        camera_grid_key(record["x"], record["y"], grid_size_m)
+        for record in history
+    )
+
+
+def camera_pose_rejection_stats(
+    transform: carla.Transform,
+    history: List[Dict[str, Any]],
+    grid_counts: Counter,
+    min_position_distance_m: float,
+    min_yaw_difference_deg: float,
+    history_window: int,
+    grid_size_m: float,
+    max_frames_per_grid: int,
+) -> Optional[Dict[str, Any]]:
+    """检查候选相机位姿是否与历史重复，并返回可读的拒绝原因。"""
+    x = float(transform.location.x)
+    y = float(transform.location.y)
+    yaw = float(transform.rotation.yaw)
+
+    if grid_size_m > 0.0 and max_frames_per_grid > 0:
+        grid = camera_grid_key(x, y, grid_size_m)
+        grid_count = int(grid_counts.get(grid, 0))
+        if grid_count >= max_frames_per_grid:
+            return {
+                "camera_pose_duplicate": True,
+                "reason": "camera_grid_quota_reached",
+                "grid": list(grid),
+                "grid_count": grid_count,
+                "max_frames_per_grid": int(max_frames_per_grid),
+            }
+
+    if min_position_distance_m <= 0.0 or not history:
+        return None
+
+    compared_history = history
+    if history_window > 0:
+        compared_history = history[-history_window:]
+
+    closest_distance = None
+    closest_yaw_difference = None
+    for record in compared_history:
+        distance = math.hypot(x - float(record["x"]), y - float(record["y"]))
+        if distance >= min_position_distance_m:
+            continue
+        yaw_difference = camera_yaw_difference_deg(yaw, float(record["yaw"]))
+        if closest_distance is None or distance < closest_distance:
+            closest_distance = distance
+            closest_yaw_difference = yaw_difference
+        if min_yaw_difference_deg <= 0.0 or yaw_difference < min_yaw_difference_deg:
+            return {
+                "camera_pose_duplicate": True,
+                "reason": "camera_pose_too_similar",
+                "distance_m": float(distance),
+                "yaw_difference_deg": float(yaw_difference),
+                "min_position_distance_m": float(min_position_distance_m),
+                "min_yaw_difference_deg": float(min_yaw_difference_deg),
+                "matched_sequence": record.get("sequence", ""),
+                "matched_frame_id": record.get("frame_id"),
+            }
+
+    return None
+
+
+def road_spawn_points_in_roi(
+    carla_map,
+    center_x: float,
+    center_y: float,
+    radius_m: float
+) -> List[carla.Transform]:
+    """ROI 关闭时返回全部道路出生点，开启时只返回区域内的点。"""
+    spawn_points = list(carla_map.get_spawn_points())
+    if radius_m <= 0.0:
+        return spawn_points
+    filtered = [
+        transform
+        for transform in spawn_points
+        if location_in_camera_roi(
+            transform.location,
+            center_x,
+            center_y,
+            radius_m
+        )
+    ]
+    if not filtered:
+        raise RuntimeError(
+            "相机 ROI 内没有道路 spawn point："
+            f"center=({center_x:.2f}, {center_y:.2f}), radius={radius_m:.2f}m"
+        )
+    return filtered
+
+
+def random_road_center(
+    carla_map,
+    roi_center_x: float = 0.0,
+    roi_center_y: float = 0.0,
+    roi_radius_m: float = 0.0
+) -> Tuple[float, float]:
+    spawn_points = road_spawn_points_in_roi(
+        carla_map,
+        roi_center_x,
+        roi_center_y,
+        roi_radius_m
+    )
     if len(spawn_points) == 0:
         return 0.0, 0.0
 
@@ -2819,13 +3816,116 @@ def destroy_live_two_wheel_vehicles(world: carla.World) -> int:
     return removed
 
 
+def horizontal_distance_m(
+    first: carla.Location,
+    second: carla.Location,
+) -> float:
+    return math.hypot(first.x - second.x, first.y - second.y)
+
+
+def drivable_surface_z_below(
+    world: carla.World,
+    carla_map: carla.Map,
+    location: carla.Location,
+    cast_above_m: float = 8.0,
+    cast_below_m: float = 20.0,
+) -> Optional[float]:
+    """返回出生点下方与 OpenDRIVE 道路高度一致的可行驶表面。"""
+    waypoint_z: Optional[float] = None
+    try:
+        waypoint = carla_map.get_waypoint(
+            location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+        if waypoint is not None:
+            waypoint_z = float(waypoint.transform.location.z)
+    except (AttributeError, RuntimeError):
+        pass
+
+    if not hasattr(world, "cast_ray"):
+        return waypoint_z
+
+    start = carla.Location(
+        x=location.x,
+        y=location.y,
+        z=location.z + cast_above_m,
+    )
+    end = carla.Location(
+        x=location.x,
+        y=location.y,
+        z=location.z - cast_below_m,
+    )
+
+    try:
+        hits = world.cast_ray(start, end)
+    except (AttributeError, RuntimeError):
+        return waypoint_z
+
+    preferred_labels = {
+        label
+        for label in (
+            getattr(carla.CityObjectLabel, "Roads", None),
+            getattr(carla.CityObjectLabel, "RoadLines", None),
+            getattr(carla.CityObjectLabel, "Sidewalks", None),
+            getattr(carla.CityObjectLabel, "Ground", None),
+        )
+        if label is not None
+    }
+    surface_z_values: List[float] = []
+    for hit in hits:
+        if getattr(hit, "label", None) not in preferred_labels:
+            continue
+        hit_location = getattr(hit, "location", None)
+        if hit_location is None or hit_location.z > location.z + 1.0:
+            continue
+        surface_z_values.append(float(hit_location.z))
+
+    if surface_z_values:
+        if waypoint_z is not None:
+            return min(surface_z_values, key=lambda value: abs(value - waypoint_z))
+        return max(surface_z_values)
+    return waypoint_z
+
+
+def grounded_vehicle_transform(
+    actor: carla.Actor,
+    source_transform: carla.Transform,
+    surface_z: float,
+    clearance_m: float,
+) -> carla.Transform:
+    bounding_box = actor.bounding_box
+    actor_origin_z = (
+        surface_z
+        - float(bounding_box.location.z)
+        + float(bounding_box.extent.z)
+        + clearance_m
+    )
+    return carla.Transform(
+        carla.Location(
+            x=source_transform.location.x,
+            y=source_transform.location.y,
+            z=actor_origin_z,
+        ),
+        source_transform.rotation,
+    )
+
+
 def spawn_background_traffic(
     client: carla.Client,
     world: carla.World,
     number_of_vehicles: int,
     number_of_walkers: int,
     tm_port: int,
-    seed: int
+    seed: int,
+    roi_center_x: float = 0.0,
+    roi_center_y: float = 0.0,
+    roi_radius_m: float = 0.0,
+    ground_vehicles_on_spawn: bool = False,
+    vehicle_ground_clearance_m: float = 0.05,
+    vehicle_settle_frames: int = 10,
+    vehicle_spawn_min_distance_m: float = 3.0,
+    vehicle_motion_mode: str = "autopilot",
 ) -> Tuple[List[carla.Actor], List[carla.Actor], List[carla.Actor]]:
     """
     生成背景车辆和行人。
@@ -2843,7 +3943,12 @@ def spawn_background_traffic(
 
     blueprint_library = world.get_blueprint_library()
     carla_map = world.get_map()
-    spawn_points = carla_map.get_spawn_points()
+    spawn_points = road_spawn_points_in_roi(
+        carla_map,
+        roi_center_x,
+        roi_center_y,
+        roi_radius_m
+    )
 
     traffic_manager = client.get_trafficmanager(tm_port)
     traffic_manager.set_global_distance_to_leading_vehicle(2.5)
@@ -2863,7 +3968,32 @@ def spawn_background_traffic(
         raise RuntimeError("没有可用的四轮 vehicle blueprint。")
     random.shuffle(spawn_points)
 
-    for sp in spawn_points[:number_of_vehicles]:
+    occupied_vehicle_locations = [
+        actor.get_location()
+        for actor in world.get_actors().filter("vehicle.*")
+    ]
+    vehicle_spawn_attempts = 0
+    for sp in spawn_points:
+        if len(vehicles) >= number_of_vehicles:
+            break
+        vehicle_spawn_attempts += 1
+        if any(
+            horizontal_distance_m(sp.location, location)
+            < vehicle_spawn_min_distance_m
+            for location in occupied_vehicle_locations
+        ):
+            continue
+
+        surface_z: Optional[float] = None
+        if ground_vehicles_on_spawn:
+            surface_z = drivable_surface_z_below(
+                world,
+                carla_map,
+                sp.location,
+            )
+            if surface_z is None:
+                continue
+
         bp = random.choice(vehicle_bps)
 
         if bp.has_attribute("role_name"):
@@ -2876,19 +4006,88 @@ def spawn_background_traffic(
 
         actor = world.try_spawn_actor(bp, sp)
 
-        if actor is not None:
+        if actor is None:
+            continue
+
+        if ground_vehicles_on_spawn:
+            try:
+                actor.set_simulate_physics(False)
+                grounded_transform = grounded_vehicle_transform(
+                    actor,
+                    sp,
+                    surface_z,
+                    vehicle_ground_clearance_m,
+                )
+                actor.set_transform(grounded_transform)
+                occupied_vehicle_locations.append(grounded_transform.location)
+            except (AttributeError, RuntimeError):
+                actor.destroy()
+                continue
+        elif vehicle_motion_mode == "autopilot":
             actor.set_autopilot(True, traffic_manager.get_port())
-            vehicles.append(actor)
+            occupied_vehicle_locations.append(sp.location)
+        vehicles.append(actor)
+
+    if ground_vehicles_on_spawn and vehicles:
+        world.tick()
+        if vehicle_motion_mode == "static":
+            print(
+                "[INFO] Grounded static vehicles: "
+                f"spawned={len(vehicles)}, attempts={vehicle_spawn_attempts}, "
+                f"clearance={vehicle_ground_clearance_m:.2f}m"
+            )
+        else:
+            for actor in vehicles:
+                try:
+                    actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+                    actor.set_target_angular_velocity(
+                        carla.Vector3D(0.0, 0.0, 0.0)
+                    )
+                    actor.set_simulate_physics(True)
+                except (AttributeError, RuntimeError):
+                    pass
+            for _ in range(vehicle_settle_frames):
+                world.tick()
+            for actor in vehicles:
+                try:
+                    actor.set_autopilot(True, traffic_manager.get_port())
+                except RuntimeError:
+                    pass
+            print(
+                "[INFO] Grounded vehicles before autopilot: "
+                f"spawned={len(vehicles)}, attempts={vehicle_spawn_attempts}, "
+                f"clearance={vehicle_ground_clearance_m:.2f}m, "
+                f"settle_frames={vehicle_settle_frames}"
+            )
 
     walker_bps = blueprint_library.filter("walker.pedestrian.*")
     controller_bp = blueprint_library.find("controller.ai.walker")
 
-    for _ in range(number_of_walkers):
+    walker_spawn_attempts = 0
+    max_walker_spawn_attempts = max(number_of_walkers, number_of_walkers * 20)
+    while (
+        len(walkers) < number_of_walkers
+        and walker_spawn_attempts < max_walker_spawn_attempts
+    ):
+        walker_spawn_attempts += 1
         loc = world.get_random_location_from_navigation()
 
         if loc is None:
             continue
+        if not location_in_camera_roi(
+            loc,
+            roi_center_x,
+            roi_center_y,
+            roi_radius_m
+        ):
+            continue
 
+        # Recast locations sit exactly on the navigation surface.  The CCSP
+        # package rejects most walkers at that Z because their capsule already
+        # overlaps the cooked pavement collision.  A small lift matches the
+        # standard CARLA walker spawning convention and lets gravity settle
+        # the actor onto the sidewalk on the next tick.
+        loc.z += 0.35
         transform = carla.Transform(loc)
         walker_bp = random.choice(walker_bps)
 
@@ -2917,7 +4116,19 @@ def spawn_background_traffic(
     for controller in walker_controllers:
         try:
             controller.start()
-            destination = world.get_random_location_from_navigation()
+            destination = None
+            for _ in range(100):
+                candidate = world.get_random_location_from_navigation()
+                if candidate is None:
+                    continue
+                if location_in_camera_roi(
+                    candidate,
+                    roi_center_x,
+                    roi_center_y,
+                    roi_radius_m
+                ):
+                    destination = candidate
+                    break
             if destination is not None:
                 controller.go_to_location(destination)
             controller.set_max_speed(random.uniform(0.8, 1.6))
@@ -2926,7 +4137,8 @@ def spawn_background_traffic(
 
     print(
         f"[INFO] Spawned traffic: vehicles={len(vehicles)}, "
-        f"walkers={len(walkers)}, walker_controllers={len(walker_controllers)}"
+        f"walkers={len(walkers)}, walker_controllers={len(walker_controllers)}, "
+        f"walker_spawn_attempts={walker_spawn_attempts}"
     )
 
     return vehicles, walkers, walker_controllers
@@ -3098,11 +4310,11 @@ def save_lidar_depth(
     )
     np.save(points_path, points.astype(np.float32))
     np.save(projected_npy_path, sparse_depth.astype(np.float32))
-    cv2.imwrite(
+    write_image(
         str(projected_vis_path),
         metric_depth_to_u16(sparse_depth, max_depth_vis_m)
     )
-    cv2.imwrite(
+    write_image(
         str(projected_color_path),
         metric_depth_to_color_bgr(sparse_depth, max_depth_vis_m)
     )
@@ -3166,7 +4378,7 @@ def number_stats(values: List[float]) -> Dict[str, Optional[float]]:
 
 def read_dataset_frame_records(out_root: Path) -> List[Dict[str, Any]]:
     records = []
-    for ann_path in sorted(out_root.glob("**/seq_*/annotations/*.json")):
+    for ann_path in sorted(out_root.glob("paired_weather/seq_*/annotations/*.json")):
         data = json.loads(ann_path.read_text(encoding="utf-8"))
         image_info = data.get("image", {})
         required_four_modalities = (
@@ -3380,7 +4592,7 @@ def write_coco_files(
 def compute_dataset_quality_report(
     out_root: Path,
     records: List[Dict[str, Any]],
-    road_semantic_ids: List[int]
+    road_validation_mode: str,
 ) -> Dict[str, Any]:
     frame_counts = []
     bbox_w = []
@@ -3389,7 +4601,6 @@ def compute_dataset_quality_report(
     bbox_max_side = []
     bbox_area_ratio = []
     depth_mean = []
-    road_ratios = []
     rgb_small = []
 
     for record in records:
@@ -3403,23 +4614,6 @@ def compute_dataset_quality_report(
         rgb = cv2.imread(str(rgb_path), cv2.IMREAD_GRAYSCALE)
         if rgb is not None:
             rgb_small.append(cv2.resize(rgb, (64, 36)).astype(np.float32) / 255.0)
-
-        segmentation_rel = data["image"].get(
-            "segmentation",
-            data["image"].get("semantic_id")
-        )
-        semantic_id = None
-        if segmentation_rel is not None:
-            semantic_id = cv2.imread(
-                str(out_root / segmentation_rel),
-                cv2.IMREAD_UNCHANGED
-            )
-        if semantic_id is not None:
-            road_mask = np.isin(
-                semantic_id,
-                np.array(road_semantic_ids, dtype=np.uint8)
-            )
-            road_ratios.append(float(np.mean(road_mask)))
 
         for ann in anns:
             _, _, w, h = [float(v) for v in ann["bbox_xywh"]]
@@ -3452,7 +4646,15 @@ def compute_dataset_quality_report(
         "bbox_max_side_px": number_stats(bbox_max_side),
         "bbox_area_ratio": number_stats(bbox_area_ratio),
         "depth_mean_m": number_stats(depth_mean),
-        "road_visible_ratio": number_stats(road_ratios),
+        "road_validation": {
+            "mode": str(road_validation_mode),
+            "passed_during_collection": True,
+            "road_semantic_ratio_available": False,
+            "note": (
+                "The saved segmentation modality is the trainable target mask, "
+                "not a full-scene road semantic map."
+            ),
+        },
         "adjacent_rgb_mean_abs_diff_64x36": number_stats(adjacent_mad),
         "small_target_ratio_max_side_le_96": small_96,
         "very_small_target_ratio_max_side_le_48": small_48,
@@ -3483,7 +4685,8 @@ def write_quality_report_files(
         f"- Very small target ratio, max side <= 48 px: {report['very_small_target_ratio_max_side_le_48']:.3f}",
         f"- Mean annotations/frame: {format_metric(report['annotations_per_frame']['mean'])}",
         f"- Median bbox max side px: {format_metric(report['bbox_max_side_px']['median'])}",
-        f"- Mean road visible ratio: {format_metric(report['road_visible_ratio']['mean'])}",
+        f"- Road validation mode: {report['road_validation']['mode']}",
+        "- Road validation: passed during collection",
         f"- Mean adjacent RGB MAD: {format_metric(report['adjacent_rgb_mean_abs_diff_64x36']['mean'])}",
         "",
         "This report is generated automatically after collection.",
@@ -3598,7 +4801,11 @@ def write_dataset_standard_artifacts(
         targets=args.target,
         dataset_name=manifest["dataset"],
     )
-    report = compute_dataset_quality_report(out_root, records, args.road_semantic_ids)
+    report = compute_dataset_quality_report(
+        out_root,
+        records,
+        args.road_validation_mode,
+    )
     report_paths = write_quality_report_files(out_root, report)
     readme_path = write_dataset_readme(out_root, manifest, report)
     config_snapshot = write_config_snapshot(out_root, args.config)
@@ -3620,7 +4827,9 @@ def write_dataset_standard_artifacts(
 # ============================================================
 
 def main() -> None:
+    global PNG_COMPRESSION_LEVEL
     args = parse_args()
+    PNG_COMPRESSION_LEVEL = int(args.png_compression_level)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -3653,6 +4862,54 @@ def main() -> None:
         args.height_min, args.height_max = args.height_max, args.height_min
     if args.safe_camera_min_z <= 0.0:
         raise ValueError("--safe-camera-min-z 必须大于 0")
+    if args.camera_roi_radius_m < 0.0:
+        raise ValueError("--camera-roi-radius-m 不能小于 0")
+    if args.camera_min_position_distance_m < 0.0:
+        raise ValueError("--camera-min-position-distance-m 不能小于 0")
+    if not 0.0 <= args.camera_min_yaw_difference_deg <= 180.0:
+        raise ValueError("--camera-min-yaw-difference-deg 必须在 0 到 180 之间")
+    if args.camera_pose_history_window < 0:
+        raise ValueError("--camera-pose-history-window 不能小于 0")
+    if args.camera_grid_size_m < 0.0:
+        raise ValueError("--camera-grid-size-m 不能小于 0")
+    if args.max_frames_per_camera_grid < 0:
+        raise ValueError("--max-frames-per-camera-grid 不能小于 0")
+    if (
+        args.max_frames_per_camera_grid > 0
+        and args.camera_grid_size_m <= 0.0
+    ):
+        raise ValueError(
+            "启用 --max-frames-per-camera-grid 时 camera_grid_size_m 必须大于 0"
+        )
+    if args.streaming_warmup_frames < 0:
+        raise ValueError("--streaming-warmup-frames 不能小于 0")
+    if args.streaming_rewarm_distance_m < 0.0:
+        raise ValueError("--streaming-rewarm-distance-m 不能小于 0")
+    for value, name in (
+        (args.streaming_min_geometry_ratio, "--streaming-min-geometry-ratio"),
+        (args.streaming_min_labeled_ratio, "--streaming-min-labeled-ratio"),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} 必须在 0 到 1 之间")
+    if args.streaming_geometry_max_depth_m <= 0.0:
+        raise ValueError("--streaming-geometry-max-depth-m 必须大于 0")
+    if args.streaming_readiness_retries < 0:
+        raise ValueError("--streaming-readiness-retries 不能小于 0")
+    if args.streaming_readiness_step_frames < 1:
+        raise ValueError("--streaming-readiness-step-frames 必须至少为 1")
+    if not 0 <= args.png_compression_level <= 9:
+        raise ValueError("--png-compression-level 必须在 0 到 9 之间")
+    if args.max_expensive_pose_retries < 0:
+        raise ValueError("--max-expensive-pose-retries 不能小于 0")
+    if args.vehicle_ground_clearance_m < 0.0:
+        raise ValueError("--vehicle-ground-clearance-m 不能小于 0")
+    if args.vehicle_settle_frames < 0:
+        raise ValueError("--vehicle-settle-frames 不能小于 0")
+    if args.vehicle_spawn_min_distance_m < 0.0:
+        raise ValueError("--vehicle-spawn-min-distance-m 不能小于 0")
+    if args.vehicle_motion_mode == "static" and not args.ground_vehicles_on_spawn:
+        print("[WARN] static 车辆模式已自动开启车辆贴地处理。")
+        args.ground_vehicles_on_spawn = True
     if args.min_target_equivalent_side_px < 0.0:
         raise ValueError("--min-target-equivalent-side-px 不能小于 0")
     if args.min_pedestrian_equivalent_side_px < 0.0:
@@ -3708,6 +4965,30 @@ def main() -> None:
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
 
+    camera_pose_history = (
+        load_saved_camera_pose_history(out_root)
+        if args.preserve_existing_sequences
+        else []
+    )
+    camera_grid_counts = build_camera_grid_counts(
+        camera_pose_history,
+        args.camera_grid_size_m,
+    )
+    initial_camera_pose_history_count = len(camera_pose_history)
+    if (
+        args.camera_min_position_distance_m > 0.0
+        or args.max_frames_per_camera_grid > 0
+    ):
+        print(
+            "[INFO] Camera pose diversity filter: "
+            f"history={initial_camera_pose_history_count}, "
+            f"min_distance={args.camera_min_position_distance_m:.1f}m, "
+            f"min_yaw={args.camera_min_yaw_difference_deg:.1f}deg, "
+            f"history_window={args.camera_pose_history_window or 'all'}, "
+            f"grid={args.camera_grid_size_m:.1f}m, "
+            f"max_per_grid={args.max_frames_per_camera_grid or 'unlimited'}"
+        )
+
     client = carla.Client(args.host, args.port)
     client.set_timeout(args.timeout)
 
@@ -3733,6 +5014,11 @@ def main() -> None:
         settings = world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = fixed_delta_seconds
+        if (
+            args.spectator_follow_camera
+            and hasattr(settings, "spectator_as_ego")
+        ):
+            settings.spectator_as_ego = True
         world.apply_settings(settings)
 
         print("[INFO] Applied synchronous mode.")
@@ -3797,7 +5083,7 @@ def main() -> None:
                 "weather_candidates": list(selected_weather_names),
                 "weather_schedule": weather_schedule,
                 "sequence_index": start_index + local_seq_idx,
-                "sequence_root": paired_root
+                "sequence_root": paired_root,
             })
 
         rgb_images_per_frame = (
@@ -3823,7 +5109,15 @@ def main() -> None:
                 number_of_vehicles=args.vehicles,
                 number_of_walkers=args.walkers,
                 tm_port=args.tm_port,
-                seed=args.seed
+                seed=args.seed,
+                roi_center_x=args.camera_roi_center_x,
+                roi_center_y=args.camera_roi_center_y,
+                roi_radius_m=args.camera_roi_radius_m,
+                ground_vehicles_on_spawn=args.ground_vehicles_on_spawn,
+                vehicle_ground_clearance_m=args.vehicle_ground_clearance_m,
+                vehicle_settle_frames=args.vehicle_settle_frames,
+                vehicle_spawn_min_distance_m=args.vehicle_spawn_min_distance_m,
+                vehicle_motion_mode=args.vehicle_motion_mode
             )
 
             traffic_actors.extend(vehicles)
@@ -4000,7 +5294,47 @@ def main() -> None:
                 "min_near_depth_m": args.min_near_depth_m,
                 "max_near_depth_ratio": args.max_near_depth_ratio,
                 "min_road_visible_ratio": args.min_road_visible_ratio,
-                "road_semantic_ids": args.road_semantic_ids
+                "road_semantic_ids": args.road_semantic_ids,
+                "road_validation_mode": args.road_validation_mode,
+                "camera_roi": {
+                    "center": [
+                        args.camera_roi_center_x,
+                        args.camera_roi_center_y
+                    ],
+                    "radius_m": args.camera_roi_radius_m,
+                    "enabled": args.camera_roi_radius_m > 0.0
+                },
+                "pose_diversity": {
+                    "min_position_distance_m": (
+                        args.camera_min_position_distance_m
+                    ),
+                    "min_yaw_difference_deg": (
+                        args.camera_min_yaw_difference_deg
+                    ),
+                    "history_window": args.camera_pose_history_window,
+                    "grid_size_m": args.camera_grid_size_m,
+                    "max_frames_per_grid": (
+                        args.max_frames_per_camera_grid
+                    ),
+                    "loaded_history_count": (
+                        initial_camera_pose_history_count
+                    ),
+                },
+                "spectator_follow_camera": args.spectator_follow_camera,
+                "streaming_warmup_frames": args.streaming_warmup_frames,
+                "streaming_rewarm_distance_m": (
+                    args.streaming_rewarm_distance_m
+                ),
+                "streaming_readiness": {
+                    "min_geometry_ratio": args.streaming_min_geometry_ratio,
+                    "min_labeled_ratio": args.streaming_min_labeled_ratio,
+                    "geometry_max_depth_m": (
+                        args.streaming_geometry_max_depth_m
+                    ),
+                    "retries": args.streaming_readiness_retries,
+                    "step_frames": args.streaming_readiness_step_frames,
+                },
+                "fast_pose_precheck": args.fast_pose_precheck
             },
             "static_map_vehicle_filter": {
                 "hide_static_map_vehicles": args.hide_static_map_vehicles,
@@ -4138,8 +5472,48 @@ def main() -> None:
                 "center_xy": [base_center_x, base_center_y],
                 "road_centered_camera": args.road_centered_camera,
                 "camera_origin_over_road": args.camera_origin_over_road,
+                "camera_roi": {
+                    "center": [
+                        args.camera_roi_center_x,
+                        args.camera_roi_center_y
+                    ],
+                    "radius_m": args.camera_roi_radius_m,
+                    "enabled": args.camera_roi_radius_m > 0.0
+                },
+                "pose_diversity": {
+                    "min_position_distance_m": (
+                        args.camera_min_position_distance_m
+                    ),
+                    "min_yaw_difference_deg": (
+                        args.camera_min_yaw_difference_deg
+                    ),
+                    "history_window": args.camera_pose_history_window,
+                    "grid_size_m": args.camera_grid_size_m,
+                    "max_frames_per_grid": (
+                        args.max_frames_per_camera_grid
+                    ),
+                    "history_count_at_sequence_start": len(
+                        camera_pose_history
+                    ),
+                },
+                "spectator_follow_camera": args.spectator_follow_camera,
+                "streaming_warmup_frames": args.streaming_warmup_frames,
+                "streaming_rewarm_distance_m": (
+                    args.streaming_rewarm_distance_m
+                ),
+                "streaming_readiness": {
+                    "min_geometry_ratio": args.streaming_min_geometry_ratio,
+                    "min_labeled_ratio": args.streaming_min_labeled_ratio,
+                    "geometry_max_depth_m": (
+                        args.streaming_geometry_max_depth_m
+                    ),
+                    "retries": args.streaming_readiness_retries,
+                    "step_frames": args.streaming_readiness_step_frames,
+                },
+                "fast_pose_precheck": args.fast_pose_precheck,
                 "min_road_visible_ratio": args.min_road_visible_ratio,
                 "road_semantic_ids": args.road_semantic_ids,
+                "road_validation_mode": args.road_validation_mode,
                 "height": args.height,
                 "height_range": [args.height_min, args.height_max],
                 "radius": orbit_radius,
@@ -4210,6 +5584,9 @@ def main() -> None:
                 sot_candidates: List[List[Dict[str, Any]]] = []
                 captured_weather_counts: Counter = Counter()
                 active_weather_name: Optional[str] = None
+                last_full_streaming_warmup_location: Optional[
+                    carla.Location
+                ] = None
 
                 for frame_i in range(args.frames):
                     if random_weather_per_frame:
@@ -4249,6 +5626,7 @@ def main() -> None:
                     accepted_semantic_sensor_id: Optional[np.ndarray] = None
                     accepted_target_semantic_id: Optional[np.ndarray] = None
                     accepted_target_instances: Optional[List[Dict[str, Any]]] = None
+                    expensive_pose_tries = 0
 
                     for pose_try in range(max(1, args.max_camera_pose_retries)):
                         if args.route == "orbit" and pose_try == 0:
@@ -4263,7 +5641,12 @@ def main() -> None:
                             )
                         else:
                             if args.road_centered_camera:
-                                center_x, center_y = random_road_center(world.get_map())
+                                center_x, center_y = random_road_center(
+                                    world.get_map(),
+                                    args.camera_roi_center_x,
+                                    args.camera_roi_center_y,
+                                    args.camera_roi_radius_m
+                                )
                             else:
                                 center_x, center_y = args.center_x, args.center_y
 
@@ -4299,7 +5682,10 @@ def main() -> None:
                                             radius_min=args.radius_min,
                                             radius_max=args.radius_max,
                                             pitch_min=args.pitch_min,
-                                            pitch_max=args.pitch_max
+                                            pitch_max=args.pitch_max,
+                                            roi_center_x=args.camera_roi_center_x,
+                                            roi_center_y=args.camera_roi_center_y,
+                                            roi_radius_m=args.camera_roi_radius_m
                                         )
                                     )
                                 elif use_vehicle_center:
@@ -4318,7 +5704,10 @@ def main() -> None:
                                             radius_min=args.radius_min,
                                             radius_max=args.radius_max,
                                             pitch_min=args.pitch_min,
-                                            pitch_max=args.pitch_max
+                                            pitch_max=args.pitch_max,
+                                            roi_center_x=args.camera_roi_center_x,
+                                            roi_center_y=args.camera_roi_center_y,
+                                            roi_radius_m=args.camera_roi_radius_m
                                         )
                                     )
                                 else:
@@ -4335,7 +5724,10 @@ def main() -> None:
                                         radius_min=args.radius_min,
                                         radius_max=args.radius_max,
                                         pitch_min=args.pitch_min,
-                                        pitch_max=args.pitch_max
+                                        pitch_max=args.pitch_max,
+                                        roi_center_x=args.camera_roi_center_x,
+                                        roi_center_y=args.camera_roi_center_y,
+                                        roi_radius_m=args.camera_roi_radius_m
                                     )
                             else:
                                 transform = random_uav_transform(
@@ -4355,32 +5747,208 @@ def main() -> None:
                                     pitch_max=args.pitch_max
                                 )
 
-                        set_all_sensor_transform(sensors, transform)
-                        carla_frame = world.tick()
+                        duplicate_pose_stats = camera_pose_rejection_stats(
+                            transform=transform,
+                            history=camera_pose_history,
+                            grid_counts=camera_grid_counts,
+                            min_position_distance_m=(
+                                args.camera_min_position_distance_m
+                            ),
+                            min_yaw_difference_deg=(
+                                args.camera_min_yaw_difference_deg
+                            ),
+                            history_window=args.camera_pose_history_window,
+                            grid_size_m=args.camera_grid_size_m,
+                            max_frames_per_grid=(
+                                args.max_frames_per_camera_grid
+                            ),
+                        )
+                        if duplicate_pose_stats is not None:
+                            last_bad_view_stats = duplicate_pose_stats
+                            continue
 
-                        lidar_data = None
-                        try:
-                            rgb_img = sync["rgb"].get(
-                                carla_frame,
-                                timeout=args.sensor_timeout
+                        if args.fast_pose_precheck:
+                            precheck_stats = fast_projected_target_precheck(
+                                world=world,
+                                camera_transform=transform,
+                                targets=args.target,
+                                width=args.width,
+                                height=args.height_img,
+                                fov=args.fov,
+                                min_target_equivalent_side_px=(
+                                    args.min_target_equivalent_side_px
+                                ),
+                                min_pedestrian_equivalent_side_px=(
+                                    args.min_pedestrian_equivalent_side_px
+                                ),
+                                min_vehicle_visible_equivalent_side_px=(
+                                    args.min_vehicle_visible_equivalent_side_px
+                                ),
+                                min_pedestrian_visible_equivalent_side_px=(
+                                    args.min_pedestrian_visible_equivalent_side_px
+                                ),
+                                min_vehicles_per_frame=args.min_vehicles_per_frame,
+                                min_pedestrians_per_frame=(
+                                    args.min_pedestrians_per_frame
+                                ),
+                                min_targets_per_frame=args.min_targets_per_frame,
                             )
-                            depth_img = sync["depth"].get(
-                                carla_frame,
-                                timeout=args.sensor_timeout
-                            )
-                            semantic_img = sync["semantic"].get(
-                                carla_frame,
-                                timeout=args.sensor_timeout
-                            )
-                            instance_img = sync["instance"].get(
-                                carla_frame,
-                                timeout=args.sensor_timeout
-                            )
-                            if args.enable_lidar:
-                                lidar_data = sync["lidar"].get(
-                                    carla_frame,
-                                    timeout=args.sensor_timeout
+                            if not bool(precheck_stats["passes"]):
+                                last_bad_view_stats = precheck_stats
+                                continue
+
+                        if (
+                            args.max_expensive_pose_retries > 0
+                            and expensive_pose_tries
+                            >= args.max_expensive_pose_retries
+                        ):
+                            break
+                        expensive_pose_tries += 1
+
+                        set_all_sensor_transform(sensors, transform)
+                        streaming_ticks = max(1, args.streaming_warmup_frames)
+                        needs_full_streaming_warmup = True
+                        if (
+                            args.streaming_warmup_frames > 1
+                            and args.streaming_rewarm_distance_m > 0.0
+                        ):
+                            needs_full_streaming_warmup = (
+                                last_full_streaming_warmup_location is None
+                                or horizontal_distance_m(
+                                    transform.location,
+                                    last_full_streaming_warmup_location,
                                 )
+                                > args.streaming_rewarm_distance_m
+                            )
+                            if needs_full_streaming_warmup:
+                                last_full_streaming_warmup_location = (
+                                    carla.Location(
+                                        x=transform.location.x,
+                                        y=transform.location.y,
+                                        z=transform.location.z,
+                                    )
+                                )
+                            else:
+                                streaming_ticks = 1
+
+                        if args.spectator_follow_camera:
+                            # roadbuild 的流式加载中心跟随 spectator。相机仍可在
+                            # 当前锚点附近移动，但不要每个候选位姿都移动 spectator，
+                            # 否则建筑子关卡会反复卸载和重新加载。
+                            if needs_full_streaming_warmup:
+                                world.get_spectator().set_transform(transform)
+
+                        # 只有进入新的流送区域才完整预热；锚点范围内仅刷新一帧。
+                        for _ in range(streaming_ticks):
+                            world.tick()
+                        for sensor_sync in sync.values():
+                            sensor_sync.drain()
+                        try:
+                            (
+                                carla_frame,
+                                rgb_img,
+                                depth_img,
+                                semantic_img,
+                                instance_img,
+                                lidar_data,
+                            ) = capture_synchronized_sensor_frame(
+                                world=world,
+                                sync=sync,
+                                sensor_timeout=args.sensor_timeout,
+                                enable_lidar=args.enable_lidar,
+                            )
+
+                            depth_m = decode_carla_depth_meters(depth_img)
+                            candidate_semantic_sensor_id = (
+                                decode_semantic_segmentation(semantic_img)
+                            )
+                            (
+                                streaming_ready,
+                                streaming_stats,
+                            ) = streaming_scene_readiness(
+                                depth_m=depth_m,
+                                semantic_id=candidate_semantic_sensor_id,
+                                max_geometry_depth_m=(
+                                    args.streaming_geometry_max_depth_m
+                                ),
+                                min_geometry_ratio=(
+                                    args.streaming_min_geometry_ratio
+                                ),
+                                min_labeled_ratio=(
+                                    args.streaming_min_labeled_ratio
+                                ),
+                            )
+                            streaming_history = [dict(streaming_stats)]
+                            readiness_retry = 0
+                            while (
+                                not streaming_ready
+                                and readiness_retry
+                                < args.streaming_readiness_retries
+                            ):
+                                readiness_retry += 1
+                                print(
+                                    "[INFO] Scene streaming not ready; "
+                                    f"pose_try={pose_try + 1}, "
+                                    f"retry={readiness_retry}/"
+                                    f"{args.streaming_readiness_retries}, "
+                                    f"stats={streaming_stats}"
+                                )
+                                for _ in range(
+                                    args.streaming_readiness_step_frames
+                                ):
+                                    world.tick()
+                                for sensor_sync in sync.values():
+                                    sensor_sync.drain()
+                                (
+                                    carla_frame,
+                                    rgb_img,
+                                    depth_img,
+                                    semantic_img,
+                                    instance_img,
+                                    lidar_data,
+                                ) = capture_synchronized_sensor_frame(
+                                    world=world,
+                                    sync=sync,
+                                    sensor_timeout=args.sensor_timeout,
+                                    enable_lidar=args.enable_lidar,
+                                )
+                                depth_m = decode_carla_depth_meters(depth_img)
+                                candidate_semantic_sensor_id = (
+                                    decode_semantic_segmentation(semantic_img)
+                                )
+                                (
+                                    streaming_ready,
+                                    streaming_stats,
+                                ) = streaming_scene_readiness(
+                                    depth_m=depth_m,
+                                    semantic_id=candidate_semantic_sensor_id,
+                                    max_geometry_depth_m=(
+                                        args.streaming_geometry_max_depth_m
+                                    ),
+                                    min_geometry_ratio=(
+                                        args.streaming_min_geometry_ratio
+                                    ),
+                                    min_labeled_ratio=(
+                                        args.streaming_min_labeled_ratio
+                                    ),
+                                )
+                                streaming_history.append(dict(streaming_stats))
+                                if not streaming_ready:
+                                    (
+                                        streaming_settled,
+                                        settle_stats,
+                                    ) = streaming_scene_has_settled(
+                                        streaming_history
+                                    )
+                                    streaming_stats.update(settle_stats)
+                                    if streaming_settled:
+                                        streaming_ready = True
+                                        streaming_stats[
+                                            "streaming_scene_ready"
+                                        ] = True
+                                        streaming_stats[
+                                            "streaming_readiness_mode"
+                                        ] = "stable_after_warmup"
                         except TimeoutError as exc:
                             total_drop_frames += 1
                             print(
@@ -4396,7 +5964,21 @@ def main() -> None:
 
                             continue
 
-                        depth_m = decode_carla_depth_meters(depth_img)
+                        if not streaming_ready:
+                            streaming_stats["bad_view"] = True
+                            streaming_stats["streaming_readiness_retries"] = (
+                                readiness_retry
+                            )
+                            last_bad_view_stats = streaming_stats
+                            if best_view_stats is None:
+                                best_view_stats = dict(streaming_stats)
+                            print(
+                                "[WARN] Reject camera pose because streamed scene "
+                                f"is incomplete after {readiness_retry} retries: "
+                                f"{streaming_stats}"
+                            )
+                            continue
+
                         near_depth_bad_view, bad_view_stats = is_bad_camera_view(
                             depth_m,
                             min_near_depth_m=args.min_near_depth_m,
@@ -4406,8 +5988,14 @@ def main() -> None:
                             semantic_img,
                             args.road_semantic_ids
                         )
-                        candidate_semantic_sensor_id = decode_semantic_segmentation(
-                            semantic_img
+                        road_geometry_stats = camera_road_alignment_stats(
+                            world.get_map(),
+                            transform,
+                        )
+                        bad_view_stats.update(road_geometry_stats)
+                        bad_view_stats.update(streaming_stats)
+                        bad_view_stats["streaming_readiness_retries"] = (
+                            readiness_retry
                         )
                         candidate_annotations = build_annotations_from_actors(
                             world=world,
@@ -4473,42 +6061,78 @@ def main() -> None:
                                     )
                                 )
                             ]
-                        (
-                            candidate_target_semantic_id,
-                            candidate_target_instances,
-                        ) = build_optimized_target_semantic_mask(
-                            instance_image=instance_img,
-                            actor_annotations=candidate_annotations,
-                            min_mask_px=args.min_mask_px,
-                            min_vehicle_projected_fill_ratio=(
-                                args.min_vehicle_projected_fill_ratio
-                            ),
-                            min_pedestrian_projected_fill_ratio=(
-                                args.min_pedestrian_projected_fill_ratio
-                            ),
-                            min_vehicle_visible_equivalent_side_px=(
-                                args.min_vehicle_visible_equivalent_side_px
-                            ),
-                            min_pedestrian_visible_equivalent_side_px=(
-                                args.min_pedestrian_visible_equivalent_side_px
-                            ),
-                            min_largest_component_ratio=(
-                                args.min_largest_component_ratio
-                            ),
-                        )
-                        target_vehicle_count = int(
-                            np.count_nonzero(
-                                candidate_target_semantic_id
-                                == TARGET_VEHICLE_ID
+                        if args.target_semantic_source == "actor_semantic_depth":
+                            (
+                                candidate_target_semantic_id,
+                                candidate_target_instances,
+                            ) = build_actor_semantic_depth_target_mask(
+                                instance_image=instance_img,
+                                semantic_id=candidate_semantic_sensor_id,
+                                depth_m=depth_m,
+                                actor_annotations=candidate_annotations,
+                                min_mask_px=args.min_mask_px,
+                                min_vehicle_projected_fill_ratio=(
+                                    args.min_vehicle_projected_fill_ratio
+                                ),
+                                min_pedestrian_projected_fill_ratio=(
+                                    args.min_pedestrian_projected_fill_ratio
+                                ),
+                                min_vehicle_visible_equivalent_side_px=(
+                                    args.min_vehicle_visible_equivalent_side_px
+                                ),
+                                min_pedestrian_visible_equivalent_side_px=(
+                                    args.min_pedestrian_visible_equivalent_side_px
+                                ),
+                                min_largest_component_ratio=(
+                                    args.min_largest_component_ratio
+                                ),
                             )
-                            > 0
-                        )
-                        target_pedestrian_count = int(
-                            np.count_nonzero(
-                                candidate_target_semantic_id
-                                == TARGET_PEDESTRIAN_ID
+                            matched_actor_ids = {
+                                int(instance["carla_actor_id"])
+                                for instance in candidate_target_instances
+                                if bool(instance["trainable"])
+                            }
+                            candidate_annotations = [
+                                annotation
+                                for annotation in candidate_annotations
+                                if int(annotation["carla_actor_id"])
+                                in matched_actor_ids
+                            ]
+                        else:
+                            (
+                                candidate_target_semantic_id,
+                                candidate_target_instances,
+                            ) = build_optimized_target_semantic_mask(
+                                instance_image=instance_img,
+                                actor_annotations=candidate_annotations,
+                                min_mask_px=args.min_mask_px,
+                                min_vehicle_projected_fill_ratio=(
+                                    args.min_vehicle_projected_fill_ratio
+                                ),
+                                min_pedestrian_projected_fill_ratio=(
+                                    args.min_pedestrian_projected_fill_ratio
+                                ),
+                                min_vehicle_visible_equivalent_side_px=(
+                                    args.min_vehicle_visible_equivalent_side_px
+                                ),
+                                min_pedestrian_visible_equivalent_side_px=(
+                                    args.min_pedestrian_visible_equivalent_side_px
+                                ),
+                                min_largest_component_ratio=(
+                                    args.min_largest_component_ratio
+                                ),
                             )
-                            > 0
+                        target_vehicle_count = sum(
+                            bool(instance["trainable"])
+                            and int(instance["mask_id"])
+                            == TARGET_VEHICLE_ID
+                            for instance in candidate_target_instances
+                        )
+                        target_pedestrian_count = sum(
+                            bool(instance["trainable"])
+                            and int(instance["mask_id"])
+                            == TARGET_PEDESTRIAN_ID
+                            for instance in candidate_target_instances
                         )
                         bad_view_stats["target_vehicle_present"] = bool(
                             target_vehicle_count
@@ -4517,10 +6141,7 @@ def main() -> None:
                             target_pedestrian_count
                         )
                         bad_view_stats["target_trainable_instances"] = int(
-                            sum(
-                                bool(instance["trainable"])
-                                for instance in candidate_target_instances
-                            )
+                            target_vehicle_count + target_pedestrian_count
                         )
                         bad_view_stats["target_unmatched_instances"] = int(
                             sum(
@@ -4599,14 +6220,63 @@ def main() -> None:
                         bad_view_stats[
                             "ignored_boundary_annotation_count"
                         ] = int(filtered_boundary_annotation_count)
+                        semantic_road_passed = bool(
+                            bad_view_stats["road_visible_ratio"]
+                            >= args.min_road_visible_ratio
+                        )
+                        geometry_road_passed = bool(
+                            bad_view_stats["road_geometry_aligned"]
+                        )
+                        if args.road_validation_mode == "semantic":
+                            road_validation_passed = semantic_road_passed
+                            road_validation_source = "semantic"
+                        elif args.road_validation_mode == "geometry":
+                            road_validation_passed = geometry_road_passed
+                            road_validation_source = "geometry"
+                        else:
+                            semantic_coverage_reliable = bool(
+                                float(
+                                    bad_view_stats.get(
+                                        "streaming_labeled_ratio", 0.0
+                                    )
+                                )
+                                >= 0.5
+                            )
+                            road_validation_source = (
+                                "semantic"
+                                if semantic_coverage_reliable
+                                else "geometry"
+                            )
+                            road_validation_passed = (
+                                semantic_road_passed
+                                if semantic_coverage_reliable
+                                else geometry_road_passed
+                            )
+                        bad_view_stats["road_validation_mode"] = (
+                            args.road_validation_mode
+                        )
+                        bad_view_stats["road_validation_source"] = (
+                            road_validation_source
+                        )
+                        bad_view_stats["road_validation_passed"] = bool(
+                            road_validation_passed
+                        )
                         bad_view = bool(
                             near_depth_bad_view
+                            or not road_validation_passed
                             or tiny_target_count > 0
                             or undersized_pedestrian_count > 0
                             or len(pedestrian_equivalent_sides)
                             < args.min_pedestrians_per_frame
-                            or target_vehicle_count == 0
-                            or target_pedestrian_count == 0
+                            or target_vehicle_count
+                            < args.min_vehicles_per_frame
+                            or target_pedestrian_count
+                            < args.min_pedestrians_per_frame
+                            or (
+                                target_vehicle_count
+                                + target_pedestrian_count
+                                < args.min_targets_per_frame
+                            )
                             or (
                                 args.reject_boundary_annotations
                                 and boundary_annotation_count > 0
@@ -4628,10 +6298,7 @@ def main() -> None:
                             ):
                                 best_view_stats = candidate_stats
 
-                        if (
-                            not bad_view
-                            and bad_view_stats["road_visible_ratio"] >= args.min_road_visible_ratio
-                        ):
+                        if not bad_view:
                             accepted_annotations = candidate_annotations
                             accepted_semantic_sensor_id = (
                                 candidate_semantic_sensor_id
@@ -4649,7 +6316,8 @@ def main() -> None:
                         total_drop_frames += 1
                         print(
                             f"[WARN] Drop frame_i={frame_i}: bad camera view after "
-                            f"{args.max_camera_pose_retries} retries, "
+                            f"{pose_try + 1} pose retries / "
+                            f"{expensive_pose_tries} full sensor checks, "
                             f"last_stats={last_bad_view_stats}, best_stats={best_view_stats}"
                         )
 
@@ -4830,7 +6498,7 @@ def main() -> None:
                         max_depth_jump_m=args.normal_max_depth_jump_m
                     )
                     save_semantic_id(target_semantic_id, segmentation_path)
-                    cv2.imwrite(
+                    write_image(
                         str(segmentation_color_path),
                         colorize_target_semantic_mask(target_semantic_id),
                     )
@@ -4975,6 +6643,20 @@ def main() -> None:
                         dataset_relative_path(segmentation_color_path, out_root),
                         len(anns)
                     ])
+
+                    saved_pose = camera_pose_record(
+                        transform,
+                        sequence=sequence_id,
+                        frame_id=frame_i,
+                    )
+                    camera_pose_history.append(saved_pose)
+                    if args.camera_grid_size_m > 0.0:
+                        saved_grid = camera_grid_key(
+                            saved_pose["x"],
+                            saved_pose["y"],
+                            args.camera_grid_size_m,
+                        )
+                        camera_grid_counts[saved_grid] += 1
                     total_saved_frames += 1
 
                     if frame_i % 20 == 0:
@@ -5039,8 +6721,8 @@ def main() -> None:
         if total_saved_frames == 0:
             raise RuntimeError(
                 "没有保存任何图像：所有帧都被视角过滤或同步超时丢弃。"
-                "请查看上方 WARN 中的 best_stats；通常需要降低 min_road_visible_ratio，"
-                "或调整 height/radius/pitch 让相机真正对准路面。"
+                "请查看上方 WARN 中的 best_stats，确认道路几何、目标尺寸、"
+                "遮挡比例以及 height/radius/pitch 是否匹配。"
             )
 
         all_frame_records = read_dataset_frame_records(out_root)
@@ -5052,6 +6734,28 @@ def main() -> None:
         manifest["total_saved_frames_this_run"] = total_saved_frames
         manifest["total_saved_frames"] = len(all_frame_records)
         manifest["total_weather_rgb_images"] = total_weather_rgb_images
+        manifest["camera_pose_diversity"] = {
+            "enabled": bool(
+                args.camera_min_position_distance_m > 0.0
+                or args.max_frames_per_camera_grid > 0
+            ),
+            "loaded_history_count": initial_camera_pose_history_count,
+            "new_pose_count": (
+                len(camera_pose_history) - initial_camera_pose_history_count
+            ),
+            "total_history_count": len(camera_pose_history),
+            "min_position_distance_m": args.camera_min_position_distance_m,
+            "min_yaw_difference_deg": args.camera_min_yaw_difference_deg,
+            "history_window": args.camera_pose_history_window,
+            "grid_size_m": args.camera_grid_size_m,
+            "max_frames_per_grid": args.max_frames_per_camera_grid,
+            "occupied_grid_count": len(camera_grid_counts),
+            "largest_grid_count": (
+                max(camera_grid_counts.values())
+                if camera_grid_counts
+                else 0
+            ),
+        }
         manifest["standard_artifacts"] = write_dataset_standard_artifacts(
             out_root=out_root,
             args=args,

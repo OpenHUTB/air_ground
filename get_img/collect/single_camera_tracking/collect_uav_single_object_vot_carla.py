@@ -27,6 +27,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+COLLECT_ROOT = Path(__file__).resolve().parent.parent
+MULTIMODAL_DIR = COLLECT_ROOT / "multimodal"
+if str(MULTIMODAL_DIR) not in sys.path:
+    sys.path.insert(0, str(MULTIMODAL_DIR))
+
 import collect_rpg_small_targets_carla_v2 as base
 
 
@@ -44,7 +49,9 @@ class SequenceSpec:
     name: str
     weather: str
     target_class: str
+    motion_mode: str
     split: str
+    sequence_id: int
     index_in_weather: int
 
 
@@ -53,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--sequences-per-weather", type=int, default=None)
+    parser.add_argument("--sequences-per-map", type=int, default=None)
     parser.add_argument("--frames-per-sequence", type=int, default=None)
     parser.add_argument(
         "--weather-presets",
@@ -77,10 +84,21 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if args.out is not None:
         config["out"] = str(args.out)
-    if args.sequences_per_weather is not None:
-        config["sequences_per_weather"] = args.sequences_per_weather
+    if args.sequences_per_map is not None:
+        config["sequences_per_map"] = args.sequences_per_map
+        modes = list(config.get("motion_modes", []))
+        if modes:
+            quotient, remainder = divmod(args.sequences_per_map, len(modes))
+            config["sequences_by_motion_mode"] = {
+                mode: quotient + (1 if index < remainder else 0)
+                for index, mode in enumerate(modes)
+            }
     if args.frames_per_sequence is not None:
         config["frames_per_sequence"] = args.frames_per_sequence
+        config["frames_by_motion_mode"] = {
+            mode: args.frames_per_sequence
+            for mode in config.get("motion_modes", [])
+        }
     if args.weather_presets is not None:
         config["weather_presets"] = args.weather_presets
     config["_config_path"] = str(config_path)
@@ -93,21 +111,122 @@ def validate_config(config: Dict[str, Any]) -> None:
         "height",
         "fov",
         "fps",
-        "sequences_per_weather",
+        "sample_interval_ticks",
+        "sequences_per_map",
         "frames_per_sequence",
-        "vehicles",
-        "walkers",
         "sensor_timeout",
     )
     for key in positive:
         if float(config[key]) <= 0:
             raise ValueError(f"{key} 必须大于 0")
-    if int(config["sequences_per_weather"]) < 4:
-        raise ValueError("每种天气至少需要 4 条序列，才能按序列划分 train/val/test")
+    for key in ("vehicles", "walkers"):
+        if int(config[key]) < 0:
+            raise ValueError(f"{key} 不能小于 0")
+    if (
+        int(config["vehicles"]) == 0
+        and int(config["walkers"]) == 0
+        and not bool(config.get("include_existing_target_actors", False))
+    ):
+        raise ValueError(
+            "vehicles 和 walkers 不能同时为 0，除非启用现有目标 actor"
+        )
+    if int(config["sequences_per_map"]) < 3:
+        raise ValueError("每张地图至少需要 3 条序列，才能覆盖 train/val/test")
+    if float(config.get("sensor_tick", 0.0)) < 0.0:
+        raise ValueError("sensor_tick 不能小于 0")
     if not 0.0 < float(config["min_visible_ratio"]) <= 1.0:
         raise ValueError("min_visible_ratio 必须在 (0, 1] 内")
     if not config["weather_presets"]:
         raise ValueError("weather_presets 不能为空")
+    weather_assignment = str(config.get("weather_assignment", "cycle"))
+    if weather_assignment not in {"cycle", "random", "random_unseeded"}:
+        raise ValueError(
+            "weather_assignment 只能是 cycle、random 或 random_unseeded"
+        )
+    motion_modes = list(config.get("motion_modes", []))
+    if not motion_modes:
+        raise ValueError("motion_modes 不能为空")
+    supported_modes = {"fixed_hover", "lagged_follow", "lateral_orbit"}
+    unknown_modes = sorted(set(motion_modes) - supported_modes)
+    if unknown_modes:
+        raise ValueError(f"不支持的运动模式：{unknown_modes}")
+    configured_count = sum(
+        int(config.get("sequences_by_motion_mode", {}).get(mode, 0))
+        for mode in motion_modes
+    )
+    if configured_count != int(config["sequences_per_map"]):
+        raise ValueError(
+            "sequences_per_map 必须等于 sequences_by_motion_mode 的总和"
+        )
+    interval_by_class = config.get("sample_interval_ticks_by_target_class", {})
+    for target_class in ("vehicle", "pedestrian"):
+        if int(interval_by_class.get(target_class, config["sample_interval_ticks"])) <= 0:
+            raise ValueError(f"{target_class} 的采样 tick 间隔必须大于 0")
+    for mode in motion_modes:
+        if int(config.get("frames_by_motion_mode", {}).get(mode, 0)) <= 0:
+            raise ValueError(f"{mode} 的最大帧数必须大于 0")
+    for mode, class_frames in config.get(
+        "frames_by_motion_mode_and_target_class", {}
+    ).items():
+        if mode not in supported_modes:
+            raise ValueError(f"类别专用帧数包含未知模式：{mode}")
+        for target_class, frame_count in class_frames.items():
+            if target_class not in {"vehicle", "pedestrian"}:
+                raise ValueError(f"类别专用帧数包含未知类别：{target_class}")
+            if int(frame_count) <= 0:
+                raise ValueError(f"{mode}/{target_class} 的帧数必须大于 0")
+
+
+def frames_for_sequence(spec: SequenceSpec, config: Dict[str, Any]) -> int:
+    class_specific = (
+        config.get("frames_by_motion_mode_and_target_class", {})
+        .get(spec.motion_mode, {})
+        .get(spec.target_class)
+    )
+    if class_specific is not None:
+        return int(class_specific)
+    return int(
+        config.get("frames_by_motion_mode", {}).get(
+            spec.motion_mode,
+            config["frames_per_sequence"],
+        )
+    )
+
+
+def sample_interval_ticks_for_sequence(
+    spec: SequenceSpec,
+    config: Dict[str, Any],
+) -> int:
+    return int(
+        config.get("sample_interval_ticks_by_target_class", {}).get(
+            spec.target_class,
+            config["sample_interval_ticks"],
+        )
+    )
+
+
+def max_absent_ratio_for_sequence(
+    spec: SequenceSpec,
+    config: Dict[str, Any],
+) -> float:
+    return float(
+        config.get("max_absent_ratio_by_motion_mode", {}).get(
+            spec.motion_mode,
+            config["max_absent_ratio_per_sequence"],
+        )
+    )
+
+
+def max_consecutive_absent_for_sequence(
+    spec: SequenceSpec,
+    config: Dict[str, Any],
+) -> int:
+    return int(
+        config.get("max_consecutive_absent_frames_by_motion_mode", {}).get(
+            spec.motion_mode,
+            config["max_consecutive_absent_frames"],
+        )
+    )
 
 
 def prepare_output(root: Path, overwrite: bool) -> Dict[str, Path]:
@@ -118,7 +237,8 @@ def prepare_output(root: Path, overwrite: bool) -> Dict[str, Path]:
                 f"输出目录已存在：{root}\n"
                 "为避免混入旧追踪帧，换一个 out，或明确使用 --overwrite。"
             )
-        if "dataset_uav_single_object_vot" not in root.name:
+        safe_name = str(root.parent / root.name).lower()
+        if "dataset_uav" not in safe_name or "single_object_vot" not in safe_name:
             raise RuntimeError(f"拒绝覆盖名称异常的目录：{root}")
         shutil.rmtree(root)
     paths = {
@@ -134,33 +254,81 @@ def prepare_output(root: Path, overwrite: bool) -> Dict[str, Path]:
 
 
 def build_sequence_specs(config: Dict[str, Any]) -> List[SequenceSpec]:
-    """
-    每种天气的前两条序列进入训练集；其余序列交替进入验证和测试集。
-    这样三个划分都覆盖全部天气，且车辆/行人数量平衡。
-    """
+    """Build the configured number of sequences for every motion mode."""
     specs: List[SequenceSpec] = []
-    count = int(config["sequences_per_weather"])
-    for weather_index, weather in enumerate(config["weather_presets"]):
-        for index in range(count):
-            target_class = "vehicle" if index % 2 == 0 else "pedestrian"
-            if index < 2:
-                split = "train"
-            elif (index + weather_index) % 2 == 0:
-                split = "val"
-            else:
-                split = "test"
-            specs.append(
-                SequenceSpec(
-                    name=(
-                        f"{weather.lower()}_"
-                        f"{target_class}_{index:02d}"
-                    ),
-                    weather=weather,
-                    target_class=target_class,
-                    split=split,
-                    index_in_weather=index,
-                )
+    count = int(config["sequences_per_map"])
+    weathers = list(config["weather_presets"])
+    weather_assignment = str(config.get("weather_assignment", "cycle"))
+    configured_weather_schedule = list(
+        config.get("weather_sequence_schedule", [])
+    )
+    if configured_weather_schedule and len(configured_weather_schedule) != count:
+        raise ValueError("weather_sequence_schedule 长度必须等于序列数")
+    invalid_weathers = sorted(
+        set(configured_weather_schedule) - set(weathers)
+    )
+    if invalid_weathers:
+        raise ValueError(
+            f"weather_sequence_schedule 包含未允许天气：{invalid_weathers}"
+        )
+    weather_rng = (
+        random.SystemRandom()
+        if weather_assignment == "random_unseeded"
+        else random.Random(
+            int(config.get("weather_assignment_seed", config["seed"]))
+        )
+    )
+    weather_occurrences: Counter = Counter()
+    motion_modes = list(config["motion_modes"])
+    mode_counts = config["sequences_by_motion_mode"]
+    max_mode_count = max(int(mode_counts[mode]) for mode in motion_modes)
+    mode_schedule = [
+        mode
+        for round_index in range(max_mode_count)
+        for mode in motion_modes
+        if round_index < int(mode_counts[mode])
+    ]
+    if count == 3:
+        split_schedule = ["train", "val", "test"]
+    else:
+        train_end = int(count * 0.60)
+        val_end = train_end + int(count * 0.20)
+        split_schedule = [
+            "train" if index < train_end else "val" if index < val_end else "test"
+            for index in range(count)
+        ]
+    class_offset = int(config.get("target_class_offset", 0))
+    for sequence_id, motion_mode in enumerate(mode_schedule):
+        weather = (
+            configured_weather_schedule[sequence_id]
+            if configured_weather_schedule
+            else weather_rng.choice(weathers)
+            if weather_assignment in {"random", "random_unseeded"}
+            else weathers[sequence_id % len(weathers)]
+        )
+        index_in_weather = int(weather_occurrences[weather])
+        weather_occurrences[weather] += 1
+        if motion_mode == "fixed_hover":
+            target_class = "vehicle"
+        elif motion_mode == "lagged_follow":
+            target_class = "pedestrian"
+        else:
+            target_class = "vehicle" if class_offset % 2 == 0 else "pedestrian"
+        split = split_schedule[sequence_id]
+        specs.append(
+            SequenceSpec(
+                name=(
+                    f"{weather.lower()}_"
+                    f"{target_class}_{motion_mode}_{index_in_weather:02d}"
+                ),
+                weather=weather,
+                target_class=target_class,
+                motion_mode=motion_mode,
+                split=split,
+                sequence_id=sequence_id,
+                index_in_weather=index_in_weather,
             )
+        )
     return specs
 
 
@@ -183,7 +351,7 @@ def spawn_internal_sensors(
             int(config["width"]),
             int(config["height"]),
             float(config["fov"]),
-            0.0,
+            float(config.get("sensor_tick", 0.0)),
             enable_rgb_postprocess=bool(config["enable_rgb_postprocess"]),
         )
         if name == "rgb":
@@ -199,6 +367,19 @@ def spawn_internal_sensors(
     return sensors
 
 
+def tick_and_get_sensors(
+    world,
+    sensor_sync: Dict[str, Any],
+    timeout: float,
+) -> Tuple[int, Dict[str, Any]]:
+    """Advance one simulation tick and consume every synchronized modality."""
+    carla_frame = int(world.tick())
+    return carla_frame, {
+        name: sync.get(carla_frame, timeout=timeout)
+        for name, sync in sensor_sync.items()
+    }
+
+
 def destroy_actors(actors: Iterable[Any]) -> None:
     for actor in actors:
         try:
@@ -211,6 +392,21 @@ def destroy_actors(actors: Iterable[Any]) -> None:
                 actor.destroy()
         except RuntimeError:
             pass
+
+
+def actor_role_name(actor: Any) -> str:
+    """Return an actor role without trusting every CARLA actor API variant."""
+    try:
+        return str(actor.attributes.get("role_name", ""))
+    except (AttributeError, RuntimeError):
+        return ""
+
+
+def is_static_bridge_actor(actor: Any) -> bool:
+    return actor_role_name(actor) in {
+        "collection_static_vehicle",
+        "collection_static_pedestrian",
+    }
 
 
 def live_targets(
@@ -357,9 +553,182 @@ def camera_transform_for_target(
     }
 
 
+def blend_angle_degrees(previous: float, current: float, alpha: float) -> float:
+    delta = (current - previous + 180.0) % 360.0 - 180.0
+    return previous + alpha * delta
+
+
+def look_at_transform(camera_location, aim_location) -> Any:
+    dx = float(aim_location.x - camera_location.x)
+    dy = float(aim_location.y - camera_location.y)
+    dz = float(aim_location.z - camera_location.z)
+    horizontal = max(0.1, math.hypot(dx, dy))
+    return carla.Transform(
+        camera_location,
+        carla.Rotation(
+            pitch=math.degrees(math.atan2(dz, horizontal)),
+            yaw=math.degrees(math.atan2(dy, dx)),
+            roll=0.0,
+        ),
+    )
+
+
+def blend_transforms(previous, current, position_alpha: float, rotation_alpha: float):
+    location = carla.Location(
+        x=float(previous.location.x)
+        + position_alpha * float(current.location.x - previous.location.x),
+        y=float(previous.location.y)
+        + position_alpha * float(current.location.y - previous.location.y),
+        z=float(previous.location.z)
+        + position_alpha * float(current.location.z - previous.location.z),
+    )
+    rotation = carla.Rotation(
+        pitch=blend_angle_degrees(
+            float(previous.rotation.pitch),
+            float(current.rotation.pitch),
+            rotation_alpha,
+        ),
+        yaw=blend_angle_degrees(
+            float(previous.rotation.yaw),
+            float(current.rotation.yaw),
+            rotation_alpha,
+        ),
+        roll=0.0,
+    )
+    return carla.Transform(location, rotation)
+
+
+def motion_pose_stats(transform, target, motion_mode: str) -> Dict[str, Any]:
+    target_location = target.get_location()
+    horizontal = math.hypot(
+        float(target_location.x - transform.location.x),
+        float(target_location.y - transform.location.y),
+    )
+    return {
+        "motion_mode": motion_mode,
+        "altitude_m": float(transform.location.z - target_location.z),
+        "ground_distance_m": horizontal,
+        "pitch_deg": float(transform.rotation.pitch),
+        "yaw_deg": float(transform.rotation.yaw),
+        "ground_x": float(transform.location.x),
+        "ground_y": float(transform.location.y),
+        "ground_z": float(target_location.z),
+    }
+
+
+def camera_in_excluded_circle(transform, config: Dict[str, Any]) -> bool:
+    camera_x = float(transform.location.x)
+    camera_y = float(transform.location.y)
+    return any(
+        math.hypot(camera_x - float(center_x), camera_y - float(center_y))
+        <= float(radius_m)
+        for center_x, center_y, radius_m
+        in config.get("excluded_camera_circles", [])
+    )
+
+
+def camera_transform_for_motion(
+    carla_map,
+    target,
+    target_class: str,
+    direction: str,
+    progress: float,
+    motion_mode: str,
+    config: Dict[str, Any],
+    state: Dict[str, Any],
+) -> Tuple[Any, Dict[str, Any]]:
+    if motion_mode == "fixed_hover":
+        if "fixed_transform" not in state:
+            transform, _ = camera_transform_for_target(
+                carla_map,
+                target,
+                target_class,
+                direction,
+                0.0,
+                config,
+            )
+            state["fixed_transform"] = transform
+        transform = state["fixed_transform"]
+    elif motion_mode == "lagged_follow":
+        ideal, _ = camera_transform_for_target(
+            carla_map,
+            target,
+            target_class,
+            direction,
+            progress,
+            config,
+            previous_ground_location=state.get("previous_ground"),
+        )
+        previous = state.get("previous_transform")
+        transform = ideal if previous is None else blend_transforms(
+            previous,
+            ideal,
+            float(config.get("lagged_follow_position_alpha", 0.28)),
+            float(config.get("lagged_follow_rotation_alpha", 0.22)),
+        )
+        state["previous_ground"] = carla.Location(
+            x=float(transform.location.x),
+            y=float(transform.location.y),
+            z=float(target.get_location().z),
+        )
+        state["previous_transform"] = transform
+    elif motion_mode == "lateral_orbit":
+        target_transform = target.get_transform()
+        target_location = target_transform.location
+        sweep = float(config.get("orbit_sweep_degrees", 120.0))
+        bearing = (
+            float(target_transform.rotation.yaw)
+            + 90.0
+            - sweep * 0.5
+            + sweep * progress
+        )
+        phase = math.sin(progress * math.pi)
+        radius = float(config["radius_max"]) - (
+            float(config["radius_max"]) - float(config["radius_min"])
+        ) * phase
+        altitude = float(config["height_min"]) + (
+            float(config["height_max"]) - float(config["height_min"])
+        ) * (0.25 + 0.65 * phase)
+        radians = math.radians(bearing)
+        camera_location = carla.Location(
+            x=float(target_location.x + radius * math.cos(radians)),
+            y=float(target_location.y + radius * math.sin(radians)),
+            z=float(target_location.z + altitude),
+        )
+        bbox = target.bounding_box
+        aim_location = carla.Location(
+            x=float(target_location.x),
+            y=float(target_location.y),
+            z=float(target_location.z + max(0.4, bbox.extent.z * 0.55)),
+        )
+        ideal = look_at_transform(camera_location, aim_location)
+        previous = state.get("previous_transform")
+        transform = ideal if previous is None else blend_transforms(
+            previous,
+            ideal,
+            1.0,
+            float(config.get("orbit_rotation_alpha", 0.3)),
+        )
+        state["previous_transform"] = transform
+    else:
+        raise RuntimeError(f"不支持的运动模式：{motion_mode}")
+
+    return transform, motion_pose_stats(transform, target, motion_mode)
+
+
 def annotation_equivalent_side(annotation: Dict[str, Any]) -> float:
     _, _, width, height = annotation["bbox_xywh"]
     return math.sqrt(float(width) * float(height))
+
+
+def bbox_iou_xywh(first: Sequence[float], second: Sequence[float]) -> float:
+    ax, ay, aw, ah = [float(value) for value in first]
+    bx, by, bw, bh = [float(value) for value in second]
+    intersection_width = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    intersection_height = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+    intersection = intersection_width * intersection_height
+    union = aw * ah + bw * bh - intersection
+    return intersection / union if union > 0.0 else 0.0
 
 
 def is_boundary_box(
@@ -405,15 +774,11 @@ def build_actor_annotations(
         actor_depth_margin=float(config["actor_depth_margin_m"]),
         actor_visibility_mode="depth",
     )
-    return [
-        annotation
-        for annotation in annotations
-        if not is_boundary_box(
-            annotation,
-            int(config["width"]),
-            int(config["height"]),
+    for annotation in annotations:
+        annotation["boundary_truncated"] = bool(
+            float(annotation.get("truncation_ratio", 0.0)) > 0.0
         )
-    ]
+    return annotations
 
 
 def find_target_annotation(
@@ -436,6 +801,24 @@ def find_target_annotation(
             return None
         return annotation
     return None
+
+
+def enrich_target_annotation(annotation: Dict[str, Any]) -> str:
+    visibility = float(annotation["visible_ratio_projected_bbox"])
+    truncation = float(annotation.get("truncation_ratio", 0.0))
+    occlusion = max(0.0, min(1.0, 1.0 - visibility))
+    if truncation >= 0.05:
+        state = "partial_out_of_view"
+    elif visibility < 0.25:
+        state = "severe_occlusion"
+    elif visibility < 0.75:
+        state = "partial_occlusion"
+    else:
+        state = "visible"
+    annotation["visibility_ratio"] = visibility
+    annotation["occlusion_ratio"] = occlusion
+    annotation["target_state"] = state
+    return state
 
 
 def save_overlay(
@@ -541,58 +924,77 @@ def collect_sequence_attempt(
     label_dir = attempt_dir / "labels_yolo"
     color_dir.mkdir(parents=True, exist_ok=True)
     label_dir.mkdir(parents=True, exist_ok=True)
-    frames = int(config["frames_per_sequence"])
+    planned_max_frames = frames_for_sequence(spec, config)
+    min_frames = int(
+        config.get("min_frames_by_motion_mode", {}).get(spec.motion_mode, 1)
+    )
+    fixed_hover_stop_after_absent = int(
+        config.get("fixed_hover_stop_after_absent_frames", 5)
+    )
+    sample_interval_ticks = sample_interval_ticks_for_sequence(spec, config)
+    max_absent_ratio = max_absent_ratio_for_sequence(spec, config)
+    max_consecutive_absent = max_consecutive_absent_for_sequence(spec, config)
     groundtruth: List[str] = []
     absence: List[str] = []
     occlusion: List[str] = []
     target_sizes: List[float] = []
     target_visible_ratios: List[float] = []
+    target_occlusion_ratios: List[float] = []
+    target_truncation_ratios: List[float] = []
+    target_states: List[str] = []
+    normalized_displacements: List[float] = []
+    adjacent_scale_log_changes: List[float] = []
+    previous_box_copy_ious: List[float] = []
+    previous_target_box: Optional[Sequence[float]] = None
     road_ratios: List[float] = []
     near_ratios: List[float] = []
     image_differences: List[float] = []
     previous_gray: Optional[np.ndarray] = None
-    previous_ground = None
+    motion_state: Dict[str, Any] = {}
     consecutive_absent = 0
     absent_frames = 0
     class_counts: Counter = Counter()
+    termination_reason = "max_frames_reached"
 
     metadata_path = attempt_dir / "annotations.jsonl"
     with metadata_path.open("w", encoding="utf-8") as metadata_file:
-        for frame_index in range(frames):
-            progress = frame_index / max(1, frames - 1)
+        for frame_index in range(planned_max_frames):
+            progress = frame_index / max(1, planned_max_frames - 1)
             try:
-                camera_transform, pose_stats = camera_transform_for_target(
+                camera_transform, pose_stats = camera_transform_for_motion(
                     world.get_map(),
                     target,
                     spec.target_class,
                     direction,
                     progress,
+                    spec.motion_mode,
                     config,
-                    previous_ground_location=previous_ground,
+                    motion_state,
                 )
             except RuntimeError as exc:
                 return False, {"reason": str(exc), "saved_frames": frame_index}
 
-            previous_ground = carla.Location(
-                x=pose_stats["ground_x"],
-                y=pose_stats["ground_y"],
-                z=pose_stats["ground_z"],
-            )
             base.set_all_sensor_transform(sensors, camera_transform)
+            if bool(config.get("spectator_follow_camera", False)):
+                world.get_spectator().set_transform(camera_transform)
+            if frame_index == 0:
+                for _ in range(int(config.get("streaming_warmup_frames", 0))):
+                    world.tick()
+                for item in sensor_sync.values():
+                    item.drain()
             try:
-                carla_frame = world.tick()
-                rgb_data = sensor_sync["rgb"].get(
-                    carla_frame,
-                    timeout=float(config["sensor_timeout"]),
-                )
-                depth_data = sensor_sync["depth"].get(
-                    carla_frame,
-                    timeout=float(config["sensor_timeout"]),
-                )
-                semantic_data = sensor_sync["semantic"].get(
-                    carla_frame,
-                    timeout=float(config["sensor_timeout"]),
-                )
+                raw = None
+                carla_frame = -1
+                for _ in range(sample_interval_ticks):
+                    carla_frame, raw = tick_and_get_sensors(
+                        world,
+                        sensor_sync,
+                        float(config["sensor_timeout"]),
+                    )
+                assert raw is not None
+                rgb_data = raw["rgb"]
+                depth_data = raw["depth"]
+                semantic_data = raw["semantic"]
             except (RuntimeError, TimeoutError) as exc:
                 return False, {
                     "reason": f"sensor_sync: {exc}",
@@ -601,11 +1003,39 @@ def collect_sequence_attempt(
 
             depth_m = base.decode_carla_depth_meters(depth_data)
             semantic_id = base.decode_semantic_segmentation(semantic_data)
+            if camera_in_excluded_circle(rgb_data.transform, config):
+                return False, {
+                    "reason": "相机进入已知贴图/几何错误区域",
+                    "saved_frames": frame_index,
+                }
+            streaming_stats: Dict[str, Any] = {}
+            if bool(config.get("require_streaming_geometry", False)):
+                streaming_ready, streaming_stats = base.streaming_scene_readiness(
+                    depth_m,
+                    semantic_id,
+                    max_geometry_depth_m=float(
+                        config.get("streaming_geometry_max_depth_m", 220.0)
+                    ),
+                    min_geometry_ratio=float(
+                        config.get("streaming_min_geometry_ratio", 0.90)
+                    ),
+                    min_labeled_ratio=0.0,
+                )
+                if not streaming_ready:
+                    return False, {
+                        "reason": (
+                            "地图几何未完整加载或画面包含大面积虚空："
+                            f"geometry_ratio="
+                            f"{streaming_stats['streaming_geometry_ratio']:.4f}"
+                        ),
+                        "saved_frames": frame_index,
+                    }
             bad_view, view_stats = base.is_bad_camera_view(
                 depth_m,
                 min_near_depth_m=float(config["min_near_depth_m"]),
                 max_near_depth_ratio=float(config["max_near_depth_ratio"]),
             )
+            view_stats.update(streaming_stats)
             road_ratio = base.road_visible_ratio(
                 semantic_data,
                 [int(value) for value in config["road_semantic_ids"]],
@@ -643,9 +1073,12 @@ def collect_sequence_attempt(
                 consecutive_absent += 1
                 groundtruth.append("0,0,0,0")
                 absence.append("1")
-                occlusion.append("1")
+                occlusion.append("0")
+                target_states.append("absent_unresolved")
+                previous_target_box = None
             else:
                 consecutive_absent = 0
+                target_state = enrich_target_annotation(target_annotation)
                 x, y, width, height = target_annotation["bbox_xywh"]
                 groundtruth.append(f"{x},{y},{width},{height}")
                 absence.append("0")
@@ -655,8 +1088,40 @@ def collect_sequence_attempt(
                 occlusion.append("1" if visible_ratio < 0.75 else "0")
                 target_sizes.append(annotation_equivalent_side(target_annotation))
                 target_visible_ratios.append(visible_ratio)
+                target_occlusion_ratios.append(
+                    float(target_annotation["occlusion_ratio"])
+                )
+                target_truncation_ratios.append(
+                    float(target_annotation.get("truncation_ratio", 0.0))
+                )
+                target_states.append(target_state)
+                current_box = [float(value) for value in target_annotation["bbox_xywh"]]
+                if previous_target_box is not None:
+                    previous_center_x = previous_target_box[0] + previous_target_box[2] * 0.5
+                    previous_center_y = previous_target_box[1] + previous_target_box[3] * 0.5
+                    current_center_x = current_box[0] + current_box[2] * 0.5
+                    current_center_y = current_box[1] + current_box[3] * 0.5
+                    previous_side = math.sqrt(
+                        previous_target_box[2] * previous_target_box[3]
+                    )
+                    normalized_displacements.append(
+                        math.hypot(
+                            current_center_x - previous_center_x,
+                            current_center_y - previous_center_y,
+                        )
+                        / max(1.0, previous_side)
+                    )
+                    previous_area = previous_target_box[2] * previous_target_box[3]
+                    current_area = current_box[2] * current_box[3]
+                    adjacent_scale_log_changes.append(
+                        abs(math.log(max(1.0, current_area) / max(1.0, previous_area)))
+                    )
+                    previous_box_copy_ious.append(
+                        bbox_iou_xywh(previous_target_box, current_box)
+                    )
+                previous_target_box = current_box
 
-            if consecutive_absent > int(config["max_consecutive_absent_frames"]):
+            if consecutive_absent > max_consecutive_absent:
                 return False, {
                     "reason": "主目标连续不可见帧过多",
                     "saved_frames": frame_index,
@@ -718,7 +1183,11 @@ def collect_sequence_attempt(
                 road_ratio,
             )
 
-            if frame_index in {0, frames // 2, frames - 1}:
+            if frame_index in {
+                0,
+                planned_max_frames // 2,
+                planned_max_frames - 1,
+            }:
                 save_overlay(
                     cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
                     annotations,
@@ -731,11 +1200,43 @@ def collect_sequence_attempt(
                     ),
                 )
 
-    absent_ratio = absent_frames / float(frames)
-    if absent_ratio > float(config["max_absent_ratio_per_sequence"]):
+            if (
+                spec.motion_mode == "fixed_hover"
+                and consecutive_absent >= fixed_hover_stop_after_absent
+            ):
+                if len(groundtruth) < min_frames:
+                    return False, {
+                        "reason": (
+                            "固定悬停目标过早离开画面："
+                            f"saved={len(groundtruth)}, min_required={min_frames}"
+                        ),
+                        "saved_frames": len(groundtruth),
+                    }
+                if frame_index not in {
+                    0,
+                    planned_max_frames // 2,
+                    planned_max_frames - 1,
+                }:
+                    save_overlay(
+                        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                        annotations,
+                        int(target.id),
+                        target_annotation,
+                        attempt_dir / f"overlay_{frame_name}.png",
+                        (
+                            f"{spec.name} frame={frame_index + 1} "
+                            "stop=5_consecutive_absent"
+                        ),
+                    )
+                termination_reason = "target_absent_for_consecutive_frames"
+                break
+
+    actual_frames = len(groundtruth)
+    absent_ratio = absent_frames / float(actual_frames)
+    if absent_ratio > max_absent_ratio:
         return False, {
             "reason": f"主目标缺失比例过高：{absent_ratio:.4f}",
-            "saved_frames": frames,
+            "saved_frames": actual_frames,
         }
     if image_differences and min(image_differences) < 0.05:
         return False, {
@@ -743,7 +1244,7 @@ def collect_sequence_attempt(
                 "出现疑似完全重复的相邻帧："
                 f"min_mean_abs_diff={min(image_differences):.4f}"
             ),
-            "saved_frames": frames,
+            "saved_frames": actual_frames,
         }
 
     (attempt_dir / "groundtruth.txt").write_text(
@@ -758,18 +1259,43 @@ def collect_sequence_attempt(
         "\n".join(occlusion) + "\n",
         encoding="utf-8",
     )
+    (attempt_dir / "target_state.label").write_text(
+        "\n".join(target_states) + "\n",
+        encoding="utf-8",
+    )
     summary = {
         "sequence": spec.name,
+        "sequence_id": int(spec.sequence_id),
         "weather": spec.weather,
         "split": spec.split,
         "target_class": spec.target_class,
+        "motion_mode": spec.motion_mode,
         "target_actor_id": int(target.id),
         "target_actor_type": target.type_id,
-        "frames": frames,
+        "frames": actual_frames,
+        "planned_max_frames": planned_max_frames,
+        "min_frames_required": min_frames,
+        "termination_reason": termination_reason,
+        "simulation_fps": float(config["fps"]),
+        "sample_interval_ticks": sample_interval_ticks,
+        "sample_interval_seconds": (
+            sample_interval_ticks / float(config["fps"])
+        ),
+        "simulated_duration_seconds": (
+            actual_frames * sample_interval_ticks / float(config["fps"])
+        ),
+        "max_absent_ratio_allowed": max_absent_ratio,
+        "max_consecutive_absent_frames_allowed": max_consecutive_absent,
         "absent_frames": absent_frames,
         "absent_ratio": absent_ratio,
         "target_equivalent_side_px": stats(target_sizes),
         "target_visible_ratio": stats(target_visible_ratios),
+        "target_occlusion_ratio": stats(target_occlusion_ratios),
+        "target_truncation_ratio": stats(target_truncation_ratios),
+        "target_state_counts": dict(Counter(target_states)),
+        "normalized_center_displacement": stats(normalized_displacements),
+        "adjacent_scale_log_change": stats(adjacent_scale_log_changes),
+        "previous_frame_box_copy_iou": stats(previous_box_copy_ious),
         "road_visible_ratio": stats(road_ratios),
         "near_depth_ratio": stats(near_ratios),
         "adjacent_frame_mean_abs_difference": stats(image_differences),
@@ -901,9 +1427,17 @@ def audit_dataset(
     config: Dict[str, Any],
     sequence_summaries: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    expected_frames = int(config["frames_per_sequence"])
     errors: List[str] = []
+    summaries_by_sequence = {
+        str(summary["sequence"]): summary
+        for summary in sequence_summaries
+    }
     for spec in specs:
+        summary = summaries_by_sequence.get(spec.name)
+        if summary is None:
+            errors.append(f"{spec.name}: missing sequence summary")
+            continue
+        expected_frames = int(summary["frames"])
         sequence_dir = root / "vot" / spec.name
         images = sorted((sequence_dir / "color").glob("*.png"))
         labels = sorted((sequence_dir / "labels_yolo").glob("*.txt"))
@@ -921,7 +1455,20 @@ def audit_dataset(
             .splitlines()
             if line.strip()
         ]
-        counts = (len(images), len(labels), len(gt_lines), len(absence_lines))
+        state_lines = [
+            line
+            for line in (sequence_dir / "target_state.label")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        counts = (
+            len(images),
+            len(labels),
+            len(gt_lines),
+            len(absence_lines),
+            len(state_lines),
+        )
         if any(count != expected_frames for count in counts):
             errors.append(f"{spec.name}: count mismatch {counts}")
         for line in gt_lines:
@@ -955,7 +1502,12 @@ def audit_dataset(
         "status": "PASS" if not errors else "FAIL",
         "errors": errors,
         "sequence_count": len(specs),
-        "expected_total_frames": len(specs) * expected_frames,
+        "actual_total_frames": sum(
+            int(summary["frames"]) for summary in sequence_summaries
+        ),
+        "planned_max_total_frames": sum(
+            frames_for_sequence(spec, config) for spec in specs
+        ),
         "sequence_level_split": True,
         "weather_is_constant_inside_each_sequence": True,
         "target_actor_is_constant_inside_each_sequence": True,
@@ -966,6 +1518,7 @@ def audit_dataset(
             "groundtruth.txt",
             "absence.label",
             "occlusion.label",
+            "target_state.label",
         ],
     }
     (root / "quality_audit.json").write_text(
@@ -994,9 +1547,15 @@ def write_dataset_card(
 - 主任务：VOT 风格单目标追踪。
 - 辅助任务：YOLO 车辆/行人检测。
 - 分辨率：{config['width']}x{config['height']}。
-- 帧率：{config['fps']} FPS。
+- 仿真帧率：{config['fps']} FPS。
+- 有效采样间隔：车辆每
+  {config.get('sample_interval_ticks_by_target_class', {}).get('vehicle', config['sample_interval_ticks'])}
+  个 CARLA 帧保存一次，人物每
+  {config.get('sample_interval_ticks_by_target_class', {}).get('pedestrian', config['sample_interval_ticks'])}
+  个 CARLA 帧保存一次。
 - 序列数：{len(specs)}。
-- 总帧数：{len(specs) * int(config['frames_per_sequence'])}。
+- 实际总帧数：{audit['actual_total_frames']}。
+- 计划最大帧数：{audit['planned_max_total_frames']}。
 - 类别：vehicle、pedestrian。
 
 ## VOT 格式
@@ -1007,16 +1566,18 @@ def write_dataset_card(
 - `groundtruth.txt`：每行 `x,y,width,height`；
 - `absence.label`：主目标不可见时为 1；
 - `occlusion.label`：主目标明显遮挡时为 1；
+- `target_state.label`：逐帧目标状态；
 - `sequence_meta.json`：目标 actor、天气和质量统计；
 - `annotations.jsonl`：逐帧完整标注；
 - `labels_yolo/`：画面中全部车辆和行人的 YOLO 标签。
 
-遮挡超过 50% 时不写主目标框，对应 VOT 行写为 `0,0,0,0`。
+目标低于最低可见率或尺寸阈值时不写主目标框，对应 VOT 行写为
+`0,0,0,0`。逐帧 JSON 同时记录可见率、遮挡率和截断率。
 
 ## 数据划分
 
-训练、验证、测试按完整序列划分，禁止相邻帧跨集合。每个划分都覆盖配置中的
-全部天气。YOLO 配置文件为 `yolo/data.yaml`。
+训练、验证、测试按完整序列划分，禁止相邻帧跨集合。天气按序列轮换。
+YOLO 配置文件为 `yolo/data.yaml`。
 
 质量审计：{audit['status']}。
 YOLO 图像数：{json.dumps(yolo_summary['splits'], ensure_ascii=False)}。
@@ -1057,6 +1618,8 @@ def main() -> None:
     accepted_specs: List[SequenceSpec] = []
     sequence_summaries: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
+    target_vehicles: List[Any] = []
+    target_walkers: List[Any] = []
 
     try:
         settings = world.get_settings()
@@ -1080,21 +1643,68 @@ def main() -> None:
         )
         base.destroy_live_two_wheel_vehicles(world)
 
-        initial_target = (
-            walkers[0] if walkers else vehicles[0]
+        target_vehicles = list(vehicles)
+        target_walkers = list(walkers)
+        if bool(config.get("include_existing_target_actors", False)):
+            world_actors = world.get_actors()
+            target_vehicles.extend(list(world_actors.filter("vehicle.*")))
+            target_walkers.extend(
+                list(world_actors.filter("walker.pedestrian.*"))
+            )
+        target_vehicles = list(
+            {
+                int(actor.id): actor
+                for actor in target_vehicles
+                if (
+                    actor is not None
+                    and actor.is_alive
+                    and not is_static_bridge_actor(actor)
+                )
+            }.values()
         )
-        initial_transform, _ = camera_transform_for_target(
-            world.get_map(),
-            initial_target,
-            (
+        target_walkers = list(
+            {
+                int(actor.id): actor
+                for actor in target_walkers
+                if (
+                    actor is not None
+                    and actor.is_alive
+                    and not is_static_bridge_actor(actor)
+                )
+            }.values()
+        )
+
+        initial_transform = None
+        initial_errors: List[str] = []
+        # The initial pose only exists to spawn the reusable sensor rig. Custom
+        # maps may have bridge pedestrians beside a road whose topology cannot
+        # be traversed in one direction, so probe several actors and directions.
+        for initial_target in (target_vehicles + target_walkers)[:80]:
+            target_class = (
                 "pedestrian"
                 if initial_target.type_id.startswith("walker.")
                 else "vehicle"
-            ),
-            "previous",
-            0.0,
-            config,
-        )
+            )
+            for direction in ("previous", "next"):
+                try:
+                    initial_transform, _ = camera_transform_for_target(
+                        world.get_map(),
+                        initial_target,
+                        target_class,
+                        direction,
+                        0.0,
+                        config,
+                    )
+                    break
+                except RuntimeError as exc:
+                    initial_errors.append(str(exc))
+            if initial_transform is not None:
+                break
+        if initial_transform is None:
+            raise RuntimeError(
+                "无法从现有目标生成初始相机位姿："
+                + "; ".join(initial_errors[:5])
+            )
         sensors = spawn_internal_sensors(world, initial_transform, config)
         sensor_sync = {
             name: base.SensorSync(name, sensor)
@@ -1108,7 +1718,7 @@ def main() -> None:
         for sequence_index, spec in enumerate(specs):
             print(
                 f"[SEQ {sequence_index + 1}/{len(specs)}] "
-                f"{spec.name} split={spec.split}"
+                f"{spec.name} mode={spec.motion_mode} split={spec.split}"
             )
             base.apply_weather(world, spec.weather)
             for _ in range(int(config["weather_warmup_frames"])):
@@ -1118,7 +1728,11 @@ def main() -> None:
 
             accepted = False
             for attempt in range(int(config["max_sequence_attempts"])):
-                actors = vehicles if spec.target_class == "vehicle" else walkers
+                actors = (
+                    target_vehicles
+                    if spec.target_class == "vehicle"
+                    else target_walkers
+                )
                 target = choose_target_actor(
                     actors,
                     spec.target_class,
@@ -1204,8 +1818,11 @@ def main() -> None:
             "map": world.get_map().name,
             "classes": CLASS_NAMES,
             "sequence_count": len(accepted_specs),
-            "total_frames": (
-                len(accepted_specs) * int(config["frames_per_sequence"])
+            "total_frames": sum(
+                int(summary["frames"]) for summary in sequence_summaries
+            ),
+            "planned_max_total_frames": sum(
+                frames_for_sequence(spec, config) for spec in accepted_specs
             ),
             "sequence_summaries": sequence_summaries,
             "failed_attempts": failures,

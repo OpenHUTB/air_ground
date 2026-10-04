@@ -1,0 +1,101 @@
+{
+  "host": "127.0.0.1",
+  "port": 2000,
+  "tm_port": 8000,
+  "timeout": 30.0,
+  "map": null,
+  "out": "E:/pythonProject/air_groud/get_img/dataset_uav_multimap_single_object_vot_weather500",
+  "width": 1920,
+  "height": 1080,
+  "fov": 55.0,
+  "fps": 20.0,
+  "sensor_tick": 0.0,
+  "sample_interval_ticks": 2,
+  "sample_interval_ticks_by_target_class": {
+    "vehicle": 2,
+    "pedestrian": 6
+  },
+  "enable_rgb_postprocess": true,
+  "sequences_per_map": 15,
+  "motion_modes": [
+    "fixed_hover",
+    "lagged_follow",
+    "lateral_orbit"
+  ],
+  "sequences_by_motion_mode": {
+    "fixed_hover": 5,
+    "lagged_follow": 5,
+    "lateral_orbit": 5
+  },
+  "frames_by_motion_mode": {
+    "fixed_hover": 80,
+    "lagged_follow": 120,
+    "lateral_orbit": 150
+  },
+  "frames_by_motion_mode_and_target_class": {
+    "lagged_follow": {
+      "pedestrian": 80
+    },
+    "lateral_orbit": {
+      "pedestrian": 100
+    }
+  },
+  "min_frames_by_motion_mode": {
+    "fixed_hover": 30
+  },
+  "fixed_hover_stop_after_absent_frames": 5,
+  "frames_per_sequence": 120,
+  "weather_presets": [
+    "ClearNoon",
+    "ClearSunset",
+    "ClearNight"
+  ],
+  "weather_assignment": "random_unseeded",
+  "weather_warmup_frames": 10,
+  "height_min": 30.0,
+  "height_max": 36.0,
+  "radius_min": 28.0,
+  "radius_max": 52.0,
+  "pitch_min": -45.0,
+  "pitch_max": -35.0,
+  "preferred_pitch_vehicle": -40.0,
+  "preferred_pitch_pedestrian": -44.0,
+  "vehicles": 20,
+  "walkers": 30,
+  "hide_static_map_vehicles": true,
+  "min_visible_ratio": 0.1,
+  "min_visible_pixels": 24,
+  "actor_depth_margin_m": 5.0,
+  "min_vehicle_equivalent_side_px": 40.0,
+  "min_pedestrian_equivalent_side_px": 35.0,
+  "min_road_visible_ratio": 0.25,
+  "road_semantic_ids": [
+    1,
+    2,
+    6,
+    7,
+    8
+  ],
+  "min_near_depth_m": 8.0,
+  "max_near_depth_ratio": 0.02,
+  "max_absent_ratio_per_sequence": 0.4,
+  "max_consecutive_absent_frames": 40,
+  "max_absent_ratio_by_motion_mode": {
+    "fixed_hover": 0.25,
+    "lagged_follow": 0.4,
+    "lateral_orbit": 0.4
+  },
+  "max_consecutive_absent_frames_by_motion_mode": {
+    "fixed_hover": 5,
+    "lagged_follow": 40,
+    "lateral_orbit": 40
+  },
+  "lagged_follow_position_alpha": 0.28,
+  "lagged_follow_rotation_alpha": 0.22,
+  "orbit_rotation_alpha": 0.3,
+  "orbit_sweep_degrees": 120.0,
+  "max_sequence_attempts": 48,
+  "warmup_frames": 20,
+  "sensor_timeout": 15.0,
+  "seed": 31
+}

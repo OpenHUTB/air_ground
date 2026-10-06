@@ -16,6 +16,7 @@ import json
 import math
 import os
 import random
+import secrets
 import shutil
 import sys
 import time
@@ -110,6 +111,18 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
     return config
 
 
+def resolve_run_seed(config: Dict[str, Any]) -> int:
+    """Generate a fresh default seed while preserving explicit replay seeds."""
+    configured = config.get("seed")
+    if configured is None:
+        configured = secrets.randbelow(2_147_483_646) + 1
+        config["seed"] = configured
+        config["seed_source"] = "generated_at_collector_start"
+    else:
+        config.setdefault("seed_source", "explicit")
+    return int(configured)
+
+
 def validate_config(config: Dict[str, Any]) -> None:
     positive = (
         "width",
@@ -119,10 +132,9 @@ def validate_config(config: Dict[str, Any]) -> None:
         "num_cameras",
         "sample_interval_ticks",
         "camera_layout_selection_attempts",
+        "min_effective_track_seconds",
         "scenes_per_map",
         "frames_per_scene",
-        "vehicles",
-        "walkers",
         "sensor_timeout",
         "max_scene_attempts",
     )
@@ -132,6 +144,12 @@ def validate_config(config: Dict[str, Any]) -> None:
     for key in ("train_frames_per_scene", "eval_frames_per_scene"):
         if key in config and int(config[key]) <= 0:
             raise ValueError(f"{key} must be greater than 0")
+    for key in ("vehicles", "walkers"):
+        if int(config[key]) < 0:
+            raise ValueError(f"{key} 不能小于 0")
+    for key in ("max_active_vehicles", "max_active_pedestrians"):
+        if int(config.get(key, 1)) <= 0:
+            raise ValueError(f"{key} 必须大于 0")
     if int(config["num_cameras"]) < 2:
         raise ValueError("跨相机数据至少需要 2 台相机")
     if int(config["scenes_per_map"]) < 1:
@@ -158,8 +176,8 @@ def validate_config(config: Dict[str, Any]) -> None:
             "camera bearing separation must satisfy 0 < minimum <= "
             "preferred_minimum <= preferred_maximum <= maximum <= 180"
         )
-    if float(config.get("camera_min_pair_distance_m", 0.0)) <= 0.0:
-        raise ValueError("camera_min_pair_distance_m 必须大于 0")
+    if float(config.get("camera_min_pair_distance_m", 0.0)) < 0.0:
+        raise ValueError("camera_min_pair_distance_m 不能小于 0")
     ratio = float(config["min_visible_ratio"])
     if not 0.0 < ratio <= 1.0:
         raise ValueError("min_visible_ratio 必须在 (0, 1] 内")
@@ -171,19 +189,48 @@ def validate_config(config: Dict[str, Any]) -> None:
         "vehicle_min_moving_frame_ratio",
         "pedestrian_min_moving_frame_ratio",
         "max_near_duplicate_pair_ratio",
+        "max_dark_flat_region_ratio",
+        "max_flat_region_ratio",
+        "max_far_depth_region_ratio",
     ):
-        value = float(config[key])
+        value = float(config.get(key, 1.0))
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{key} 必须在 [0, 1] 内")
     if not 0.0 <= float(config["near_duplicate_ssim_threshold"]) <= 1.0:
         raise ValueError("near_duplicate_ssim_threshold 必须在 [0, 1] 内")
     if int(config["min_dynamic_event_count"]) < 0:
         raise ValueError("min_dynamic_event_count 不能小于 0")
+    for key in (
+        "vehicle_min_dynamic_event_count",
+        "pedestrian_min_dynamic_event_count",
+    ):
+        if key in config and int(config[key]) < 0:
+            raise ValueError(f"{key} 不能小于 0")
+    if int(config.get("walker_activation_ticks", 10)) < 0:
+        raise ValueError("walker_activation_ticks 不能小于 0")
+    if float(config.get("pedestrian_activation_displacement_m", 0.05)) <= 0.0:
+        raise ValueError("pedestrian_activation_displacement_m 必须大于 0")
+    if float(config.get("pedestrian_moving_step_threshold_m", 0.02)) <= 0.0:
+        raise ValueError("pedestrian_moving_step_threshold_m 必须大于 0")
     pedestrian_sample_hz = float(config.get("pedestrian_sample_hz", 5.0))
     if not 0.0 < pedestrian_sample_hz <= float(config["fps"]):
         raise ValueError("pedestrian_sample_hz 必须在 (0, fps] 内")
     if int(config.get("empty_camera_patience_frames", 5)) < 0:
         raise ValueError("empty_camera_patience_frames 不能小于 0")
+    for key in (
+        "unmodeled_check_width",
+        "unmodeled_check_height",
+        "unmodeled_check_tile_size",
+    ):
+        if int(config.get(key, 1)) <= 0:
+            raise ValueError(f"{key} 必须大于 0")
+    if float(config.get("unmodeled_flat_tile_std_max", 3.0)) < 0.0:
+        raise ValueError("unmodeled_flat_tile_std_max 不能小于 0")
+    dark_luma = float(config.get("unmodeled_dark_luma_max", 100.0))
+    if not 0.0 <= dark_luma <= 255.0:
+        raise ValueError("unmodeled_dark_luma_max 必须在 [0, 255] 内")
+    if float(config.get("unmodeled_far_depth_min_m", 500.0)) <= 0.0:
+        raise ValueError("unmodeled_far_depth_min_m 必须大于 0")
     empty_camera_stop_count = int(config.get("empty_camera_stop_count", 2))
     if not 1 <= empty_camera_stop_count <= int(config["num_cameras"]):
         raise ValueError("empty_camera_stop_count 必须在 [1, num_cameras] 内")
@@ -271,11 +318,16 @@ def build_scene_specs(config: Dict[str, Any]) -> List[SceneSpec]:
         weather = weathers[weather_index]
         index_in_weather = int(weather_occurrences[weather])
         weather_occurrences[weather] += 1
-        anchor_class = (
-            "vehicle"
-            if (weather_index + index_in_weather) % 2 == 0
-            else "pedestrian"
-        )
+        if count == 2:
+            # The two-scene collection contract is explicit: one vehicle scene
+            # followed by one pedestrian scene on every map.
+            anchor_class = "vehicle" if scene_id == 0 else "pedestrian"
+        else:
+            anchor_class = (
+                "vehicle"
+                if (weather_index + index_in_weather) % 2 == 0
+                else "pedestrian"
+            )
         split = (
             "train"
             if scene_id < train_end
@@ -309,7 +361,10 @@ def safe_remove_staging(path: Path, staging_root: Path) -> None:
         shutil.rmtree(resolved)
 
 
-def accepted_scene_directory(path: Path) -> bool:
+def accepted_scene_directory(
+    path: Path,
+    max_frames: Optional[int] = None,
+) -> bool:
     quality_path = path / "scene_quality.json"
     if not quality_path.is_file():
         return False
@@ -317,7 +372,19 @@ def accepted_scene_directory(path: Path) -> bool:
         quality = json.loads(quality_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return bool(quality.get("passed", False))
+    if not bool(quality.get("passed", False)):
+        return False
+    if max_frames is None:
+        return True
+    meta_path = path / "scene_meta.json"
+    if not meta_path.is_file():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    frame_count = int(meta.get("frames", quality.get("frame_count", 0)))
+    return 0 < frame_count <= int(max_frames)
 
 
 def quarantine_rejected_scene(path: Path, root: Path) -> Path:
@@ -506,7 +573,24 @@ def collection_target_actors(
         actors = world.get_actors()
         all_vehicles.extend(list(actors.filter("vehicle.*")))
         all_walkers.extend(list(actors.filter("walker.pedestrian.*")))
-    return live_target_actors(all_vehicles, all_walkers)
+    live = live_target_actors(all_vehicles, all_walkers)
+    vehicles_live = sorted(
+        (
+            actor
+            for actor in live
+            if actor.type_id.startswith("vehicle.")
+        ),
+        key=lambda actor: int(actor.id),
+    )[: int(config.get("max_active_vehicles", len(live)))]
+    pedestrians_live = sorted(
+        (
+            actor
+            for actor in live
+            if actor.type_id.startswith("walker.pedestrian.")
+        ),
+        key=lambda actor: int(actor.id),
+    )[: int(config.get("max_active_pedestrians", len(live)))]
+    return vehicles_live + pedestrians_live
 
 
 def distance_2d(a: Any, b: Any) -> float:
@@ -522,25 +606,96 @@ def actor_speed_mps(actor: Any) -> float:
     )
 
 
+def actor_instance_key(actor: Any, collection_seed: int) -> str:
+    """Identify one spawned instance without depending on its appearance."""
+    return f"{int(collection_seed)}:{int(actor.id)}"
+
+
 def current_moving_anchor_actors(
     actors: Sequence[Any],
     anchor_class: Optional[str],
     config: Dict[str, Any],
 ) -> List[Any]:
-    """Select anchors from their current state, never from warmup history."""
+    """Select currently moving vehicles; pedestrians use measured positions."""
     moving: List[Any] = []
     for actor in registered_actors(actors):
         is_pedestrian = actor.type_id.startswith("walker.pedestrian.")
         actor_class = "pedestrian" if is_pedestrian else "vehicle"
         if anchor_class is not None and actor_class != anchor_class:
             continue
-        threshold = float(config[f"{actor_class}_min_median_speed_mps"])
+        # OpenHUTB can report zero velocity for a walker whose transform is
+        # changing.  The proven single-camera collector therefore evaluates
+        # pedestrian motion from consecutive world positions instead.
+        if actor_class == "pedestrian":
+            continue
+        threshold = float(config["vehicle_min_median_speed_mps"])
         try:
             if actor_speed_mps(actor) >= threshold:
                 moving.append(actor)
         except RuntimeError:
             continue
     return moving
+
+
+def pedestrian_positions(actors: Sequence[Any]) -> Dict[int, Tuple[float, float]]:
+    """Snapshot live pedestrian XY positions without simulator velocity."""
+    positions: Dict[int, Tuple[float, float]] = {}
+    for actor in registered_actors(actors):
+        if not actor.type_id.startswith("walker.pedestrian."):
+            continue
+        try:
+            location = actor.get_location()
+            positions[int(actor.id)] = (
+                float(location.x),
+                float(location.y),
+            )
+        except (AttributeError, RuntimeError):
+            continue
+    return positions
+
+
+def pedestrians_moved_since(
+    actors: Sequence[Any],
+    starting_positions: Dict[int, Tuple[float, float]],
+    config: Dict[str, Any],
+) -> List[Any]:
+    """Return walkers with real displacement during the activation window."""
+    minimum = float(config.get("pedestrian_activation_displacement_m", 0.05))
+    moved: List[Any] = []
+    for actor in registered_actors(actors):
+        if not actor.type_id.startswith("walker.pedestrian."):
+            continue
+        start = starting_positions.get(int(actor.id))
+        if start is None:
+            continue
+        try:
+            location = actor.get_location()
+            displacement = math.hypot(
+                float(location.x) - start[0],
+                float(location.y) - start[1],
+            )
+        except (AttributeError, RuntimeError):
+            continue
+        if displacement >= minimum:
+            moved.append(actor)
+    return moved
+
+
+def eligible_anchor_actors(
+    actors: Sequence[Any],
+    anchor_class: str,
+    config: Dict[str, Any],
+    eligible_pedestrian_ids: Optional[Sequence[int]] = None,
+) -> List[Any]:
+    if anchor_class != "pedestrian":
+        return current_moving_anchor_actors(actors, anchor_class, config)
+    eligible = set(map(int, eligible_pedestrian_ids or []))
+    return [
+        actor
+        for actor in registered_actors(actors)
+        if actor.type_id.startswith("walker.pedestrian.")
+        and int(actor.id) in eligible
+    ]
 
 
 def configure_vehicle_motion(
@@ -587,6 +742,7 @@ def refresh_walker_motion(
     seed: int,
     config: Dict[str, Any],
 ) -> None:
+    """Refresh AI destinations while preserving the original controllers."""
     rng = random.Random(seed + 1543)
     speed_min = float(config.get("walker_speed_min_mps", 0.9))
     speed_max = float(config.get("walker_speed_max_mps", 1.8))
@@ -1153,6 +1309,98 @@ def frame_quality(
     return valid, common, counts
 
 
+def largest_connected_region_ratio(mask: np.ndarray) -> float:
+    """Return the largest 8-connected true component as a mask fraction."""
+    binary = np.asarray(mask, dtype=np.uint8)
+    if binary.size == 0 or not np.any(binary):
+        return 0.0
+    component_count, _, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8,
+    )
+    if component_count <= 1:
+        return 0.0
+    largest = int(np.max(stats[1:, cv2.CC_STAT_AREA]))
+    return float(largest / binary.size)
+
+
+def unmodeled_region_metrics(
+    rgb_bgr: np.ndarray,
+    config: Dict[str, Any],
+    depth_m: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Detect large map-edge voids on a small grid of texture statistics."""
+    if not bool(config.get("reject_unmodeled_regions", False)):
+        return {
+            "enabled": False,
+            "passed": True,
+            "dark_flat_component_ratio": 0.0,
+            "flat_component_ratio": 0.0,
+            "far_depth_ratio": 0.0,
+        }
+    width = int(config.get("unmodeled_check_width", 160))
+    height = int(config.get("unmodeled_check_height", 90))
+    tile = int(config.get("unmodeled_check_tile_size", 10))
+    gray = cv2.cvtColor(
+        cv2.resize(rgb_bgr, (width, height), interpolation=cv2.INTER_AREA),
+        cv2.COLOR_BGR2GRAY,
+    )
+    rows = height // tile
+    columns = width // tile
+    if rows <= 0 or columns <= 0:
+        raise ValueError("未建模区域检测尺寸必须不小于 tile size")
+    gray = gray[: rows * tile, : columns * tile]
+    means = np.empty((rows, columns), dtype=np.float32)
+    deviations = np.empty((rows, columns), dtype=np.float32)
+    for row in range(rows):
+        for column in range(columns):
+            patch = gray[
+                row * tile : (row + 1) * tile,
+                column * tile : (column + 1) * tile,
+            ]
+            means[row, column] = float(np.mean(patch))
+            deviations[row, column] = float(np.std(patch))
+    flat_limit = float(config.get("unmodeled_flat_tile_std_max", 3.0))
+    dark_limit = float(config.get("unmodeled_dark_luma_max", 100.0))
+    flat_mask = deviations <= flat_limit
+    dark_flat_mask = flat_mask & (means <= dark_limit)
+    flat_ratio = largest_connected_region_ratio(flat_mask)
+    dark_flat_ratio = largest_connected_region_ratio(dark_flat_mask)
+    maximum_flat = float(config.get("max_flat_region_ratio", 0.24))
+    maximum_dark_flat = float(
+        config.get("max_dark_flat_region_ratio", 0.05)
+    )
+    far_depth_ratio = 0.0
+    if depth_m is not None:
+        far_depth_minimum = float(
+            config.get("unmodeled_far_depth_min_m", 500.0)
+        )
+        far_depth_ratio = float(
+            np.mean(
+                ~np.isfinite(depth_m)
+                | (depth_m <= 0.0)
+                | (depth_m >= far_depth_minimum)
+            )
+        )
+    maximum_far_depth = float(
+        config.get("max_far_depth_region_ratio", 0.10)
+    )
+    return {
+        "enabled": True,
+        "passed": (
+            flat_ratio <= maximum_flat
+            and dark_flat_ratio <= maximum_dark_flat
+            and far_depth_ratio <= maximum_far_depth
+        ),
+        "dark_flat_component_ratio": dark_flat_ratio,
+        "flat_component_ratio": flat_ratio,
+        "far_depth_ratio": far_depth_ratio,
+        "max_dark_flat_component_ratio": maximum_dark_flat,
+        "max_flat_component_ratio": maximum_flat,
+        "max_far_depth_region_ratio": maximum_far_depth,
+    }
+
+
 def inspect_camera_frame(
     world: Any,
     unit: CameraUnit,
@@ -1186,9 +1434,11 @@ def inspect_camera_frame(
             & (depth_m < float(config["min_near_depth_m"]))
         )
     )
+    unmodeled = unmodeled_region_metrics(rgb_bgr, config, depth_m)
     view_valid = (
         road_ratio >= float(config["min_road_visible_ratio"])
         and near_ratio <= float(config["max_near_depth_ratio"])
+        and bool(unmodeled["passed"])
     )
     boundary_count = 0
     if bool(config.get("reject_boundary_annotations", False)):
@@ -1220,6 +1470,7 @@ def inspect_camera_frame(
         "annotations": annotations,
         "road_visible_ratio": road_ratio,
         "near_depth_ratio": near_ratio,
+        "unmodeled_region": unmodeled,
         "view_valid": view_valid,
         "boundary_annotation_count": boundary_count,
     }
@@ -1286,6 +1537,7 @@ def write_frame(
                 "image": str(image_path.relative_to(scene_dir)),
                 "road_visible_ratio": payload["road_visible_ratio"],
                 "near_depth_ratio": payload["near_depth_ratio"],
+                "unmodeled_region": payload["unmodeled_region"],
                 "common_global_ids": saved_common_ids,
                 "annotations": saved_annotations,
             },
@@ -1450,15 +1702,40 @@ def sequence_quality_report(
             + (samples[-1][2] - samples[0][2]) ** 2
             + (samples[-1][3] - samples[0][3]) ** 2
         )
+    step_distances = [
+        math.sqrt(
+            (current[1] - previous[1]) ** 2
+            + (current[2] - previous[2]) ** 2
+            + (current[3] - previous[3]) ** 2
+        )
+        for previous, current in zip(samples, samples[1:])
+    ]
     speeds = [sample[4] for sample in samples]
     median_speed = float(np.median(speeds)) if speeds else 0.0
     prefix = "pedestrian" if spec.anchor_class == "pedestrian" else "vehicle"
-    speed_threshold = float(config[f"{prefix}_min_median_speed_mps"])
-    moving_ratio = (
-        float(sum(speed >= speed_threshold for speed in speeds) / len(speeds))
-        if speeds
-        else 0.0
-    )
+    if prefix == "pedestrian":
+        # Match the single-camera collector: walker movement is derived from
+        # consecutive transforms because OpenHUTB may report zero velocity.
+        speed_threshold = 0.0
+        moving_step_threshold = float(
+            config.get("pedestrian_moving_step_threshold_m", 0.02)
+        )
+        moving_ratio = (
+            float(
+                sum(step >= moving_step_threshold for step in step_distances)
+                / len(step_distances)
+            )
+            if step_distances
+            else 0.0
+        )
+    else:
+        speed_threshold = float(config["vehicle_min_median_speed_mps"])
+        moving_step_threshold = None
+        moving_ratio = (
+            float(sum(speed >= speed_threshold for speed in speeds) / len(speeds))
+            if speeds
+            else 0.0
+        )
 
     headings: List[float] = []
     for previous, current in zip(samples, samples[1:]):
@@ -1519,8 +1796,18 @@ def sequence_quality_report(
         "occlusion_reappearance": reappearances > 0,
     }
     dynamic_event_count = sum(bool(value) for value in events.values())
+    minimum_dynamic_event_count = int(
+        config.get(
+            f"{spec.anchor_class}_min_dynamic_event_count",
+            config["min_dynamic_event_count"],
+        )
+    )
 
-    minimum_track_frames = int(config["min_effective_track_frames"])
+    minimum_track_seconds = float(config["min_effective_track_seconds"])
+    minimum_track_frames = max(
+        1,
+        int(math.ceil(minimum_track_seconds / sample_seconds)),
+    )
     effective_tracks = {
         dataset_global_id(spec.scene_id, actor_id): len(frames)
         for actor_id, frames in track_visible_frames.items()
@@ -1551,7 +1838,32 @@ def sequence_quality_report(
         median_speed >= speed_threshold
         and moving_ratio >= moving_ratio_threshold
     )
-    motion_gate_passed = spatial_motion_passed or temporal_motion_passed
+    if prefix == "pedestrian":
+        # Pedestrians have no minimum-speed quality threshold. Acceptance uses
+        # actual displacement and accumulated path length only.
+        motion_policy = "spatial_only_no_speed_limit"
+        motion_gate_passed = spatial_motion_passed
+        motion_failure_detail = (
+            "motion_gate_failed: "
+            f"displacement_m={displacement:.3f}/"
+            f"{displacement_threshold:.3f}, "
+            f"path_length_m={path_length:.3f}/"
+            f"{path_length_threshold:.3f}"
+        )
+    else:
+        motion_policy = "spatial_or_temporal"
+        motion_gate_passed = spatial_motion_passed or temporal_motion_passed
+        motion_failure_detail = (
+            "motion_gate_failed: "
+            f"displacement_m={displacement:.3f}/"
+            f"{displacement_threshold:.3f}, "
+            f"path_length_m={path_length:.3f}/"
+            f"{path_length_threshold:.3f}, "
+            f"median_speed_mps={median_speed:.3f}/"
+            f"{speed_threshold:.3f}, "
+            f"moving_frame_ratio={moving_ratio:.3f}/"
+            f"{moving_ratio_threshold:.3f}"
+        )
 
     failures: List[str] = []
     checks = (
@@ -1569,25 +1881,16 @@ def sequence_quality_report(
         ),
         (
             motion_gate_passed,
-            (
-                "motion_gate_failed: "
-                f"displacement_m={displacement:.3f}/"
-                f"{displacement_threshold:.3f}, "
-                f"path_length_m={path_length:.3f}/"
-                f"{path_length_threshold:.3f}, "
-                f"median_speed_mps={median_speed:.3f}/"
-                f"{speed_threshold:.3f}, "
-                f"moving_frame_ratio={moving_ratio:.3f}/"
-                f"{moving_ratio_threshold:.3f}"
-            ),
+            motion_failure_detail,
         ),
         (
             len(effective_tracks) >= int(config["min_effective_tracks"]),
             f"effective_tracks={len(effective_tracks)}",
         ),
         (
-            dynamic_event_count >= int(config["min_dynamic_event_count"]),
-            f"dynamic_event_count={dynamic_event_count}",
+            dynamic_event_count >= minimum_dynamic_event_count,
+            f"dynamic_event_count={dynamic_event_count}/"
+            f"{minimum_dynamic_event_count}",
         ),
         (
             near_duplicate_ratio <= float(config["max_near_duplicate_pair_ratio"]),
@@ -1614,7 +1917,7 @@ def sequence_quality_report(
         "anchor_moving_frame_ratio": moving_ratio,
         "motion_gate": {
             "passed": motion_gate_passed,
-            "policy": "spatial_or_temporal",
+            "policy": motion_policy,
             "spatial_motion_passed": spatial_motion_passed,
             "temporal_motion_passed": temporal_motion_passed,
             "thresholds": {
@@ -1622,12 +1925,16 @@ def sequence_quality_report(
                 "path_length_m": path_length_threshold,
                 "median_speed_mps": speed_threshold,
                 "moving_frame_ratio": moving_ratio_threshold,
+                "moving_step_m": moving_step_threshold,
             },
         },
         "effective_track_count": len(effective_tracks),
         "effective_track_lengths": effective_tracks,
+        "effective_track_minimum_seconds": minimum_track_seconds,
+        "effective_track_minimum_frames": minimum_track_frames,
         "dynamic_events": events,
         "dynamic_event_count": dynamic_event_count,
+        "minimum_dynamic_event_count": minimum_dynamic_event_count,
         "anchor_heading_change_deg": float(heading_change),
         "minimum_other_actor_distance_m": (
             None
@@ -1685,26 +1992,32 @@ def collect_scene_attempt(
         ),
         None,
     )
-    current_speed_threshold = float(
-        config[f"{spec.anchor_class}_min_median_speed_mps"]
-    )
-    try:
-        current_anchor_speed = (
-            actor_speed_mps(current_anchor) if current_anchor is not None else 0.0
-        )
-    except RuntimeError:
-        current_anchor_speed = 0.0
-    if current_anchor_speed < current_speed_threshold:
+    if current_anchor is None:
         return {
             "accepted": False,
-            "reason": f"anchor_current_speed_mps={current_anchor_speed:.3f}",
+            "reason": "anchor_actor_is_no_longer_alive",
             "quality": {
                 "passed": False,
-                "failures": [
-                    f"anchor_current_speed_mps={current_anchor_speed:.3f}"
-                ],
+                "failures": ["anchor_actor_is_no_longer_alive"],
             },
         }
+    if spec.anchor_class != "pedestrian":
+        current_speed_threshold = float(config["vehicle_min_median_speed_mps"])
+        try:
+            current_anchor_speed = actor_speed_mps(current_anchor)
+        except RuntimeError:
+            current_anchor_speed = 0.0
+        if current_anchor_speed < current_speed_threshold:
+            return {
+                "accepted": False,
+                "reason": f"anchor_current_speed_mps={current_anchor_speed:.3f}",
+                "quality": {
+                    "passed": False,
+                    "failures": [
+                        f"anchor_current_speed_mps={current_anchor_speed:.3f}"
+                    ],
+                },
+            }
 
     for unit in units:
         write_json(
@@ -1768,6 +2081,31 @@ def collect_scene_attempt(
             )
             camera_payloads[unit.name] = payload
             all_views_valid = all_views_valid and bool(payload["view_valid"])
+        rejected_unmodeled_views = {
+            camera_name: payload["unmodeled_region"]
+            for camera_name, payload in camera_payloads.items()
+            if not bool(payload["unmodeled_region"]["passed"])
+        }
+        if rejected_unmodeled_views:
+            details = ", ".join(
+                (
+                    f"{camera_name}:dark_flat="
+                    f"{float(metrics['dark_flat_component_ratio']):.3f},"
+                    f"flat={float(metrics['flat_component_ratio']):.3f},"
+                    f"far_depth={float(metrics['far_depth_ratio']):.3f}"
+                )
+                for camera_name, metrics in rejected_unmodeled_views.items()
+            )
+            return {
+                "accepted": False,
+                "reason": f"unmodeled_map_region_detected ({details})",
+                "quality": {
+                    "passed": False,
+                    "failures": ["unmodeled_map_region_detected"],
+                    "rejected_cameras": rejected_unmodeled_views,
+                    "rejected_at_frame": frame_index,
+                },
+            }
         for camera_name, payload in camera_payloads.items():
             if payload["annotations"]:
                 empty_camera_streaks[camera_name] = 0
@@ -1917,6 +2255,11 @@ def collect_scene_attempt(
                     int(required_global_id),
                 ),
                 "anchor_carla_actor_id": int(required_global_id),
+                "anchor_instance_key": actor_instance_key(
+                    current_anchor,
+                    int(config["seed"]),
+                ),
+                "collection_seed": int(config["seed"]),
                 "frames": len(frame_rows),
                 "max_frames": max_frames,
                 "termination_reason": termination_reason,
@@ -1966,6 +2309,9 @@ def collect_scene(
     paths: Dict[str, Path],
     config: Dict[str, Any],
     rng: random.Random,
+    eligible_pedestrian_ids: Optional[Sequence[int]] = None,
+    used_anchor_ids: Optional[Sequence[int]] = None,
+    used_anchor_instance_keys: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     max_attempts = int(config["max_scene_attempts"])
     max_attempts_per_anchor = max(
@@ -1973,37 +2319,54 @@ def collect_scene(
         int(config.get("max_camera_attempts_per_anchor", 3)),
     )
     anchor_failure_counts: Counter = Counter()
-    excluded_anchor_ids: set = set()
+    permanently_excluded_anchor_ids = set(map(int, used_anchor_ids or []))
+    permanently_excluded_instance_keys = set(
+        used_anchor_instance_keys or []
+    )
+    temporarily_excluded_anchor_ids: set = set()
     for attempt in range(max_attempts):
         staging_dir = paths["staging"] / f"{spec.name}_attempt_{attempt:03d}"
         safe_remove_staging(staging_dir, paths["staging"])
         staging_dir.mkdir(parents=True)
-        anchor_candidates = current_moving_anchor_actors(
+        anchor_candidates = eligible_anchor_actors(
             traffic_actors,
             spec.anchor_class,
             config,
+            eligible_pedestrian_ids,
         )
+        anchor_candidates = [
+            actor
+            for actor in anchor_candidates
+            if actor_instance_key(actor, int(config["seed"]))
+            not in permanently_excluded_instance_keys
+        ]
         anchor = choose_anchor_actor(
             anchor_candidates,
             config,
             rng,
             preferred_class=spec.anchor_class,
-            excluded_actor_ids=excluded_anchor_ids,
+            excluded_actor_ids=(
+                permanently_excluded_anchor_ids
+                | temporarily_excluded_anchor_ids
+            ),
         )
-        if anchor is None and excluded_anchor_ids:
+        if anchor is None and temporarily_excluded_anchor_ids:
             # Every candidate has been explored. Start another bounded pass while
-            # retaining the same frame-quality requirements.
-            excluded_anchor_ids.clear()
+            # retaining both the frame-quality requirements and the permanent
+            # per-map list of anchors already saved in successful scenes.
+            temporarily_excluded_anchor_ids.clear()
             anchor_failure_counts.clear()
             anchor = choose_anchor_actor(
-                current_moving_anchor_actors(
+                eligible_anchor_actors(
                     traffic_actors,
                     spec.anchor_class,
                     config,
+                    eligible_pedestrian_ids,
                 ),
                 config,
                 rng,
                 preferred_class=spec.anchor_class,
+                excluded_actor_ids=permanently_excluded_anchor_ids,
             )
         if anchor is None:
             safe_remove_staging(staging_dir, paths["staging"])
@@ -2047,6 +2410,10 @@ def collect_scene(
                     ),
                     "anchor_carla_actor_id": int(anchor.id),
                     "anchor_class": spec.anchor_class,
+                    "anchor_instance_key": actor_instance_key(
+                        anchor,
+                        int(config["seed"]),
+                    ),
                 }
             )
             print(
@@ -2073,7 +2440,7 @@ def collect_scene(
         anchor_id = int(anchor.id)
         anchor_failure_counts[anchor_id] += 1
         if anchor_failure_counts[anchor_id] >= max_attempts_per_anchor:
-            excluded_anchor_ids.add(anchor_id)
+            temporarily_excluded_anchor_ids.add(anchor_id)
         safe_remove_staging(staging_dir, paths["staging"])
     raise RuntimeError(
         f"{spec.name} 连续 {max_attempts} 次没有得到合格的三相机公共目标"
@@ -2431,7 +2798,11 @@ def audit_dataset(root: Path) -> Dict[str, Any]:
 
     report = {
         "root": str(root),
-        "passed": not sync_errors and duplicate_image_files == 0,
+        "passed": (
+            bool(scene_reports)
+            and not sync_errors
+            and duplicate_image_files == 0
+        ),
         "scene_count": len(scene_reports),
         "image_count": total_images,
         "annotation_observations": dict(total_annotations),
@@ -2495,6 +2866,12 @@ def write_dataset_manifest(
         },
         "capture": {
             "num_cameras": int(config["num_cameras"]),
+            "run_seed": (
+                int(config["seed"])
+                if config.get("seed") is not None
+                else None
+            ),
+            "seed_source": str(config.get("seed_source", "explicit")),
             "fps": float(config["fps"]),
             "sensor_tick": float(config.get("sensor_tick", 0.0)),
             "vehicle_sample_interval_ticks": int(config["sample_interval_ticks"]),
@@ -2607,7 +2984,7 @@ def write_readme(root: Path, config: Dict[str, Any], audit: Dict[str, Any]) -> N
 - 车辆场景：每 {config['sample_interval_ticks']} 个同步帧保存一次
 - 行人场景：{float(config.get('pedestrian_sample_hz', 5.0)):.1f} Hz 保存
 - 场景长度：配置帧数是上限；至少 {config.get('empty_camera_stop_count', 2)} 台相机连续超过 {config.get('empty_camera_patience_frames', 5)} 帧没有目标时提前停止
-- 相机布局：方位角和俯视角按范围随机，任意两机水平距离至少 {float(config.get('camera_min_pair_distance_m', 15.0)):.1f} 米
+- 相机布局：方位角和俯视角按范围随机，相机物理间距下限为 {float(config.get('camera_min_pair_distance_m', 0.0)):.1f} 米（0 表示不限制）
 - 分辨率：{config['width']}x{config['height']}
 - 天气：{', '.join(config['weather_presets'])}
 - 场景级划分：train / val / test，避免相邻帧泄漏
@@ -2665,11 +3042,19 @@ def run_collection(
     try:
         if bool(config["hide_static_map_vehicles"]):
             static_ids = base.hide_static_map_vehicles(world)
+        vehicle_spawn_count = min(
+            int(config["vehicles"]),
+            int(config.get("max_active_vehicles", config["vehicles"])),
+        )
+        walker_spawn_count = min(
+            int(config["walkers"]),
+            int(config.get("max_active_pedestrians", config["walkers"])),
+        )
         vehicles, walkers, controllers = base.spawn_background_traffic(
             client,
             world,
-            int(config["vehicles"]),
-            int(config["walkers"]),
+            vehicle_spawn_count,
+            walker_spawn_count,
             int(config["tm_port"]),
             int(config["seed"]),
         )
@@ -2683,14 +3068,16 @@ def run_collection(
             int(config["seed"]),
             config,
         )
-        refresh_walker_motion(world, controllers, int(config["seed"]), config)
-        # Let Traffic Manager reach a stable state, but deliberately discard
-        # all motion history. Anchor selection below uses only current speed.
+        refresh_walker_motion(
+            world,
+            controllers,
+            int(config["seed"]),
+            config,
+        )
+        # Let Traffic Manager and the AI walker controllers reach a stable
+        # state. This history is never used to qualify a scene target.
         for _ in range(int(config.get("actor_spawn_warmup_ticks", 75))):
             world.tick()
-        vehicles = registered_actors(vehicles)
-        walkers = registered_actors(walkers)
-        controllers = registered_actors(controllers)
         traffic_actors = collection_target_actors(
             world,
             vehicles,
@@ -2701,11 +3088,16 @@ def run_collection(
             raise RuntimeError("没有成功生成车辆或行人")
         initial_anchor_actors = current_moving_anchor_actors(
             traffic_actors,
-            None,
+            "vehicle",
             config,
         )
         if not initial_anchor_actors:
-            raise RuntimeError("当前没有正在运动的车辆或行人可用于初始化相机")
+            # The initial transform only provides a safe place to spawn the
+            # reusable sensors. Actual targets are selected after warmup from
+            # a fresh per-scene activation window.
+            initial_anchor_actors = registered_actors(traffic_actors)
+        if not initial_anchor_actors:
+            raise RuntimeError("当前没有可用于初始化相机的交通参与者")
         carla_map = world.get_map()
         road_waypoints = carla_map.generate_waypoints(
             float(config["camera_candidate_spacing_m"])
@@ -2736,18 +3128,72 @@ def run_collection(
             if initial_rig is not None:
                 break
         if initial_rig is None:
-            raise RuntimeError(
-                "无法生成初始三相机道路上空视角："
-                f"已检查 {len(initial_anchor_ids)} 个不同锚点"
+            fallback_anchor = initial_anchor_actors[0]
+            fallback_location = fallback_anchor.get_location()
+            fallback_transform = carla.Transform(
+                carla.Location(
+                    x=float(fallback_location.x),
+                    y=float(fallback_location.y),
+                    z=float(fallback_location.z)
+                    + float(config["camera_height_min_m"]),
+                ),
+                carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0),
             )
-        units = spawn_camera_units(world, initial_rig[0][0], config)
+            initial_transform = fallback_transform
+            print(
+                "[WARN] Initial rig proposal unavailable; using a temporary "
+                "sensor spawn transform. Scene collection will still search "
+                "for a fully valid three-camera rig.",
+                flush=True,
+            )
+        else:
+            initial_transform = initial_rig[0][0]
+        units = spawn_camera_units(world, initial_transform, config)
         rng = random.Random(int(config["seed"]) + 101)
 
         current_weather = None
+        used_anchor_ids_by_class = {
+            "vehicle": set(),
+            "pedestrian": set(),
+        }
+        used_anchor_instance_keys_by_class = {
+            "vehicle": set(),
+            "pedestrian": set(),
+        }
+        # Rebuild the accepted-instance history from saved scenes. Identity is
+        # based on collection seed + actor ID, never on the limited appearance
+        # catalogue. A respawned actor is therefore a new target instance.
+        for meta_path in paths["scenes"].glob("*/scene_meta.json"):
+            try:
+                previous_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            previous_class = str(previous_meta.get("anchor_class", ""))
+            previous_instance_key = str(
+                previous_meta.get("anchor_instance_key", "")
+            )
+            if (
+                previous_class in used_anchor_instance_keys_by_class
+                and previous_instance_key
+            ):
+                used_anchor_instance_keys_by_class[previous_class].add(
+                    previous_instance_key
+                )
+        instance_history_path = paths["root"] / "used_anchor_instances.json"
+        write_json(
+            instance_history_path,
+            {
+                key: sorted(values)
+                for key, values in used_anchor_instance_keys_by_class.items()
+            },
+        )
         for scene_index, spec in enumerate(specs):
             completed_scene = paths["scenes"] / spec.name
             if completed_scene.is_dir():
-                if accepted_scene_directory(completed_scene):
+                if accepted_scene_directory(
+                    completed_scene,
+                    frames_for_scene(spec, config),
+                ):
                     print(
                         f"[RESUME-SKIP] Scene {scene_index + 1}/{len(specs)}: "
                         f"{spec.name}",
@@ -2784,16 +3230,17 @@ def run_collection(
                 f"consecutive target-free frames",
                 flush=True,
             )
-            # Keep one moving traffic population for the map.  Public IDs are
-            # namespaced by scene_id, so reuse does not leak identities across
-            # splits.  Avoiding per-scene destruction is also required for this
-            # OpenHUTB build: destroying attached walker controllers can remove
-            # their parents server-side and destabilize the simulator.
+            # Keep one bounded moving population for the map, but permanently
+            # exclude every anchor already saved by this run. Public IDs remain
+            # namespaced by scene_id. Avoiding per-scene actor destruction is
+            # also required for this OpenHUTB build: destroying attached walker
+            # controllers can remove their parents and destabilize the server.
             population_limit = max(
                 1,
                 int(config.get("max_actor_population_attempts", 1)),
             )
             result = None
+            scene_failure_reason = None
             for population_attempt in range(population_limit):
                 scene_seed = (
                     int(config["seed"])
@@ -2807,37 +3254,102 @@ def run_collection(
                     scene_seed,
                     config,
                 )
-                refresh_walker_motion(world, controllers, scene_seed, config)
-                vehicles = registered_actors(vehicles)
-                walkers = registered_actors(walkers)
-                controllers = registered_actors(controllers)
                 traffic_actors = collection_target_actors(
                     world,
                     vehicles,
                     walkers,
                     config,
                 )
-                current_anchor_actors = current_moving_anchor_actors(
-                    traffic_actors,
-                    spec.anchor_class,
+                pedestrian_starting_positions = (
+                    pedestrian_positions(traffic_actors)
+                    if spec.anchor_class == "pedestrian"
+                    else {}
+                )
+                refresh_walker_motion(
+                    world,
+                    controllers,
+                    scene_seed,
                     config,
+                )
+                if spec.anchor_class == "pedestrian":
+                    for _ in range(
+                        int(config.get("walker_activation_ticks", 10))
+                    ):
+                        tick_and_get(
+                            world,
+                            units,
+                            float(config["sensor_timeout"]),
+                        )
+                    drain_camera_units(units)
+                traffic_actors = collection_target_actors(
+                    world,
+                    vehicles,
+                    walkers,
+                    config,
+                )
+                if spec.anchor_class == "pedestrian":
+                    current_anchor_actors = pedestrians_moved_since(
+                        traffic_actors,
+                        pedestrian_starting_positions,
+                        config,
+                    )
+                    print(
+                        "[WALKER-ACTIVATION] "
+                        f"observed={len(pedestrian_starting_positions)}, "
+                        f"moved_xy_at_least_"
+                        f"{float(config.get('pedestrian_activation_displacement_m', 0.05)):.2f}m="
+                        f"{len(current_anchor_actors)}, "
+                        f"controller_refs={len(controllers)}",
+                        flush=True,
+                    )
+                else:
+                    current_anchor_actors = current_moving_anchor_actors(
+                        traffic_actors,
+                        spec.anchor_class,
+                        config,
+                    )
+                used_anchor_ids = used_anchor_ids_by_class[spec.anchor_class]
+                used_anchor_instance_keys = used_anchor_instance_keys_by_class[
+                    spec.anchor_class
+                ]
+                unused_anchor_actors = [
+                    actor
+                    for actor in current_anchor_actors
+                    if int(actor.id) not in used_anchor_ids
+                    and actor_instance_key(actor, int(config["seed"]))
+                    not in used_anchor_instance_keys
+                ]
+                remaining_scenes = sum(
+                    candidate.anchor_class == spec.anchor_class
+                    for candidate in specs[scene_index:]
+                )
+                print(
+                    f"[ANCHOR-POOL] class={spec.anchor_class}, "
+                    f"moving={len(current_anchor_actors)}, "
+                    f"unused={len(unused_anchor_actors)}, "
+                    f"already_saved={len(used_anchor_ids)}, "
+                    f"used_instances={len(used_anchor_instance_keys)}, "
+                    f"remaining_scenes={remaining_scenes}",
+                    flush=True,
                 )
                 if not traffic_actors:
                     if population_attempt + 1 >= population_limit:
-                        raise RuntimeError(
+                        scene_failure_reason = (
                             f"No vehicle or pedestrian was spawned for {spec.name}"
                         )
+                        break
                     continue
                 drain_camera_units(units)
-                if not current_anchor_actors:
+                if not unused_anchor_actors:
                     if population_attempt + 1 >= population_limit:
-                        raise RuntimeError(
-                            f"No currently moving {spec.anchor_class} anchor "
-                            f"was available for {spec.name}"
+                        scene_failure_reason = (
+                            f"No unused, currently moving {spec.anchor_class} "
+                            f"anchor was available for {spec.name}"
                         )
+                        break
                     print(
-                        f"[RETRY-TRAFFIC] {spec.name}: no currently moving "
-                        f"{spec.anchor_class} anchor",
+                        f"[RETRY-TRAFFIC] {spec.name}: no unused, currently "
+                        f"moving {spec.anchor_class} anchor",
                         flush=True,
                     )
                     continue
@@ -2851,10 +3363,16 @@ def run_collection(
                         paths,
                         config,
                         random.Random(scene_seed + 101),
+                        eligible_pedestrian_ids=[
+                            int(actor.id) for actor in unused_anchor_actors
+                        ],
+                        used_anchor_ids=used_anchor_ids,
+                        used_anchor_instance_keys=used_anchor_instance_keys,
                     )
                 except RuntimeError as exc:
                     if population_attempt + 1 >= population_limit:
-                        raise
+                        scene_failure_reason = str(exc)
+                        break
                     print(
                         f"[RETRY-TRAFFIC] {spec.name}: motion refresh "
                         f"{population_attempt + 1}/{population_limit} rejected: {exc}",
@@ -2866,9 +3384,53 @@ def run_collection(
                 result["current_moving_anchor_count"] = len(
                     current_anchor_actors
                 )
+                accepted_anchor_id = int(result["anchor_carla_actor_id"])
+                if accepted_anchor_id in used_anchor_ids:
+                    raise RuntimeError(
+                        f"Accepted duplicate {spec.anchor_class} anchor "
+                        f"{accepted_anchor_id}"
+                    )
+                accepted_instance_key = str(result["anchor_instance_key"])
+                if accepted_instance_key in used_anchor_instance_keys:
+                    raise RuntimeError(
+                        f"Accepted duplicate {spec.anchor_class} instance "
+                        f"{accepted_instance_key}"
+                    )
+                used_anchor_ids.add(accepted_anchor_id)
+                used_anchor_instance_keys.add(accepted_instance_key)
+                write_json(
+                    instance_history_path,
+                    {
+                        key: sorted(values)
+                        for key, values in (
+                            used_anchor_instance_keys_by_class.items()
+                        )
+                    },
+                )
                 break
             if result is None:
-                raise RuntimeError(f"No accepted actor population for {spec.name}")
+                scene_failure_reason = scene_failure_reason or (
+                    f"No accepted actor population for {spec.name}"
+                )
+                failed_result = {
+                    "accepted": False,
+                    "scene": spec.name,
+                    "split": spec.split,
+                    "weather": spec.weather,
+                    "anchor_class": spec.anchor_class,
+                    "reason": scene_failure_reason,
+                }
+                results.append(failed_result)
+                append_jsonl(
+                    paths["root"] / "failed_scenes.jsonl",
+                    failed_result,
+                )
+                print(
+                    f"[SCENE-FAILED] {spec.name}: {scene_failure_reason}; "
+                    "continuing with the next scene.",
+                    flush=True,
+                )
+                continue
             results.append(result)
     finally:
         destroy_actors(
@@ -2920,6 +3482,12 @@ def main() -> int:
         )
         return 0 if audit["passed"] else 2
 
+    run_seed = resolve_run_seed(config)
+    print(
+        f"[INFO] Run seed: {run_seed} "
+        f"({config.get('seed_source', 'explicit')})",
+        flush=True,
+    )
     paths = prepare_output(output, args.overwrite, args.resume)
     write_json(paths["root"] / "collection_config_used.json", config)
     started = time.time()
@@ -2927,23 +3495,44 @@ def main() -> int:
     normalize_existing_dataset(paths["root"], specs)
     yolo_report = rebuild_yolo_dataset(paths["root"], specs)
     audit = audit_dataset(paths["root"])
+    accepted_scene_names = [
+        spec.name
+        for spec in specs
+        if accepted_scene_directory(
+            paths["scenes"] / spec.name,
+            frames_for_scene(spec, config),
+        )
+    ]
+    missing_scene_names = [
+        spec.name
+        for spec in specs
+        if spec.name not in set(accepted_scene_names)
+    ]
+    collection_complete = not missing_scene_names
     write_dataset_manifest(paths["root"], config, audit)
     write_readme(paths["root"], config, audit)
     write_json(
         paths["root"] / "collection_report.json",
         {
             "elapsed_seconds": time.time() - started,
+            "run_seed": int(config["seed"]),
+            "seed_source": str(config.get("seed_source", "explicit")),
             "scene_results": results,
             "yolo": yolo_report,
             "audit_passed": audit["passed"],
+            "collection_complete": collection_complete,
+            "accepted_scenes": accepted_scene_names,
+            "missing_scenes": missing_scene_names,
         },
     )
     safe_remove_staging(paths["staging"], paths["root"])
     print(
         f"[DONE] root={paths['root']}, scenes={audit['scene_count']}, "
-        f"images={audit['image_count']}, passed={audit['passed']}"
+        f"images={audit['image_count']}, audit_passed={audit['passed']}, "
+        f"collection_complete={collection_complete}, "
+        f"missing_scenes={missing_scene_names}"
     )
-    return 0 if audit["passed"] else 2
+    return 0 if audit["passed"] and collection_complete else 2
 
 
 if __name__ == "__main__":

@@ -19,8 +19,9 @@ import os
 import random
 import shutil
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -60,6 +61,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="保留已完整验收的序列，并从第一条缺失序列继续。",
+    )
     parser.add_argument("--sequences-per-map", type=int, default=None)
     parser.add_argument("--frames-per-sequence", type=int, default=None)
     parser.add_argument(
@@ -101,6 +107,14 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
         }
     if args.weather_presets is not None:
         config["weather_presets"] = args.weather_presets
+    if (
+        str(config.get("weather_assignment", "cycle")) == "random_per_run"
+        and "run_seed" not in config
+    ):
+        run_seed = random.SystemRandom().randint(1, 2_147_000_000)
+        config["run_seed"] = run_seed
+        config["seed"] = run_seed
+        config["weather_assignment_seed"] = run_seed + 10_007
     config["_config_path"] = str(config_path)
     return config
 
@@ -122,10 +136,18 @@ def validate_config(config: Dict[str, Any]) -> None:
     for key in ("vehicles", "walkers"):
         if int(config[key]) < 0:
             raise ValueError(f"{key} 不能小于 0")
+    include_existing_any = bool(config.get("include_existing_target_actors", False))
+    include_existing_vehicle = bool(
+        config.get("include_existing_target_vehicle_actors", include_existing_any)
+    )
+    include_existing_pedestrian = bool(
+        config.get("include_existing_target_pedestrian_actors", include_existing_any)
+    )
     if (
         int(config["vehicles"]) == 0
         and int(config["walkers"]) == 0
-        and not bool(config.get("include_existing_target_actors", False))
+        and not include_existing_vehicle
+        and not include_existing_pedestrian
     ):
         raise ValueError(
             "vehicles 和 walkers 不能同时为 0，除非启用现有目标 actor"
@@ -139,9 +161,15 @@ def validate_config(config: Dict[str, Any]) -> None:
     if not config["weather_presets"]:
         raise ValueError("weather_presets 不能为空")
     weather_assignment = str(config.get("weather_assignment", "cycle"))
-    if weather_assignment not in {"cycle", "random", "random_unseeded"}:
+    if weather_assignment not in {
+        "cycle",
+        "random",
+        "random_unseeded",
+        "random_per_run",
+    }:
         raise ValueError(
-            "weather_assignment 只能是 cycle、random 或 random_unseeded"
+            "weather_assignment 只能是 cycle、random、random_unseeded "
+            "或 random_per_run"
         )
     motion_modes = list(config.get("motion_modes", []))
     if not motion_modes:
@@ -165,6 +193,32 @@ def validate_config(config: Dict[str, Any]) -> None:
     for mode in motion_modes:
         if int(config.get("frames_by_motion_mode", {}).get(mode, 0)) <= 0:
             raise ValueError(f"{mode} 的最大帧数必须大于 0")
+    target_classes_by_mode = config.get("target_classes_by_motion_mode", {})
+    for mode in motion_modes:
+        classes = list(
+            target_classes_by_mode.get(mode, ("vehicle", "pedestrian"))
+        )
+        if not classes:
+            raise ValueError(f"{mode} 的目标类别列表不能为空")
+        unknown_classes = sorted(
+            set(classes) - {"vehicle", "pedestrian"}
+        )
+        if unknown_classes:
+            raise ValueError(
+                f"{mode} 包含未知目标类别：{unknown_classes}"
+            )
+    if int(config.get("max_sequences_per_target_actor", 2)) <= 0:
+        raise ValueError("max_sequences_per_target_actor 必须大于 0")
+    for key in (
+        "min_target_average_speed_mps",
+        "min_target_moving_step_ratio",
+        "target_moving_step_threshold_m",
+    ):
+        for target_class, value in config.get(key, {}).items():
+            if target_class not in {"vehicle", "pedestrian"}:
+                raise ValueError(f"{key} 包含未知类别：{target_class}")
+            if float(value) < 0.0:
+                raise ValueError(f"{key}/{target_class} 不能小于 0")
     for mode, class_frames in config.get(
         "frames_by_motion_mode_and_target_class", {}
     ).items():
@@ -229,18 +283,25 @@ def max_consecutive_absent_for_sequence(
     )
 
 
-def prepare_output(root: Path, overwrite: bool) -> Dict[str, Path]:
+def prepare_output(
+    root: Path,
+    overwrite: bool,
+    resume: bool = False,
+) -> Dict[str, Path]:
     root = root.resolve()
+    if overwrite and resume:
+        raise ValueError("--overwrite 和 --resume 不能同时使用")
     if root.exists():
-        if not overwrite:
+        if not overwrite and not resume:
             raise FileExistsError(
                 f"输出目录已存在：{root}\n"
-                "为避免混入旧追踪帧，换一个 out，或明确使用 --overwrite。"
+                "为避免混入旧追踪帧，换一个 out，或使用 --overwrite/--resume。"
             )
         safe_name = str(root.parent / root.name).lower()
         if "dataset_uav" not in safe_name or "single_object_vot" not in safe_name:
             raise RuntimeError(f"拒绝覆盖名称异常的目录：{root}")
-        shutil.rmtree(root)
+        if overwrite:
+            shutil.rmtree(root)
     paths = {
         "root": root,
         "vot": root / "vot",
@@ -248,6 +309,24 @@ def prepare_output(root: Path, overwrite: bool) -> Dict[str, Path]:
         "qa": root / "qa_overlay",
         "tmp": root / "_sequence_staging",
     }
+    if resume:
+        # These are derived only after all source sequences finish. Rebuild
+        # them from the preserved VOT sequence directories at finalization.
+        for derived in (
+            paths["yolo"],
+            root / "splits",
+        ):
+            shutil.rmtree(derived, ignore_errors=True)
+        shutil.rmtree(paths["tmp"], ignore_errors=True)
+        for derived_file in (
+            root / "dataset_manifest.json",
+            root / "quality_audit.json",
+            root / "README.md",
+        ):
+            try:
+                derived_file.unlink()
+            except FileNotFoundError:
+                pass
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
     return paths
@@ -279,6 +358,7 @@ def build_sequence_specs(config: Dict[str, Any]) -> List[SequenceSpec]:
         )
     )
     weather_occurrences: Counter = Counter()
+    mode_occurrences: Counter = Counter()
     motion_modes = list(config["motion_modes"])
     mode_counts = config["sequences_by_motion_mode"]
     max_mode_count = max(int(mode_counts[mode]) for mode in motion_modes)
@@ -298,22 +378,32 @@ def build_sequence_specs(config: Dict[str, Any]) -> List[SequenceSpec]:
             for index in range(count)
         ]
     class_offset = int(config.get("target_class_offset", 0))
+    target_classes_by_mode = config.get("target_classes_by_motion_mode", {})
     for sequence_id, motion_mode in enumerate(mode_schedule):
         weather = (
             configured_weather_schedule[sequence_id]
             if configured_weather_schedule
             else weather_rng.choice(weathers)
-            if weather_assignment in {"random", "random_unseeded"}
+            if weather_assignment in {
+                "random",
+                "random_unseeded",
+                "random_per_run",
+            }
             else weathers[sequence_id % len(weathers)]
         )
         index_in_weather = int(weather_occurrences[weather])
         weather_occurrences[weather] += 1
-        if motion_mode == "fixed_hover":
-            target_class = "vehicle"
-        elif motion_mode == "lagged_follow":
-            target_class = "pedestrian"
-        else:
-            target_class = "vehicle" if class_offset % 2 == 0 else "pedestrian"
+        target_classes = list(
+            target_classes_by_mode.get(
+                motion_mode,
+                ("vehicle", "pedestrian"),
+            )
+        )
+        occurrence = int(mode_occurrences[motion_mode])
+        target_class = target_classes[
+            (occurrence + class_offset) % len(target_classes)
+        ]
+        mode_occurrences[motion_mode] += 1
         split = split_schedule[sequence_id]
         specs.append(
             SequenceSpec(
@@ -427,11 +517,42 @@ def choose_target_actor(
     actors: Sequence[Any],
     target_class: str,
     used_actor_ids: Counter,
+    actor_split_assignments: Dict[int, str],
+    split: str,
+    max_sequences_per_actor: int,
+    attempted_actor_ids: Counter,
     rng: random.Random,
 ) -> Any:
-    candidates = live_targets(actors, target_class)
+    candidates = [
+        actor
+        for actor in live_targets(actors, target_class)
+        if used_actor_ids[int(actor.id)] < max_sequences_per_actor
+        and actor_split_assignments.get(int(actor.id), split) == split
+    ]
     if not candidates:
-        raise RuntimeError(f"没有存活的 {target_class} actor")
+        raise RuntimeError(
+            f"没有可用于 {split} 的 {target_class} actor："
+            f"每个目标最多 {max_sequences_per_actor} 段，且不能跨 split"
+        )
+
+    # Reuse an actor already owned by this split before claiming a new one.
+    # This keeps enough untouched actors for val/test while still respecting
+    # the configured one-or-two-sequence cap.
+    minimum_attempts = min(
+        attempted_actor_ids[int(actor.id)] for actor in candidates
+    )
+    candidates = [
+        actor
+        for actor in candidates
+        if attempted_actor_ids[int(actor.id)] == minimum_attempts
+    ]
+    assigned = [
+        actor
+        for actor in candidates
+        if actor_split_assignments.get(int(actor.id)) == split
+    ]
+    if assigned:
+        candidates = assigned
     minimum_use = min(used_actor_ids[int(actor.id)] for actor in candidates)
     candidates = [
         actor
@@ -439,7 +560,7 @@ def choose_target_actor(
         if used_actor_ids[int(actor.id)] == minimum_use
     ]
     target = rng.choice(candidates)
-    used_actor_ids[int(target.id)] += 1
+    attempted_actor_ids[int(target.id)] += 1
     return target
 
 
@@ -950,6 +1071,8 @@ def collect_sequence_attempt(
     near_ratios: List[float] = []
     image_differences: List[float] = []
     previous_gray: Optional[np.ndarray] = None
+    target_world_step_distances: List[float] = []
+    previous_target_world_location = None
     motion_state: Dict[str, Any] = {}
     consecutive_absent = 0
     absent_frames = 0
@@ -1000,6 +1123,16 @@ def collect_sequence_attempt(
                     "reason": f"sensor_sync: {exc}",
                     "saved_frames": frame_index,
                 }
+
+            current_target_world_location = target.get_location()
+            if previous_target_world_location is not None:
+                target_world_step_distances.append(
+                    distance_xy(
+                        current_target_world_location,
+                        previous_target_world_location,
+                    )
+                )
+            previous_target_world_location = current_target_world_location
 
             depth_m = base.decode_carla_depth_meters(depth_data)
             semantic_id = base.decode_semantic_segmentation(semantic_data)
@@ -1247,6 +1380,62 @@ def collect_sequence_attempt(
             "saved_frames": actual_frames,
         }
 
+    target_path_length_m = float(sum(target_world_step_distances))
+    target_motion_duration_seconds = (
+        len(target_world_step_distances)
+        * sample_interval_ticks
+        / float(config["fps"])
+    )
+    target_average_speed_mps = (
+        target_path_length_m / target_motion_duration_seconds
+        if target_motion_duration_seconds > 0.0
+        else 0.0
+    )
+    moving_step_threshold_m = float(
+        config.get("target_moving_step_threshold_m", {}).get(
+            spec.target_class,
+            0.05,
+        )
+    )
+    target_moving_step_ratio = (
+        sum(
+            distance >= moving_step_threshold_m
+            for distance in target_world_step_distances
+        )
+        / float(len(target_world_step_distances))
+        if target_world_step_distances
+        else 0.0
+    )
+    min_average_speed_mps = float(
+        config.get("min_target_average_speed_mps", {}).get(
+            spec.target_class,
+            0.0,
+        )
+    )
+    min_moving_step_ratio = float(
+        config.get("min_target_moving_step_ratio", {}).get(
+            spec.target_class,
+            0.0,
+        )
+    )
+    if (
+        target_average_speed_mps < min_average_speed_mps
+        or target_moving_step_ratio < min_moving_step_ratio
+    ):
+        return False, {
+            "reason": (
+                "主目标自身运动不足："
+                f"average_speed={target_average_speed_mps:.3f}m/s "
+                f"(min={min_average_speed_mps:.3f}), "
+                f"moving_step_ratio={target_moving_step_ratio:.3f} "
+                f"(min={min_moving_step_ratio:.3f})"
+            ),
+            "saved_frames": actual_frames,
+            "target_path_length_m": target_path_length_m,
+            "target_average_speed_mps": target_average_speed_mps,
+            "target_moving_step_ratio": target_moving_step_ratio,
+        }
+
     (attempt_dir / "groundtruth.txt").write_text(
         "\n".join(groundtruth) + "\n",
         encoding="utf-8",
@@ -1296,6 +1485,11 @@ def collect_sequence_attempt(
         "normalized_center_displacement": stats(normalized_displacements),
         "adjacent_scale_log_change": stats(adjacent_scale_log_changes),
         "previous_frame_box_copy_iou": stats(previous_box_copy_ious),
+        "target_world_step_distance_m": stats(target_world_step_distances),
+        "target_path_length_m": target_path_length_m,
+        "target_average_speed_mps": target_average_speed_mps,
+        "target_moving_step_ratio": target_moving_step_ratio,
+        "target_moving_step_threshold_m": moving_step_threshold_m,
         "road_visible_ratio": stats(road_ratios),
         "near_depth_ratio": stats(near_ratios),
         "adjacent_frame_mean_abs_difference": stats(image_differences),
@@ -1350,6 +1544,160 @@ def finalize_sequence(
     attempt_dir.replace(destination)
     for overlay in sorted(destination.glob("overlay_*.png")):
         overlay.replace(qa_root / f"{spec.name}_{overlay.name}")
+
+
+def nonempty_line_count(path: Path) -> int:
+    return sum(
+        1
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+
+
+def load_sequence_checkpoint(
+    sequence_dir: Path,
+    spec: SequenceSpec,
+    config: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Load one fully committed sequence or explain why it must be retried."""
+    meta_path = sequence_dir / "sequence_meta.json"
+    try:
+        summary = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"sequence_meta unreadable: {exc}"
+
+    expected_identity = {
+        "sequence": spec.name,
+        "sequence_id": int(spec.sequence_id),
+        "weather": spec.weather,
+        "split": spec.split,
+        "target_class": spec.target_class,
+        "motion_mode": spec.motion_mode,
+    }
+    mismatches = [
+        key
+        for key, expected in expected_identity.items()
+        if summary.get(key) != expected
+    ]
+    if mismatches:
+        return None, "metadata mismatch: " + ", ".join(mismatches)
+
+    try:
+        frame_count = int(summary["frames"])
+    except (KeyError, TypeError, ValueError):
+        return None, "invalid frame count in sequence_meta"
+    min_frames = int(
+        config.get("min_frames_by_motion_mode", {}).get(spec.motion_mode, 1)
+    )
+    if not min_frames <= frame_count <= frames_for_sequence(spec, config):
+        return None, f"frame count outside valid range: {frame_count}"
+
+    required_line_files = (
+        "groundtruth.txt",
+        "absence.label",
+        "occlusion.label",
+        "target_state.label",
+        "annotations.jsonl",
+    )
+    try:
+        counts = {
+            "color": len(list((sequence_dir / "color").glob("*.png"))),
+            "labels_yolo": len(
+                list((sequence_dir / "labels_yolo").glob("*.txt"))
+            ),
+            **{
+                name: nonempty_line_count(sequence_dir / name)
+                for name in required_line_files
+            },
+        }
+    except OSError as exc:
+        return None, f"checkpoint file unreadable: {exc}"
+    if any(count != frame_count for count in counts.values()):
+        return None, f"checkpoint count mismatch: {counts}"
+    return summary, "complete"
+
+
+def load_resume_checkpoints(
+    root: Path,
+    specs: Sequence[SequenceSpec],
+    config: Dict[str, Any],
+) -> Tuple[List[SequenceSpec], List[Dict[str, Any]]]:
+    vot_root = root / "vot"
+    specs_by_name = {spec.name: spec for spec in specs}
+    completed_specs: List[SequenceSpec] = []
+    summaries: List[Dict[str, Any]] = []
+    rejected_root = root / "_resume_rejected"
+
+    for sequence_dir in sorted(
+        path for path in vot_root.iterdir() if path.is_dir()
+    ):
+        spec = specs_by_name.get(sequence_dir.name)
+        if spec is None:
+            reason = "not present in current sequence plan"
+            summary = None
+        else:
+            summary, reason = load_sequence_checkpoint(
+                sequence_dir,
+                spec,
+                config,
+            )
+        if summary is not None and spec is not None:
+            completed_specs.append(spec)
+            summaries.append(summary)
+            continue
+
+        rejected_root.mkdir(parents=True, exist_ok=True)
+        destination = rejected_root / sequence_dir.name
+        if destination.exists():
+            shutil.rmtree(destination)
+        sequence_dir.replace(destination)
+        print(
+            f"[RESUME] Quarantined incomplete sequence "
+            f"{sequence_dir.name}: {reason}",
+            flush=True,
+        )
+
+    order = {spec.name: index for index, spec in enumerate(specs)}
+    paired = sorted(
+        zip(completed_specs, summaries),
+        key=lambda item: order[item[0].name],
+    )
+    return (
+        [item[0] for item in paired],
+        [item[1] for item in paired],
+    )
+
+
+def write_resume_state(
+    root: Path,
+    specs: Sequence[SequenceSpec],
+    completed_specs: Sequence[SequenceSpec],
+    sequence_summaries: Sequence[Dict[str, Any]],
+    failures: Sequence[Dict[str, Any]],
+    status: str,
+) -> None:
+    completed_names = {spec.name for spec in completed_specs}
+    next_spec = next(
+        (spec.name for spec in specs if spec.name not in completed_names),
+        None,
+    )
+    payload = {
+        "status": status,
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "planned_sequences": len(specs),
+        "completed_sequences": len(completed_specs),
+        "completed_sequence_names": [spec.name for spec in completed_specs],
+        "next_sequence": next_spec,
+        "sequence_summaries": list(sequence_summaries),
+        "failed_attempts": list(failures),
+    }
+    destination = root / "resume_state.json"
+    temporary = destination.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(destination)
 
 
 def build_yolo_dataset(
@@ -1498,6 +1846,50 @@ def audit_dataset(
         float(summary["target_equivalent_side_px"]["median"])
         for summary in sequence_summaries
     ]
+    actor_sequence_counts: Counter = Counter()
+    actor_splits: Dict[int, set] = defaultdict(set)
+    motion_target_combinations: Counter = Counter()
+    for summary in sequence_summaries:
+        actor_id = int(summary["target_actor_id"])
+        actor_sequence_counts[actor_id] += 1
+        actor_splits[actor_id].add(str(summary["split"]))
+        motion_target_combinations[
+            (str(summary["motion_mode"]), str(summary["target_class"]))
+        ] += 1
+    cross_split_actors = {
+        actor_id: sorted(splits)
+        for actor_id, splits in actor_splits.items()
+        if len(splits) > 1
+    }
+    if cross_split_actors:
+        errors.append(
+            "target actors cross train/val/test splits: "
+            + json.dumps(cross_split_actors, ensure_ascii=False)
+        )
+    max_sequences_per_actor = int(
+        config.get("max_sequences_per_target_actor", 2)
+    )
+    overused_actors = {
+        actor_id: count
+        for actor_id, count in actor_sequence_counts.items()
+        if count > max_sequences_per_actor
+    }
+    if overused_actors:
+        errors.append(
+            "target actors exceed per-actor sequence cap: "
+            + json.dumps(overused_actors, ensure_ascii=False)
+        )
+    expected_combinations = {
+        (spec.motion_mode, spec.target_class)
+        for spec in specs
+    }
+    missing_combinations = sorted(
+        expected_combinations - set(motion_target_combinations)
+    )
+    if missing_combinations:
+        errors.append(
+            f"missing motion/target combinations: {missing_combinations}"
+        )
     audit = {
         "status": "PASS" if not errors else "FAIL",
         "errors": errors,
@@ -1511,6 +1903,18 @@ def audit_dataset(
         "sequence_level_split": True,
         "weather_is_constant_inside_each_sequence": True,
         "target_actor_is_constant_inside_each_sequence": True,
+        "target_actor_is_split_isolated": not cross_split_actors,
+        "max_sequences_per_target_actor": max_sequences_per_actor,
+        "unique_target_actors": len(actor_sequence_counts),
+        "target_actor_sequence_count": stats(
+            list(actor_sequence_counts.values())
+        ),
+        "motion_target_combinations": {
+            f"{mode}/{target_class}": count
+            for (mode, target_class), count in sorted(
+                motion_target_combinations.items()
+            )
+        },
         "absent_ratio": stats(absent_ratios),
         "target_equivalent_side_median_px": stats(target_medians),
         "vot_files_checked": [
@@ -1576,8 +1980,10 @@ def write_dataset_card(
 
 ## 数据划分
 
-训练、验证、测试按完整序列划分，禁止相邻帧跨集合。天气按序列轮换。
-YOLO 配置文件为 `yolo/data.yaml`。
+训练、验证、测试按完整序列划分，禁止相邻帧跨集合。同一个目标 actor
+只能属于一个集合，且最多拍摄
+{config.get('max_sequences_per_target_actor', 2)} 条序列。三种拍摄方式均覆盖
+车辆和人物。天气在每条序列内保持不变。YOLO 配置文件为 `yolo/data.yaml`。
 
 质量审计：{audit['status']}。
 YOLO 图像数：{json.dumps(yolo_summary['splits'], ensure_ascii=False)}。
@@ -1589,12 +1995,16 @@ def main() -> None:
     args = parse_args()
     config = load_config(args)
     validate_config(config)
-    paths = prepare_output(Path(config["out"]), args.overwrite)
     specs = build_sequence_specs(config)
     if args.max_sequences is not None:
         if args.max_sequences <= 0:
             raise ValueError("--max-sequences 必须大于 0")
         specs = specs[: args.max_sequences]
+    paths = prepare_output(
+        Path(config["out"]),
+        args.overwrite,
+        resume=args.resume,
+    )
     rng = random.Random(int(config["seed"]))
     random.seed(int(config["seed"]))
     np.random.seed(int(config["seed"]))
@@ -1615,11 +2025,43 @@ def main() -> None:
     controllers: List[Any] = []
     hidden_static_ids: List[int] = []
     used_actor_ids: Counter = Counter()
+    actor_split_assignments: Dict[int, str] = {}
     accepted_specs: List[SequenceSpec] = []
     sequence_summaries: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
     target_vehicles: List[Any] = []
     target_walkers: List[Any] = []
+
+    if args.resume:
+        accepted_specs, sequence_summaries = load_resume_checkpoints(
+            paths["root"],
+            specs,
+            config,
+        )
+        print(
+            f"[RESUME] Preserved {len(accepted_specs)}/{len(specs)} "
+            "completed sequences.",
+            flush=True,
+        )
+        for summary in sequence_summaries:
+            actor_id = int(summary["target_actor_id"])
+            split = str(summary["split"])
+            existing_split = actor_split_assignments.get(actor_id)
+            if existing_split is not None and existing_split != split:
+                raise RuntimeError(
+                    f"断点中的目标 actor={actor_id} 同时属于 "
+                    f"{existing_split} 和 {split}"
+                )
+            actor_split_assignments[actor_id] = split
+            used_actor_ids[actor_id] += 1
+    write_resume_state(
+        paths["root"],
+        specs,
+        accepted_specs,
+        sequence_summaries,
+        failures,
+        "in_progress",
+    )
 
     try:
         settings = world.get_settings()
@@ -1645,9 +2087,24 @@ def main() -> None:
 
         target_vehicles = list(vehicles)
         target_walkers = list(walkers)
-        if bool(config.get("include_existing_target_actors", False)):
+        include_existing_any = bool(
+            config.get("include_existing_target_actors", False)
+        )
+        if bool(
+            config.get(
+                "include_existing_target_vehicle_actors",
+                include_existing_any,
+            )
+        ):
             world_actors = world.get_actors()
             target_vehicles.extend(list(world_actors.filter("vehicle.*")))
+        if bool(
+            config.get(
+                "include_existing_target_pedestrian_actors",
+                include_existing_any,
+            )
+        ):
+            world_actors = world.get_actors()
             target_walkers.extend(
                 list(world_actors.filter("walker.pedestrian.*"))
             )
@@ -1715,7 +2172,15 @@ def main() -> None:
         for item in sensor_sync.values():
             item.drain()
 
+        completed_names = {spec.name for spec in accepted_specs}
         for sequence_index, spec in enumerate(specs):
+            if spec.name in completed_names:
+                print(
+                    f"[RESUME {sequence_index + 1}/{len(specs)}] "
+                    f"skip completed {spec.name}",
+                    flush=True,
+                )
+                continue
             print(
                 f"[SEQ {sequence_index + 1}/{len(specs)}] "
                 f"{spec.name} mode={spec.motion_mode} split={spec.split}"
@@ -1727,6 +2192,7 @@ def main() -> None:
                 item.drain()
 
             accepted = False
+            attempted_actor_ids: Counter = Counter()
             for attempt in range(int(config["max_sequence_attempts"])):
                 actors = (
                     target_vehicles
@@ -1737,6 +2203,10 @@ def main() -> None:
                     actors,
                     spec.target_class,
                     used_actor_ids,
+                    actor_split_assignments,
+                    spec.split,
+                    int(config.get("max_sequences_per_target_actor", 2)),
+                    attempted_actor_ids,
                     rng,
                 )
                 direction = (
@@ -1761,6 +2231,17 @@ def main() -> None:
                     config,
                 )
                 if success:
+                    target_actor_id = int(target.id)
+                    assigned_split = actor_split_assignments.get(
+                        target_actor_id
+                    )
+                    if assigned_split is not None and assigned_split != spec.split:
+                        raise RuntimeError(
+                            f"目标 actor={target_actor_id} 不允许从 "
+                            f"{assigned_split} 跨到 {spec.split}"
+                        )
+                    actor_split_assignments[target_actor_id] = spec.split
+                    used_actor_ids[target_actor_id] += 1
                     summary["attempt"] = attempt
                     summary["camera_road_direction"] = direction
                     (attempt_dir / "sequence_meta.json").write_text(
@@ -1775,6 +2256,15 @@ def main() -> None:
                     )
                     accepted_specs.append(spec)
                     sequence_summaries.append(summary)
+                    completed_names.add(spec.name)
+                    write_resume_state(
+                        paths["root"],
+                        specs,
+                        accepted_specs,
+                        sequence_summaries,
+                        failures,
+                        "in_progress",
+                    )
                     accepted = True
                     print(
                         f"[ACCEPT] actor={target.id} "
@@ -1797,10 +2287,28 @@ def main() -> None:
                 )
                 shutil.rmtree(attempt_dir, ignore_errors=True)
             if not accepted:
+                write_resume_state(
+                    paths["root"],
+                    specs,
+                    accepted_specs,
+                    sequence_summaries,
+                    failures,
+                    "sequence_failed",
+                )
                 raise RuntimeError(
                     f"序列 {spec.name} 在最大尝试次数内仍未通过质量检查"
                 )
 
+        summaries_by_name = {
+            str(summary["sequence"]): summary
+            for summary in sequence_summaries
+        }
+        accepted_specs = [
+            spec for spec in specs if spec.name in completed_names
+        ]
+        sequence_summaries = [
+            summaries_by_name[spec.name] for spec in accepted_specs
+        ]
         (paths["vot"] / "list.txt").write_text(
             "\n".join(spec.name for spec in accepted_specs) + "\n",
             encoding="utf-8",
@@ -1840,6 +2348,14 @@ def main() -> None:
             accepted_specs,
             yolo_summary,
             audit,
+        )
+        write_resume_state(
+            paths["root"],
+            specs,
+            accepted_specs,
+            sequence_summaries,
+            failures,
+            "complete",
         )
         print(json.dumps(audit, ensure_ascii=False, indent=2))
         print(f"[DONE] {paths['root']}")

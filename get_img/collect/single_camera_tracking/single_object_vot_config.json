@@ -16,16 +16,31 @@
     "pedestrian": 6
   },
   "enable_rgb_postprocess": true,
-  "sequences_per_map": 15,
+  "sequences_per_map": 54,
   "motion_modes": [
     "fixed_hover",
     "lagged_follow",
     "lateral_orbit"
   ],
+  "target_classes_by_motion_mode": {
+    "fixed_hover": [
+      "vehicle",
+      "pedestrian"
+    ],
+    "lagged_follow": [
+      "vehicle",
+      "pedestrian"
+    ],
+    "lateral_orbit": [
+      "vehicle",
+      "pedestrian"
+    ]
+  },
+  "max_sequences_per_target_actor": 2,
   "sequences_by_motion_mode": {
-    "fixed_hover": 5,
-    "lagged_follow": 5,
-    "lateral_orbit": 5
+    "fixed_hover": 18,
+    "lagged_follow": 18,
+    "lateral_orbit": 18
   },
   "frames_by_motion_mode": {
     "fixed_hover": 80,
@@ -50,7 +65,7 @@
     "ClearSunset",
     "ClearNight"
   ],
-  "weather_assignment": "random_unseeded",
+  "weather_assignment": "random_per_run",
   "weather_warmup_frames": 10,
   "height_min": 30.0,
   "height_max": 36.0,
@@ -62,6 +77,9 @@
   "preferred_pitch_pedestrian": -44.0,
   "vehicles": 20,
   "walkers": 30,
+  "include_existing_target_actors": false,
+  "include_existing_target_vehicle_actors": false,
+  "include_existing_target_pedestrian_actors": false,
   "hide_static_map_vehicles": true,
   "min_visible_ratio": 0.1,
   "min_visible_pixels": 24,
@@ -94,6 +112,18 @@
   "lagged_follow_rotation_alpha": 0.22,
   "orbit_rotation_alpha": 0.3,
   "orbit_sweep_degrees": 120.0,
+  "min_target_average_speed_mps": {
+    "vehicle": 0.5,
+    "pedestrian": 0.2
+  },
+  "min_target_moving_step_ratio": {
+    "vehicle": 0.2,
+    "pedestrian": 0.2
+  },
+  "target_moving_step_threshold_m": {
+    "vehicle": 0.05,
+    "pedestrian": 0.05
+  },
   "max_sequence_attempts": 48,
   "warmup_frames": 20,
   "sensor_timeout": 15.0,

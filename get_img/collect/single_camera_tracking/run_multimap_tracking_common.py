@@ -14,7 +14,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 PROJECT_DIR = Path(__file__).resolve().parent
 COLLECT_ROOT = PROJECT_DIR.parent
@@ -35,10 +35,14 @@ WEATHERS = [
 ]
 MAPS = list(runtime.ALL_OUTPUT_NAMES)
 SINGLE_MOTION_MODES = ["fixed_hover", "lagged_follow", "lateral_orbit"]
+SINGLE_TARGET_CLASSES_BY_MOTION_MODE = {
+    mode: ["vehicle", "pedestrian"]
+    for mode in SINGLE_MOTION_MODES
+}
 SINGLE_SEQUENCES_BY_MOTION_MODE = {
-    "fixed_hover": 5,
-    "lagged_follow": 5,
-    "lateral_orbit": 5,
+    "fixed_hover": 18,
+    "lagged_follow": 18,
+    "lateral_orbit": 18,
 }
 SINGLE_FRAMES_BY_MOTION_MODE = {
     "fixed_hover": 80,
@@ -62,6 +66,7 @@ MULTICAMERA_FRAMES_PER_SCENE = 30
 MULTICAMERA_SAMPLE_INTERVAL_TICKS = 3
 MULTICAMERA_FPS = 25.0
 CAMERAS_PER_MULTICAMERA_SAMPLE = 3
+RUN_SEED = random.SystemRandom().randint(1, 1_900_000_000)
 
 TASKS: Dict[str, Dict[str, Any]] = {
     "multicamera": {
@@ -95,6 +100,15 @@ def parse_args(task: str, argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument("--visible", action="store_true")
     parser.add_argument("--rerun-complete", action="store_true")
     parser.add_argument(
+        "--run-seed",
+        type=int,
+        default=None,
+        help=(
+            "Use this run seed for a fresh/rebuilt collection. "
+            "Omit it to generate a new random seed."
+        ),
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Collect one tiny scene/sequence into an isolated smoke directory.",
@@ -105,13 +119,30 @@ def parse_args(task: str, argv: Optional[Sequence[str]]) -> argparse.Namespace:
 def weather_presets_for_map(task: str, map_name: str) -> Sequence[str]:
     if task == "single_object":
         tracking_weathers = ["ClearNoon", "ClearSunset", "ClearNight"]
-        if map_name == runtime.CCSP_OUTPUT_NAME:
+        if map_name in {
+            runtime.HUTB_MAP_NAME,
+            runtime.CCSP_OUTPUT_NAME,
+        }:
             return tracking_weathers[:2]
         return tracking_weathers
     return list(WEATHERS)
 
 
 _WEATHER_SCHEDULE_CACHE: Dict[str, Sequence[str]] = {}
+
+
+def map_collection_seed(map_name: str) -> int:
+    return 1 + (
+        RUN_SEED + (MAPS.index(map_name) + 1) * 100_003
+    ) % 2_000_000_000
+
+
+def map_weather_seed(map_name: str, smoke: bool) -> int:
+    return 1 + (
+        RUN_SEED
+        + (MAPS.index(map_name) + 1) * 10_007
+        + (1_000_003 if smoke else 0)
+    ) % 2_000_000_000
 
 
 def single_motion_mode_schedule() -> Sequence[str]:
@@ -131,9 +162,9 @@ def random_weather_schedule_for_map(
     cache_key = f"{map_name}|smoke={int(smoke)}"
     if cache_key not in _WEATHER_SCHEDULE_CACHE:
         allowed = list(weather_presets_for_map("single_object", map_name))
-        system_rng = random.SystemRandom()
+        weather_rng = random.Random(map_weather_seed(map_name, smoke))
         _WEATHER_SCHEDULE_CACHE[cache_key] = [
-            system_rng.choice(allowed)
+            weather_rng.choice(allowed)
             for _ in range(SINGLE_SEQUENCES_PER_MAP)
         ]
     return list(_WEATHER_SCHEDULE_CACHE[cache_key])
@@ -143,28 +174,55 @@ def expected_images_by_weather(
     task: str,
     smoke: bool,
     map_name: str,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, int]:
     map_weathers = weather_presets_for_map(task, map_name)
     if task == "single_object":
         counts = {weather: 0 for weather in WEATHERS}
-        schedule = list(single_motion_mode_schedule())
+        if config is None:
+            schedule = list(single_motion_mode_schedule())
+            mode_frames = SINGLE_FRAMES_BY_MOTION_MODE
+            class_frames = SINGLE_FRAMES_BY_MOTION_AND_CLASS
+            class_offset = MAPS.index(map_name) % 2
+            weather_schedule = random_weather_schedule_for_map(map_name, smoke)
+        else:
+            modes = list(config["motion_modes"])
+            mode_counts = config["sequences_by_motion_mode"]
+            max_count = max(int(mode_counts[mode]) for mode in modes)
+            schedule = [
+                mode
+                for round_index in range(max_count)
+                for mode in modes
+                if round_index < int(mode_counts[mode])
+            ]
+            mode_frames = config["frames_by_motion_mode"]
+            class_frames = config.get(
+                "frames_by_motion_mode_and_target_class", {}
+            )
+            class_offset = int(config.get("target_class_offset", 0))
+            weather_schedule = list(config["weather_sequence_schedule"])
         if smoke:
             schedule = schedule[:1]
-        weather_schedule = random_weather_schedule_for_map(map_name, smoke)
-        for group_index, mode in enumerate(schedule):
-            target_class = (
-                "vehicle"
-                if mode == "fixed_hover"
-                else "pedestrian"
-                if mode == "lagged_follow"
-                else "vehicle"
-                if MAPS.index(map_name) % 2 == 0
-                else "pedestrian"
+        mode_occurrences: Dict[str, int] = {}
+        target_classes_by_mode = (
+            SINGLE_TARGET_CLASSES_BY_MOTION_MODE
+            if config is None
+            else config.get(
+                "target_classes_by_motion_mode",
+                SINGLE_TARGET_CLASSES_BY_MOTION_MODE,
             )
+        )
+        for group_index, mode in enumerate(schedule):
+            occurrence = mode_occurrences.get(mode, 0)
+            target_classes = list(target_classes_by_mode[mode])
+            target_class = target_classes[
+                (occurrence + class_offset) % len(target_classes)
+            ]
+            mode_occurrences[mode] = occurrence + 1
             planned_frames = (
-                SINGLE_FRAMES_BY_MOTION_AND_CLASS.get(mode, {}).get(
+                class_frames.get(mode, {}).get(
                     target_class,
-                    SINGLE_FRAMES_BY_MOTION_MODE[mode],
+                    mode_frames[mode],
                 )
             )
             selected_weather = weather_schedule[group_index]
@@ -211,7 +269,11 @@ def build_config(
             "timeout": 300.0,
             "sensor_timeout": 60.0,
             "weather_presets": weather_presets_for_map(task, map_name),
-            "include_existing_target_actors": True,
+            "run_seed": RUN_SEED,
+            "seed": map_collection_seed(map_name),
+            "include_existing_target_actors": False,
+            "include_existing_target_vehicle_actors": False,
+            "include_existing_target_pedestrian_actors": False,
             "spectator_follow_camera": map_name == runtime.CCSP_OUTPUT_NAME,
         }
     )
@@ -226,8 +288,9 @@ def build_config(
                 # These maps need fallback walkers because their navigation
                 # meshes are absent or unreliable. Avoid creating a second
                 # crowd here, and keep Traffic Manager traffic sparse.
-                "vehicles": 8,
+                "vehicles": 20,
                 "walkers": 0,
+                "include_existing_target_pedestrian_actors": True,
                 "require_streaming_geometry": True,
                 "streaming_geometry_max_depth_m": 220.0,
                 "streaming_min_geometry_ratio": 0.90,
@@ -316,6 +379,13 @@ def build_config(
             {
                 "sequences_per_map": SINGLE_SEQUENCES_PER_MAP,
                 "motion_modes": list(SINGLE_MOTION_MODES),
+                "target_classes_by_motion_mode": {
+                    mode: list(target_classes)
+                    for mode, target_classes in (
+                        SINGLE_TARGET_CLASSES_BY_MOTION_MODE.items()
+                    )
+                },
+                "max_sequences_per_target_actor": 2,
                 "sequences_by_motion_mode": dict(
                     SINGLE_SEQUENCES_BY_MOTION_MODE
                 ),
@@ -341,7 +411,8 @@ def build_config(
                 "sample_interval_ticks_by_target_class": dict(
                     SINGLE_SAMPLE_INTERVAL_TICKS_BY_TARGET_CLASS
                 ),
-                "weather_assignment": "random_unseeded",
+                "weather_assignment": "random_per_run",
+                "weather_assignment_seed": map_weather_seed(map_name, smoke),
                 "weather_sequence_schedule": list(
                     random_weather_schedule_for_map(map_name, smoke)
                 ),
@@ -411,12 +482,19 @@ def single_object_plan_is_complete(
     actual_config = manifest.get("config", {})
     plan_keys = (
         "motion_modes",
+        "target_classes_by_motion_mode",
         "sequences_by_motion_mode",
         "frames_by_motion_mode",
         "frames_by_motion_mode_and_target_class",
         "sample_interval_ticks_by_target_class",
         "fixed_hover_stop_after_absent_frames",
         "min_frames_by_motion_mode",
+        "max_sequences_per_target_actor",
+        "min_target_average_speed_mps",
+        "min_target_moving_step_ratio",
+        "target_moving_step_threshold_m",
+        "include_existing_target_vehicle_actors",
+        "include_existing_target_pedestrian_actors",
         "weather_presets",
         "weather_assignment",
     )
@@ -440,6 +518,69 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
     )
 
 
+RESUME_CONFIG_IGNORED_KEYS = {
+    "out",
+    "timeout",
+    "sensor_timeout",
+    "run_seed",
+    "seed",
+    "weather_assignment_seed",
+    "weather_sequence_schedule",
+    "_config_path",
+}
+
+
+def configs_are_resume_compatible(
+    saved: Dict[str, Any],
+    current: Dict[str, Any],
+) -> bool:
+    saved_plan = {
+        key: value
+        for key, value in saved.items()
+        if key not in RESUME_CONFIG_IGNORED_KEYS
+    }
+    current_plan = {
+        key: value
+        for key, value in current.items()
+        if key not in RESUME_CONFIG_IGNORED_KEYS
+    }
+    return saved_plan == current_plan
+
+
+def resolve_map_config(
+    task: str,
+    map_name: str,
+    output_root: Path,
+    smoke: bool,
+) -> Tuple[Dict[str, Any], bool]:
+    map_output = output_root / map_name
+    current = build_config(task, map_name, map_output, smoke)
+    config_path = output_root / "_configs" / f"{map_name}.json"
+    has_sequence_output = (
+        task == "single_object"
+        and not smoke
+        and (map_output / "vot").is_dir()
+        and any(path.is_dir() for path in (map_output / "vot").iterdir())
+    )
+    if not has_sequence_output or not config_path.is_file():
+        return current, False
+    try:
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return current, False
+    if not configs_are_resume_compatible(saved, current):
+        return current, False
+
+    saved.update(
+        {
+            "out": str(map_output),
+            "timeout": current["timeout"],
+            "sensor_timeout": current["sensor_timeout"],
+        }
+    )
+    return saved, True
+
+
 def run_collector(
     task: str,
     python_executable: Path,
@@ -448,8 +589,9 @@ def run_collector(
     log_path: Path,
     env: Optional[Dict[str, str]],
     smoke: bool,
+    resume: bool = False,
 ) -> int:
-    resume = (
+    resume = resume or (
         task == "multicamera"
         and not smoke
         and (output / "scenes").is_dir()
@@ -473,7 +615,12 @@ def run_collector(
         )
     print("[COLLECT] " + subprocess.list2cmdline(command), flush=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as log_file:
+    with log_path.open("a" if resume else "w", encoding="utf-8") as log_file:
+        if resume:
+            log_file.write(
+                f"\n[RESUME RUN {now_iso()}]\n"
+            )
+            log_file.flush()
         process = subprocess.Popen(
             command,
             cwd=str(TASKS[task]["collector"].parent),
@@ -528,9 +675,12 @@ def collect_map(
     output_root: Path,
     visible: bool,
     smoke: bool,
+    config: Optional[Dict[str, Any]] = None,
+    resume: bool = False,
 ) -> int:
     map_output = output_root / map_name
-    config = build_config(task, map_name, map_output, smoke)
+    if config is None:
+        config = build_config(task, map_name, map_output, smoke)
     config_path = output_root / "_configs" / f"{map_name}.json"
     log_path = output_root / "_logs" / f"{map_name}.log"
     write_json(config_path, config)
@@ -556,7 +706,7 @@ def collect_map(
                 count=40 if task == "single_object" else 120,
                 vehicle_count=0 if task == "single_object" else 40,
                 env=env,
-                seed=9301,
+                seed=int(config["seed"]) + 9301,
                 pedestrian_motion=(
                     "shuttle" if task == "single_object" else "static"
                 ),
@@ -585,7 +735,7 @@ def collect_map(
                     vehicle_count=0 if task == "single_object" else 40,
                     map_name=map_name,
                     load_map=True,
-                    seed=9201,
+                    seed=int(config["seed"]) + 9201,
                     pedestrian_motion=(
                         "shuttle" if task == "single_object" else "static"
                     ),
@@ -600,6 +750,7 @@ def collect_map(
             log_path,
             env,
             smoke,
+            resume=resume,
         )
     finally:
         runtime.stop_static_pedestrian_bridge(bridge)
@@ -610,15 +761,46 @@ def main_for_task(
     task: str,
     argv: Optional[Sequence[str]] = None,
 ) -> int:
+    global RUN_SEED
     if task not in TASKS:
         raise ValueError(f"Unknown task: {task}")
     args = parse_args(task, argv)
+    if args.run_seed is not None:
+        if not 1 <= int(args.run_seed) <= 1_900_000_000:
+            raise ValueError("--run-seed 必须在 1 到 1900000000 之间")
+        RUN_SEED = int(args.run_seed)
+        _WEATHER_SCHEDULE_CACHE.clear()
     task_spec = TASKS[task]
     output_root = Path(str(task_spec["output"]) + ("_smoke" if args.smoke else ""))
     output_root.mkdir(parents=True, exist_ok=True)
     selected = list(args.only or MAPS)
+    resolved_configs: Dict[str, Dict[str, Any]] = {}
+    resume_by_map: Dict[str, bool] = {}
+    for map_name in selected:
+        if args.rerun_complete:
+            resolved_configs[map_name] = build_config(
+                task,
+                map_name,
+                output_root / map_name,
+                args.smoke,
+            )
+            resume_by_map[map_name] = False
+        else:
+            config, resume = resolve_map_config(
+                task,
+                map_name,
+                output_root,
+                args.smoke,
+            )
+            resolved_configs[map_name] = config
+            resume_by_map[map_name] = resume
     expected_by_map = {
-        map_name: expected_images_by_weather(task, args.smoke, map_name)
+        map_name: expected_images_by_weather(
+            task,
+            args.smoke,
+            map_name,
+            config=resolved_configs[map_name],
+        )
         for map_name in selected
     }
     planned_max_by_map = {
@@ -630,6 +812,22 @@ def main_for_task(
         "task": task,
         "started_at": now_iso(),
         "output_root": str(output_root),
+        "session_run_seed": RUN_SEED,
+        "run_seed_source": (
+            "command_line" if args.run_seed is not None else "system_random"
+        ),
+        "map_run_seeds": {
+            map_name: resolved_configs[map_name].get("run_seed", RUN_SEED)
+            for map_name in selected
+        },
+        "map_seeds": {
+            map_name: int(resolved_configs[map_name]["seed"])
+            for map_name in selected
+        },
+        "weather_assignment_seeds": {
+            map_name: resolved_configs[map_name].get("weather_assignment_seed")
+            for map_name in selected
+        },
         "weather_count_by_map": {
             map_name: len(weather_presets_for_map(task, map_name))
             for map_name in selected
@@ -696,6 +894,12 @@ def main_for_task(
             print(f"[SKIP] {map_name}: {before} images", flush=True)
             status["maps"][map_name] = {
                 "state": "skipped_complete",
+                "resumed": False,
+                "run_seed": resolved_configs[map_name].get("run_seed"),
+                "map_seed": resolved_configs[map_name].get("seed"),
+                "weather_assignment_seed": resolved_configs[map_name].get(
+                    "weather_assignment_seed"
+                ),
                 "images": before,
                 "images_by_weather": before_by_weather,
             }
@@ -704,6 +908,12 @@ def main_for_task(
 
         status["maps"][map_name] = {
             "state": "running",
+            "resumed": resume_by_map[map_name],
+            "run_seed": resolved_configs[map_name].get("run_seed"),
+            "map_seed": resolved_configs[map_name].get("seed"),
+            "weather_assignment_seed": resolved_configs[map_name].get(
+                "weather_assignment_seed"
+            ),
             "started_at": now_iso(),
             "images_before": before,
         }
@@ -715,6 +925,8 @@ def main_for_task(
             output_root,
             args.visible,
             args.smoke,
+            config=resolved_configs[map_name],
+            resume=resume_by_map[map_name],
         )
         after = image_count(task, map_output)
         after_by_weather = image_counts_by_weather(task, map_output)
@@ -758,6 +970,12 @@ def main_for_task(
         )
         status["maps"][map_name] = {
             "state": state,
+            "resumed": resume_by_map[map_name],
+            "run_seed": resolved_configs[map_name].get("run_seed"),
+            "map_seed": resolved_configs[map_name].get("seed"),
+            "weather_assignment_seed": resolved_configs[map_name].get(
+                "weather_assignment_seed"
+            ),
             "return_code": return_code,
             "quality_audit_passed": passed,
             "fresh_manifest": fresh_manifest,

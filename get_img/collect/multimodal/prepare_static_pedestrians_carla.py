@@ -32,13 +32,38 @@ def parse_args():
     parser.add_argument("--lateral-offset", type=float, default=3.5)
     parser.add_argument(
         "--pedestrian-motion",
-        choices=("static", "shuttle"),
+        choices=("static", "shuttle", "forward"),
         default="static",
     )
     parser.add_argument("--walker-speed-min", type=float, default=0.9)
     parser.add_argument("--walker-speed-max", type=float, default=1.5)
     parser.add_argument("--shuttle-distance", type=float, default=12.0)
+    parser.add_argument("--min-road-clearance", type=float, default=1.25)
     return parser.parse_args()
+
+
+def distance_xy(first, second):
+    return math.hypot(
+        float(first.x - second.x),
+        float(first.y - second.y),
+    )
+
+
+def driving_lane_clearance_m(carla_map, location):
+    """Return distance beyond the nearest driving-lane edge."""
+    try:
+        waypoint = carla_map.get_waypoint(
+            location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        waypoint = carla_map.get_waypoint(location, project_to_road=True)
+    if waypoint is None:
+        return float("inf")
+    center_distance = distance_xy(location, waypoint.transform.location)
+    lane_half_width = max(1.5, float(waypoint.lane_width) * 0.5)
+    return center_distance - lane_half_width
 
 
 def spawn_fallback_pedestrians(
@@ -49,10 +74,12 @@ def spawn_fallback_pedestrians(
     pedestrian_motion,
     speed_min,
     speed_max,
+    min_road_clearance,
 ):
     rng = random.Random(seed)
     blueprints = list(world.get_blueprint_library().filter("walker.pedestrian.*"))
-    spawn_points = list(world.get_map().get_spawn_points())
+    carla_map = world.get_map()
+    spawn_points = list(carla_map.get_spawn_points())
     if not blueprints:
         raise RuntimeError("No walker.pedestrian.* blueprints are available")
     if not spawn_points:
@@ -68,7 +95,27 @@ def spawn_fallback_pedestrians(
         base = spawn_points[candidate_index % len(spawn_points)]
         lane_pass = candidate_index // len(spawn_points)
         side = -1.0 if (candidate_index + lane_pass) % 2 else 1.0
-        lateral = side * (lateral_offset + 0.7 * (lane_pass % 3))
+        try:
+            base_waypoint = carla_map.get_waypoint(
+                base.location,
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+        except (AttributeError, RuntimeError, TypeError):
+            base_waypoint = carla_map.get_waypoint(
+                base.location,
+                project_to_road=True,
+            )
+        lane_half_width = (
+            max(1.5, float(base_waypoint.lane_width) * 0.5)
+            if base_waypoint is not None
+            else 1.75
+        )
+        lateral_from_center = max(
+            lateral_offset,
+            lane_half_width + min_road_clearance,
+        ) + 1.5 * (lane_pass % 6)
+        lateral = side * lateral_from_center
         longitudinal = (-2.0, 0.0, 2.0)[lane_pass % 3]
         yaw_rad = math.radians(float(base.rotation.yaw))
 
@@ -79,6 +126,10 @@ def spawn_fallback_pedestrians(
             + math.sin(yaw_rad) * longitudinal,
             z=base.location.z + 0.6,
         )
+        spawn_road_clearance = driving_lane_clearance_m(carla_map, location)
+        if spawn_road_clearance < min_road_clearance:
+            candidate_index += 1
+            continue
         rotation = carla.Rotation(
             pitch=0.0,
             yaw=float(base.rotation.yaw) + rng.uniform(-35.0, 35.0),
@@ -92,7 +143,7 @@ def spawn_fallback_pedestrians(
                 "role_name",
                 (
                     "collection_scripted_pedestrian"
-                    if pedestrian_motion == "shuttle"
+                    if pedestrian_motion != "static"
                     else "collection_static_pedestrian"
                 ),
             )
@@ -111,6 +162,8 @@ def spawn_fallback_pedestrians(
                 "direction_y": math.sin(yaw_rad),
                 "sign": 1.0,
                 "speed": rng.uniform(speed_min, speed_max),
+                "spawn_road_clearance_m": spawn_road_clearance,
+                "target_center_offset_m": abs(lateral),
             })
         candidate_index += 1
 
@@ -129,7 +182,12 @@ def apply_shuttle_control(state):
     state["actor"].apply_control(control)
 
 
-def update_shuttle_pedestrians(states, distance):
+def update_shuttle_pedestrians(
+    states,
+    distance,
+    carla_map,
+    min_road_clearance,
+):
     for state in states:
         actor = state["actor"]
         if actor is None or not actor.is_alive:
@@ -143,6 +201,99 @@ def update_shuttle_pedestrians(states, distance):
             state["sign"] = -1.0
         elif along <= -distance:
             state["sign"] = 1.0
+        lookahead = max(0.75, float(state["speed"]) * 0.75)
+        next_location = carla.Location(
+            x=float(location.x)
+            + state["direction_x"] * state["sign"] * lookahead,
+            y=float(location.y)
+            + state["direction_y"] * state["sign"] * lookahead,
+            z=float(location.z),
+        )
+        if (
+            driving_lane_clearance_m(carla_map, next_location)
+            < min_road_clearance
+        ):
+            state["sign"] *= -1.0
+        apply_shuttle_control(state)
+
+
+def update_forward_pedestrians(states, carla_map, min_road_clearance):
+    """Move continuously along the road while staying beyond the lane edge."""
+    for state in states:
+        actor = state["actor"]
+        if actor is None or not actor.is_alive:
+            continue
+        location = actor.get_location()
+        try:
+            waypoint = carla_map.get_waypoint(
+                location,
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+        except (AttributeError, RuntimeError, TypeError):
+            try:
+                waypoint = carla_map.get_waypoint(
+                    location,
+                    project_to_road=True,
+                )
+            except (AttributeError, RuntimeError, TypeError):
+                waypoint = None
+        if waypoint is None:
+            apply_shuttle_control(state)
+            continue
+
+        yaw_rad = math.radians(float(waypoint.transform.rotation.yaw))
+        tangent_x = math.cos(yaw_rad)
+        tangent_y = math.sin(yaw_rad)
+        # Lane directions may flip when the nearest waypoint changes. Preserve
+        # the actor's current forward direction instead of turning it around.
+        if (
+            tangent_x * state["direction_x"]
+            + tangent_y * state["direction_y"]
+            < 0.0
+        ):
+            tangent_x *= -1.0
+            tangent_y *= -1.0
+
+        normal_x = -tangent_y
+        normal_y = tangent_x
+        center = waypoint.transform.location
+        relative_x = float(location.x - center.x)
+        relative_y = float(location.y - center.y)
+        signed_lateral = relative_x * normal_x + relative_y * normal_y
+        side = 1.0 if signed_lateral >= 0.0 else -1.0
+        lane_half_width = max(1.5, float(waypoint.lane_width) * 0.5)
+        target_offset = max(
+            lane_half_width + min_road_clearance,
+            float(state["target_center_offset_m"]),
+        )
+        lateral_error = target_offset - abs(signed_lateral)
+        correction = max(-0.35, min(0.75, lateral_error * 0.25))
+        direction_x = tangent_x + normal_x * side * correction
+        direction_y = tangent_y + normal_y * side * correction
+        norm = math.hypot(direction_x, direction_y)
+        if norm > 1e-6:
+            direction_x /= norm
+            direction_y /= norm
+
+        lookahead = max(1.0, float(state["speed"]))
+        next_location = carla.Location(
+            x=float(location.x) + direction_x * lookahead,
+            y=float(location.y) + direction_y * lookahead,
+            z=float(location.z),
+        )
+        if driving_lane_clearance_m(carla_map, next_location) < min_road_clearance:
+            # Steer outward rather than reversing when a curved road brings the
+            # predicted step too close to the driving lane.
+            direction_x = tangent_x + normal_x * side * 0.9
+            direction_y = tangent_y + normal_y * side * 0.9
+            norm = math.hypot(direction_x, direction_y)
+            direction_x /= norm
+            direction_y /= norm
+
+        state["direction_x"] = direction_x
+        state["direction_y"] = direction_y
+        state["sign"] = 1.0
         apply_shuttle_control(state)
 
 
@@ -214,6 +365,8 @@ def main():
         raise ValueError("--walker-speed-min cannot exceed --walker-speed-max")
     if args.shuttle_distance <= 0.0:
         raise ValueError("--shuttle-distance must be greater than zero")
+    if args.min_road_clearance < 0.0:
+        raise ValueError("--min-road-clearance cannot be negative")
 
     client = carla.Client(args.host, args.port)
     client.set_timeout(args.timeout)
@@ -234,6 +387,7 @@ def main():
             args.pedestrian_motion,
             args.walker_speed_min,
             args.walker_speed_max,
+            args.min_road_clearance,
         )
     )
     vehicles, vehicle_attempts = spawn_static_vehicles(
@@ -253,9 +407,29 @@ def main():
         "pedestrian_attempts": pedestrian_attempts,
         "vehicle_attempts": vehicle_attempts,
         "pedestrian_motion": args.pedestrian_motion,
+        "min_required_road_clearance_m": args.min_road_clearance,
+        "minimum_spawn_road_clearance_m": (
+            min(
+                state["spawn_road_clearance_m"]
+                for state in motion_states
+            )
+            if motion_states
+            else None
+        ),
     }
     if args.pedestrian_motion == "shuttle":
-        update_shuttle_pedestrians(motion_states, args.shuttle_distance)
+        update_shuttle_pedestrians(
+            motion_states,
+            args.shuttle_distance,
+            world.get_map(),
+            args.min_road_clearance,
+        )
+    elif args.pedestrian_motion == "forward":
+        update_forward_pedestrians(
+            motion_states,
+            world.get_map(),
+            args.min_road_clearance,
+        )
     print("READY " + json.dumps(payload, ensure_ascii=True), flush=True)
     if not pedestrians:
         return 2
@@ -264,7 +438,19 @@ def main():
     # the parent orchestration process terminates this helper.
     while True:
         if args.pedestrian_motion == "shuttle":
-            update_shuttle_pedestrians(motion_states, args.shuttle_distance)
+            update_shuttle_pedestrians(
+                motion_states,
+                args.shuttle_distance,
+                world.get_map(),
+                args.min_road_clearance,
+            )
+            time.sleep(0.25)
+        elif args.pedestrian_motion == "forward":
+            update_forward_pedestrians(
+                motion_states,
+                world.get_map(),
+                args.min_road_clearance,
+            )
             time.sleep(0.25)
         else:
             time.sleep(10.0)

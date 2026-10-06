@@ -238,6 +238,8 @@ def start_static_pedestrian_bridge(
     seed: int = 2718,
     pedestrian_motion: str = "static",
     shuttle_distance: float = 12.0,
+    lateral_offset: float = 3.5,
+    min_road_clearance: float = 1.25,
 ) -> subprocess.Popen:
     command = [
         str(python_executable),
@@ -259,12 +261,15 @@ def start_static_pedestrian_bridge(
         pedestrian_motion,
         "--shuttle-distance",
         str(shuttle_distance),
+        "--lateral-offset",
+        str(lateral_offset),
+        "--min-road-clearance",
+        str(min_road_clearance),
     ]
     if map_name:
         command.extend(["--map", map_name])
     if load_map:
         command.append("--load-map")
-
     process = subprocess.Popen(
         command,
         cwd=str(STATIC_PEDESTRIAN_HELPER.parent),

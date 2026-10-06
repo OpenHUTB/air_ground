@@ -16,23 +16,25 @@ E:\pythonProject\air_groud\get_img\dataset_uav_multimap_single_object_vot_motion
 - 类别：`vehicle`、`pedestrian`。
 - 分辨率：1920×1080。
 - 仿真帧率：20 FPS；车辆每 2 tick 保存一次（10 Hz），人物每 6 tick 保存一次（约 3.33 Hz）。
-- 每张地图分别采集固定悬停、滞后跟随和侧向环绕各 5 条序列，共 15 条。
+- 每张地图分别采集固定悬停、滞后跟随和侧向环绕各 18 条序列，共 54 条；
+  每种拍摄方式均包含 9 条车辆和 9 条人物序列。
 - 固定悬停最长 80 帧，连续 5 帧未出现目标即结束；不足 30 帧则重采。
 - 人物滞后跟随保存 80 帧（0.3 秒间隔，约 24 秒）。
 - 侧向环绕：车辆 150 帧（0.1 秒间隔），人物 100 帧（0.3 秒间隔）。
-- 根据侧向环绕目标类别，每张地图计划最多约 1300–1550 张 RGB；固定悬停
-  允许提前结束，因此八张地图实际预计约 9400–11400 张。
-- 训练、验证、测试按完整序列划分，避免相邻帧泄漏。
+- 每张地图计划最多 5490 张 RGB，八张地图计划最多 43920 张；固定悬停
+  允许提前结束，因此实际数量会略少。
+- 训练、验证、测试按完整序列划分；同一目标只属于一个 split，单个目标最多
+  拍摄 2 条序列，避免相邻帧和目标身份泄漏。
 - 深度与语义传感器只用于遮挡、道路、目标尺寸和穿模检查，不作为公开模态保存。
-- 中电园和湖工商使用 40 个带行走控制的补充行人，不再补充静止车辆；
-  普通交通参与者调整为 8 辆车、0 个额外导航行人，采集器还会跳过旧版
-  静止桥接 actor。
+- 中电园和湖工商使用 40 个带行走控制的补充行人；生成位置会根据车道宽度
+  移到道路边界以外，行走时也会提前检测并避开机动车道。普通交通参与者调整为
+  20 辆车、0 个额外导航行人，采集器还会跳过旧版静止桥接 actor。
 - 两张特殊地图启用完整贴图加载、30 帧预热和场景几何完整度检查；中电园还会
   避开已知的贴图/虚空区域。
-- 三种运动模式分别从地图允许的天气中独立随机选择，不设置固定天气种子，
-  每次重新启动批量采集都会重新抽取。其余七张地图只会抽取 `ClearNoon`、
-  `ClearSunset`、`ClearNight`；中电园只会抽取 `ClearNoon` 和
-  `ClearSunset`。
+- 三种运动模式分别从地图允许的天气中独立随机选择。每次启动批量采集都会
+  生成并记录新的运行种子、地图种子和天气种子；六张标准地图只会抽取
+  `ClearNoon`、`ClearSunset`、`ClearNight`；中电园和湖工商只会抽取
+  `ClearNoon` 和 `ClearSunset`。
 - 中电园单相机高度单独调整为 18–24 m、水平距离调整为 18–32 m，以提高
   行人首帧尺寸和可见性；其他地图仍使用 30–36 m 高度。
 
@@ -118,13 +120,16 @@ $PROJECT = "E:\pythonProject\air_groud\get_img\collect\single_camera_tracking"
 | `--visible` | 显示模拟器窗口 |
 | `--rerun-complete` | 完成的地图也重新采集 |
 | `--smoke` | 使用隔离输出，只采一条极小序列 |
+| `--run-seed N` | 新采或强制重采时使用指定运行种子；省略则随机生成 |
 
 ## 核心配置
 
 | 配置项 | 当前基础值 | 说明 |
 |---|---:|---|
-| `sequences_per_map` | 15 | 正式采集每张地图的完整序列数 |
-| `sequences_by_motion_mode` | 每种 5 条 | 三种运动模式的正式配额 |
+| `sequences_per_map` | 54 | 正式采集每张地图的完整序列数 |
+| `sequences_by_motion_mode` | 每种 18 条 | 三种运动模式的正式配额 |
+| `target_classes_by_motion_mode` | 每种均含车辆和人物 | 每种模式各 9 条车辆、9 条人物 |
+| `max_sequences_per_target_actor` | 2 | 单个目标最多进入两条序列，且不得跨 split |
 | `frames_by_motion_mode` | 最长 80 / 120 / 150 | 三种模式的默认/车辆上限 |
 | `frames_by_motion_mode_and_target_class` | 人物跟随 80 / 人物环绕 100 | 保持人物序列原覆盖时长 |
 | `fixed_hover_stop_after_absent_frames` | 5 | 固定悬停连续缺失 5 帧即结束 |
@@ -140,6 +145,8 @@ $PROJECT = "E:\pythonProject\air_groud\get_img\collect\single_camera_tracking"
 | `max_consecutive_absent_frames_by_motion_mode` | 固定悬停 5 / 其余 40 | 最大连续缺失帧数 |
 | `min_vehicle_equivalent_side_px` | 40 px | 车辆等效边长下限 |
 | `min_pedestrian_equivalent_side_px` | 35 px | 行人等效边长下限 |
+| `min_target_average_speed_mps` | 车辆 0.5 / 人物 0.2 | 拒绝目标自身几乎不移动的序列 |
+| `min_target_moving_step_ratio` | 车辆/人物 0.2 | 至少 20% 的相邻采样位置发生有效移动 |
 
 命令行可覆盖序列数、帧数、天气和输出目录。查看完整参数：
 
@@ -175,6 +182,18 @@ $PROJECT = "E:\pythonProject\air_groud\get_img\collect\single_camera_tracking"
 
 - 第一帧必须存在合格主目标，否则整条尝试失败。
 - 一条序列超过缺失比例或连续缺失上限时不会进入正式结果。
+- 目标自身的世界坐标平均速度或有效运动帧比例不足时整条重采，不能再依靠背景
+  或相机运动通过质量检查。
+- 质量审计会拒绝目标跨 train/val/test、单个目标超过 2 条或缺少任一“运动模式/目标类别”组合的数据。
+- 每验收一条序列，就原子更新 `resume_state.json`。重新执行同一条批量命令时，
+  完整序列会被逐项校验并跳过，从第一条缺失序列继续。
+- 图片、YOLO、VOT、逐帧 JSON 或元数据数量不一致的半成品不会跳过，而会
+  移到 `_resume_rejected/` 后重采。
+- 续跑复用 `_configs/<地图名>.json` 中原来的运行种子、地图种子、天气种子
+  和天气计划；已经完成的地图仍由批量运行器直接跳过。
+- 普通续跑不需要传种子。若需要从头复现实验，可从旧的
+  `collection_status.json` 读取 `session_run_seed`，配合
+  `--run-seed <数值> --rerun-complete` 使用。
 - `quality_audit.json` 应为 `PASS`，并检查序列级数据划分和 VOT 必需文件。
 - 批量运行器按地图核对图像数量、天气分布、清单新鲜度和质量审计。
 - `--smoke` 输出与正式数据隔离，适合验证环境和地图兼容性。
@@ -189,6 +208,7 @@ $PROJECT = "E:\pythonProject\air_groud\get_img\collect\single_camera_tracking"
 
 - 正式单相机项目是 VOT/SOT，不是旧的单相机多目标 MOT 方案。
 - `--overwrite` 是破坏性选项，只应用于确认可以重建的输出目录。
+- `--rerun-complete` 会放弃完整地图的跳过行为并从头采集，不用于普通断点续跑。
 - 同一序列内天气和主目标身份必须保持不变。
 - 不要按帧随机拆分训练集、验证集和测试集，否则会产生相邻帧泄漏。
 - CARLA RPC 端口默认是 2000；不要同时运行另一个采集聊天或采集脚本。

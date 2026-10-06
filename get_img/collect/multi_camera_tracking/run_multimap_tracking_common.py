@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -32,14 +33,23 @@ WEATHERS = [
     "SnowNoon",
     "DustStorm",
 ]
+SPECIAL_MAP_WEATHERS = [
+    weather for weather in WEATHERS if weather != "ClearNight"
+]
+DIFFICULT_MULTICAMERA_LAYOUT_MAPS = {
+    "Town03_Opt",
+    "Town04_Opt",
+    "Town07_Opt",
+    "Town10HD",
+}
 MAPS = list(runtime.ALL_OUTPUT_NAMES)
 SINGLE_SEQUENCES_PER_MAP = 75
 SINGLE_FRAMES_PER_SEQUENCE = 40
 SINGLE_SAMPLE_INTERVAL_TICKS = 4
 SINGLE_FPS = 20.0
-MULTICAMERA_SCENES_PER_MAP = 1
-MULTICAMERA_TRAIN_FRAMES_PER_SCENE = 80
-MULTICAMERA_EVAL_FRAMES_PER_SCENE = 100
+MULTICAMERA_SCENES_PER_MAP = 30
+MULTICAMERA_TRAIN_FRAMES_PER_SCENE = 50
+MULTICAMERA_EVAL_FRAMES_PER_SCENE = 50
 MULTICAMERA_SAMPLE_INTERVAL_TICKS = 3
 MULTICAMERA_FPS = 25.0
 CAMERAS_PER_MULTICAMERA_SAMPLE = 3
@@ -84,15 +94,6 @@ def parse_args(task: str, argv: Optional[Sequence[str]]) -> argparse.Namespace:
 
 
 def expected_images_by_weather(task: str, smoke: bool) -> Dict[str, int]:
-    frames = (
-        20
-        if smoke and task == "multicamera"
-        else 3
-        if smoke
-        else MULTICAMERA_TRAIN_FRAMES_PER_SCENE
-        if task == "multicamera"
-        else SINGLE_FRAMES_PER_SEQUENCE
-    )
     cameras = CAMERAS_PER_MULTICAMERA_SAMPLE if task == "multicamera" else 1
     group_count = (
         1
@@ -103,6 +104,22 @@ def expected_images_by_weather(task: str, smoke: bool) -> Dict[str, int]:
     )
     counts = {weather: 0 for weather in WEATHERS}
     for group_index in range(group_count):
+        if task == "multicamera":
+            if smoke:
+                frames = 20
+            else:
+                train_end = (
+                    1
+                    if group_count == 1
+                    else int(group_count * 0.60)
+                )
+                frames = (
+                    MULTICAMERA_TRAIN_FRAMES_PER_SCENE
+                    if group_index < train_end
+                    else MULTICAMERA_EVAL_FRAMES_PER_SCENE
+                )
+        else:
+            frames = 3 if smoke else SINGLE_FRAMES_PER_SEQUENCE
         counts[WEATHERS[group_index % len(WEATHERS)]] += frames * cameras
     return counts
 
@@ -140,8 +157,16 @@ def build_config(
 
     if task == "multicamera":
         frames_per_scene = 20 if smoke else MULTICAMERA_TRAIN_FRAMES_PER_SCENE
+        configured_seed = config.get("seed")
+        if configured_seed is None:
+            configured_seed = secrets.randbelow(2_147_483_646) + 1
+            seed_source = "generated_by_multimap_runner"
+        else:
+            seed_source = "explicit"
         config.update(
             {
+                "seed": int(configured_seed),
+                "seed_source": seed_source,
                 "scenes_per_map": MULTICAMERA_SCENES_PER_MAP,
                 "fps": MULTICAMERA_FPS,
                 "frames_per_scene": frames_per_scene,
@@ -154,28 +179,71 @@ def build_config(
                 "sample_interval_ticks": MULTICAMERA_SAMPLE_INTERVAL_TICKS,
                 "camera_bearing_separation_deg": 35.0,
                 "camera_preferred_bearing_separation_min_deg": 42.0,
-                "camera_preferred_bearing_separation_max_deg": 78.0,
-                "camera_max_bearing_separation_deg": 100.0,
-                "camera_min_pair_distance_m": 15.0,
+                "camera_preferred_bearing_separation_max_deg": 65.0,
+                "camera_max_bearing_separation_deg": 90.0,
+                # Camera bearings remain separated, but no map imposes a
+                # minimum physical distance between camera origins.
+                "camera_min_pair_distance_m": 0.0,
                 "pedestrian_camera_radius_min_m": 18.0,
                 "pedestrian_camera_radius_max_m": 32.0,
-                "pedestrian_camera_height_min_m": 16.0,
-                "pedestrian_camera_height_max_m": 24.0,
+                "pedestrian_camera_height_min_m": 18.0,
+                "pedestrian_camera_height_max_m": 26.0,
                 "streaming_warmup_ticks": (
                     30 if map_name == runtime.CCSP_OUTPUT_NAME else 2
                 ),
                 # Sparse pedestrian layouts such as Town04 can need many camera
                 # proposals while preserving the strict three-view QA gates.
-                "max_scene_attempts": 6,
+                "max_scene_attempts": 12,
                 "max_actor_population_attempts": 3,
             }
         )
+        if map_name in {runtime.HUTB_MAP_NAME, runtime.CCSP_OUTPUT_NAME}:
+            config.update(
+                {
+                    # Only the midnight preset is disabled. Sunset, fog, snow,
+                    # and dust remain available on both special maps.
+                    "weather_presets": list(SPECIAL_MAP_WEATHERS),
+                    # These maps use the bridge pedestrians below. Disabling
+                    # the second nav-mesh population prevents overlapping
+                    # crowds and walkers being routed through driving lanes.
+                    "walkers": 0,
+                    # Moving vehicles come from the collector/Traffic Manager.
+                    # The bridge only provides road-edge pedestrians, avoiding
+                    # a second batch of static vehicles in the same picture.
+                    "vehicles": 30,
+                    "special_map_bridge_pedestrians": 24,
+                    "special_map_bridge_vehicles": 0,
+                    "special_map_pedestrian_motion": "forward",
+                    "special_map_pedestrian_lateral_offset_m": 4.5,
+                    "special_map_pedestrian_min_road_clearance_m": 2.0,
+                    # Reject camera layouts that see the dark, unmodeled map
+                    # boundary or another very large textureless region.
+                    "reject_unmodeled_regions": True,
+                    "max_dark_flat_region_ratio": 0.05,
+                    "max_flat_region_ratio": 0.24,
+                    "max_far_depth_region_ratio": 0.10,
+                    "max_scene_attempts": 18,
+                }
+            )
+        if map_name in DIFFICULT_MULTICAMERA_LAYOUT_MAPS:
+            config.update(
+                {
+                    # Dense buildings and trees make the generic aerial-view
+                    # gate reject otherwise useful three-camera trajectories.
+                    "min_road_visible_ratio": 0.20,
+                    "max_near_depth_ratio": 0.08,
+                    "camera_bearing_separation_deg": 30.0,
+                    "camera_preferred_bearing_separation_min_deg": 38.0,
+                    "camera_preferred_bearing_separation_max_deg": 60.0,
+                    "camera_max_bearing_separation_deg": 90.0,
+                }
+            )
         if smoke:
             config.update(
                 {
                     "actor_spawn_warmup_ticks": 25,
                     "min_anchor_common_view_seconds": 0.24,
-                    "min_effective_track_frames": 5,
+                    "min_effective_track_seconds": 0.6,
                     "vehicle_min_sequence_displacement_m": 0.5,
                     "vehicle_min_sequence_path_length_m": 0.75,
                     "pedestrian_min_sequence_displacement_m": 0.15,
@@ -187,8 +255,11 @@ def build_config(
                 {
                     "pedestrian_camera_radius_min_m": 18.0,
                     "pedestrian_camera_radius_max_m": 32.0,
-                    "pedestrian_camera_height_min_m": 16.0,
-                    "pedestrian_camera_height_max_m": 24.0,
+                    "pedestrian_camera_height_min_m": 18.0,
+                    "pedestrian_camera_height_max_m": 26.0,
+                    # CCSP boundary voids are often mid-gray rather than
+                    # black, so its low-texture screen-space gate is stricter.
+                    "max_flat_region_ratio": 0.14,
                 }
             )
         if map_name == "Town04_Opt":
@@ -196,25 +267,33 @@ def build_config(
                 {
                     "pedestrian_camera_radius_min_m": 18.0,
                     "pedestrian_camera_radius_max_m": 32.0,
-                    "pedestrian_camera_height_min_m": 16.0,
-                    "pedestrian_camera_height_max_m": 24.0,
+                    "pedestrian_camera_height_min_m": 18.0,
+                    "pedestrian_camera_height_max_m": 26.0,
                 }
             )
         if map_name == "Town02_Opt":
             config.update(
                 {
+                    # Town02 roads are narrow and curved. Dense road samples
+                    # and a wider pedestrian search annulus provide enough
+                    # three-view candidates without weakening final image QA.
+                    "camera_candidate_spacing_m": 3.0,
+                    "pedestrian_camera_radius_min_m": 14.0,
+                    "pedestrian_camera_radius_max_m": 38.0,
+                    "pedestrian_camera_pitch_min_deg": -52.0,
+                    "pedestrian_camera_pitch_max_deg": -30.0,
                     "vehicle_camera_radius_min_m": 18.0,
                     "vehicle_camera_radius_max_m": 32.0,
-                    "vehicle_camera_height_min_m": 18.0,
-                    "vehicle_camera_height_max_m": 24.0,
+                    "vehicle_camera_height_min_m": 20.0,
+                    "vehicle_camera_height_max_m": 26.0,
                     # Town02 has narrower/curvier roads. Keep the road-view QA
                     # enabled, but relax it enough that the third camera can
                     # still form a valid multi-view rig.
                     "min_road_visible_ratio": 0.25,
                     "camera_bearing_separation_deg": 30.0,
                     "camera_preferred_bearing_separation_min_deg": 38.0,
-                    "camera_preferred_bearing_separation_max_deg": 72.0,
-                    "camera_max_bearing_separation_deg": 100.0,
+                    "camera_preferred_bearing_separation_max_deg": 60.0,
+                    "camera_max_bearing_separation_deg": 90.0,
                     # Give Town02 additional fresh actor populations before
                     # declaring a scene unavailable.
                     "max_actor_population_attempts": 6,
@@ -300,10 +379,12 @@ def run_collector(
     log_path: Path,
     env: Optional[Dict[str, str]],
     smoke: bool,
+    force_overwrite: bool = False,
 ) -> int:
     resume = (
         task == "multicamera"
         and not smoke
+        and not force_overwrite
         and (output / "scenes").is_dir()
         and any((output / "scenes").iterdir())
     )
@@ -348,8 +429,8 @@ def run_collector(
             audit_command.remove("--resume" if resume else "--overwrite")
             audit_command.append("--audit-only")
             print(
-                "[RECOVER] Collector exited during native cleanup; "
-                "running offline audit and manifest rebuild.",
+                "[RECOVER] Collector exited non-zero; running offline audit "
+                "and manifest rebuild for any successfully saved scenes.",
                 flush=True,
             )
             audit = subprocess.run(
@@ -380,9 +461,12 @@ def collect_map(
     output_root: Path,
     visible: bool,
     smoke: bool,
+    force_overwrite: bool = False,
 ) -> int:
     map_output = output_root / map_name
     config = build_config(task, map_name, map_output, smoke)
+    if map_name in {runtime.CCSP_OUTPUT_NAME, runtime.HUTB_MAP_NAME}:
+        config["bridge_seed"] = secrets.randbelow(2_147_483_646) + 1
     config_path = output_root / "_configs" / f"{map_name}.json"
     log_path = output_root / "_logs" / f"{map_name}.log"
     write_json(config_path, config)
@@ -405,10 +489,19 @@ def collect_map(
             )
             bridge = runtime.start_static_pedestrian_bridge(
                 runtime.CCSP_PYTHON,
-                count=120,
-                vehicle_count=40,
+                count=int(config["special_map_bridge_pedestrians"]),
+                vehicle_count=int(config["special_map_bridge_vehicles"]),
                 env=env,
-                seed=9301,
+                seed=int(config["bridge_seed"]),
+                pedestrian_motion=str(
+                    config["special_map_pedestrian_motion"]
+                ),
+                lateral_offset=float(
+                    config["special_map_pedestrian_lateral_offset_m"]
+                ),
+                min_road_clearance=float(
+                    config["special_map_pedestrian_min_road_clearance_m"]
+                ),
             )
             python_executable = runtime.CCSP_PYTHON
         else:
@@ -422,11 +515,20 @@ def collect_map(
             if map_name == runtime.HUTB_MAP_NAME:
                 bridge = runtime.start_static_pedestrian_bridge(
                     runtime.OPENHUTB_PYTHON,
-                    count=120,
-                    vehicle_count=40,
+                    count=int(config["special_map_bridge_pedestrians"]),
+                    vehicle_count=int(config["special_map_bridge_vehicles"]),
                     map_name=map_name,
                     load_map=True,
-                    seed=9201,
+                    seed=int(config["bridge_seed"]),
+                    pedestrian_motion=str(
+                        config["special_map_pedestrian_motion"]
+                    ),
+                    lateral_offset=float(
+                        config["special_map_pedestrian_lateral_offset_m"]
+                    ),
+                    min_road_clearance=float(
+                        config["special_map_pedestrian_min_road_clearance_m"]
+                    ),
                 )
 
         return run_collector(
@@ -437,6 +539,7 @@ def collect_map(
             log_path,
             env,
             smoke,
+            force_overwrite,
         )
     finally:
         runtime.stop_static_pedestrian_bridge(bridge)
@@ -547,6 +650,7 @@ def main_for_task(
             output_root,
             args.visible,
             args.smoke,
+            args.rerun_complete,
         )
         after = image_count(task, map_output)
         after_by_weather = image_counts_by_weather(task, map_output)

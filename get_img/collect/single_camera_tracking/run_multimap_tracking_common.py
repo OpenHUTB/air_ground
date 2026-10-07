@@ -34,31 +34,16 @@ WEATHERS = [
     "DustStorm",
 ]
 MAPS = list(runtime.ALL_OUTPUT_NAMES)
-SINGLE_MOTION_MODES = ["fixed_hover", "lagged_follow", "lateral_orbit"]
-SINGLE_TARGET_CLASSES_BY_MOTION_MODE = {
-    mode: ["vehicle", "pedestrian"]
-    for mode in SINGLE_MOTION_MODES
-}
-SINGLE_SEQUENCES_BY_MOTION_MODE = {
-    "fixed_hover": 18,
-    "lagged_follow": 18,
-    "lateral_orbit": 18,
-}
-SINGLE_FRAMES_BY_MOTION_MODE = {
-    "fixed_hover": 80,
-    "lagged_follow": 120,
-    "lateral_orbit": 150,
-}
-SINGLE_FRAMES_BY_MOTION_AND_CLASS = {
-    "lagged_follow": {"pedestrian": 80},
-    "lateral_orbit": {"pedestrian": 100},
-}
+SINGLE_MOTION_MODE = "rear_upper_follow"
+SINGLE_TARGET_CLASSES = ["vehicle", "pedestrian"]
 SINGLE_SAMPLE_INTERVAL_TICKS_BY_TARGET_CLASS = {
     "vehicle": 2,
     "pedestrian": 6,
 }
-SINGLE_SEQUENCES_PER_MAP = sum(SINGLE_SEQUENCES_BY_MOTION_MODE.values())
+SINGLE_SEQUENCES_PER_MAP = 54
 SINGLE_FRAMES_PER_SEQUENCE = 120
+SINGLE_SMOKE_SEQUENCES = 3
+SINGLE_SMOKE_FRAMES = 15
 SINGLE_SAMPLE_INTERVAL_TICKS = 2
 SINGLE_FPS = 20.0
 MULTICAMERA_SCENES_PER_MAP = 100
@@ -74,7 +59,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "base_config": COLLECT_ROOT / "multi_camera_tracking" / "multi_camera_mot_config.json",
         "output": (
             GET_IMG_ROOT
-            / "dataset_uav_multimap_multicamera_mot_weather500"
+            / "AirGroundCoopSuite"
+            / "release"
+            / "derived_task3_mcmot"
         ),
     },
     "single_object": {
@@ -82,7 +69,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "base_config": COLLECT_ROOT / "single_camera_tracking" / "single_object_vot_config.json",
         "output": (
             GET_IMG_ROOT
-            / "dataset_uav_multimap_single_object_vot_motion_full"
+            / "AirGroundCoopSuite"
+            / "release"
+            / "derived_task2_sot"
         ),
     },
 }
@@ -145,16 +134,6 @@ def map_weather_seed(map_name: str, smoke: bool) -> int:
     ) % 2_000_000_000
 
 
-def single_motion_mode_schedule() -> Sequence[str]:
-    max_count = max(SINGLE_SEQUENCES_BY_MOTION_MODE.values())
-    return [
-        mode
-        for round_index in range(max_count)
-        for mode in SINGLE_MOTION_MODES
-        if round_index < SINGLE_SEQUENCES_BY_MOTION_MODE[mode]
-    ]
-
-
 def random_weather_schedule_for_map(
     map_name: str,
     smoke: bool,
@@ -163,9 +142,12 @@ def random_weather_schedule_for_map(
     if cache_key not in _WEATHER_SCHEDULE_CACHE:
         allowed = list(weather_presets_for_map("single_object", map_name))
         weather_rng = random.Random(map_weather_seed(map_name, smoke))
+        sequence_count = (
+            SINGLE_SMOKE_SEQUENCES if smoke else SINGLE_SEQUENCES_PER_MAP
+        )
         _WEATHER_SCHEDULE_CACHE[cache_key] = [
             weather_rng.choice(allowed)
-            for _ in range(SINGLE_SEQUENCES_PER_MAP)
+            for _ in range(sequence_count)
         ]
     return list(_WEATHER_SCHEDULE_CACHE[cache_key])
 
@@ -180,65 +162,24 @@ def expected_images_by_weather(
     if task == "single_object":
         counts = {weather: 0 for weather in WEATHERS}
         if config is None:
-            schedule = list(single_motion_mode_schedule())
-            mode_frames = SINGLE_FRAMES_BY_MOTION_MODE
-            class_frames = SINGLE_FRAMES_BY_MOTION_AND_CLASS
-            class_offset = MAPS.index(map_name) % 2
             weather_schedule = random_weather_schedule_for_map(map_name, smoke)
+            sequence_count = (
+                SINGLE_SMOKE_SEQUENCES if smoke else SINGLE_SEQUENCES_PER_MAP
+            )
+            frames_per_sequence = (
+                SINGLE_SMOKE_FRAMES if smoke else SINGLE_FRAMES_PER_SEQUENCE
+            )
         else:
-            modes = list(config["motion_modes"])
-            mode_counts = config["sequences_by_motion_mode"]
-            max_count = max(int(mode_counts[mode]) for mode in modes)
-            schedule = [
-                mode
-                for round_index in range(max_count)
-                for mode in modes
-                if round_index < int(mode_counts[mode])
-            ]
-            mode_frames = config["frames_by_motion_mode"]
-            class_frames = config.get(
-                "frames_by_motion_mode_and_target_class", {}
-            )
-            class_offset = int(config.get("target_class_offset", 0))
             weather_schedule = list(config["weather_sequence_schedule"])
-        if smoke:
-            schedule = schedule[:1]
-        mode_occurrences: Dict[str, int] = {}
-        target_classes_by_mode = (
-            SINGLE_TARGET_CLASSES_BY_MOTION_MODE
-            if config is None
-            else config.get(
-                "target_classes_by_motion_mode",
-                SINGLE_TARGET_CLASSES_BY_MOTION_MODE,
-            )
-        )
-        for group_index, mode in enumerate(schedule):
-            occurrence = mode_occurrences.get(mode, 0)
-            target_classes = list(target_classes_by_mode[mode])
-            target_class = target_classes[
-                (occurrence + class_offset) % len(target_classes)
-            ]
-            mode_occurrences[mode] = occurrence + 1
-            planned_frames = (
-                class_frames.get(mode, {}).get(
-                    target_class,
-                    mode_frames[mode],
-                )
-            )
+            sequence_count = int(config["sequences_per_map"])
+            frames_per_sequence = int(config["frames_per_sequence"])
+        for group_index in range(sequence_count):
             selected_weather = weather_schedule[group_index]
-            counts[selected_weather] += (
-                3
-                if smoke
-                else planned_frames
-            )
+            counts[selected_weather] += frames_per_sequence
         return counts
-    frames = (
-        2
-        if smoke and task == "multicamera"
-        else MULTICAMERA_FRAMES_PER_SCENE
-    )
+    frames = 15 if smoke and task == "multicamera" else MULTICAMERA_FRAMES_PER_SCENE
     cameras = CAMERAS_PER_MULTICAMERA_SAMPLE
-    group_count = 1 if smoke else MULTICAMERA_SCENES_PER_MAP
+    group_count = 3 if smoke else MULTICAMERA_SCENES_PER_MAP
     counts = {weather: 0 for weather in WEATHERS}
     for group_index in range(group_count):
         counts[map_weathers[group_index % len(map_weathers)]] += frames * cameras
@@ -291,6 +232,17 @@ def build_config(
                 "vehicles": 20,
                 "walkers": 0,
                 "include_existing_target_pedestrian_actors": True,
+                "target_population_refresh_enabled_by_class": {
+                    "vehicle": True,
+                    # These maps use the external scripted-pedestrian bridge;
+                    # their navigation meshes are not reliable enough for
+                    # collector-side walker respawning.
+                    "pedestrian": False,
+                },
+                "max_active_target_actors_by_class": {
+                    "vehicle": 32,
+                    "pedestrian": 40,
+                },
                 "require_streaming_geometry": True,
                 "streaming_geometry_max_depth_m": 220.0,
                 "streaming_min_geometry_ratio": 0.90,
@@ -310,7 +262,7 @@ def build_config(
         )
 
     if task == "multicamera":
-        frames_per_scene = 2 if smoke else MULTICAMERA_FRAMES_PER_SCENE
+        frames_per_scene = 15 if smoke else MULTICAMERA_FRAMES_PER_SCENE
         config.update(
             {
                 "scenes_per_map": MULTICAMERA_SCENES_PER_MAP,
@@ -374,37 +326,19 @@ def build_config(
                 }
             )
     else:
-        frames_per_sequence = 3 if smoke else SINGLE_FRAMES_PER_SEQUENCE
+        frames_per_sequence = (
+            SINGLE_SMOKE_FRAMES if smoke else SINGLE_FRAMES_PER_SEQUENCE
+        )
         config.update(
             {
-                "sequences_per_map": SINGLE_SEQUENCES_PER_MAP,
-                "motion_modes": list(SINGLE_MOTION_MODES),
-                "target_classes_by_motion_mode": {
-                    mode: list(target_classes)
-                    for mode, target_classes in (
-                        SINGLE_TARGET_CLASSES_BY_MOTION_MODE.items()
-                    )
-                },
-                "max_sequences_per_target_actor": 2,
-                "sequences_by_motion_mode": dict(
-                    SINGLE_SEQUENCES_BY_MOTION_MODE
-                ),
-                "frames_by_motion_mode": {
-                    mode: 3
-                    for mode in SINGLE_MOTION_MODES
-                }
-                if smoke
-                else dict(SINGLE_FRAMES_BY_MOTION_MODE),
-                "frames_by_motion_mode_and_target_class": (
-                    {}
+                "sequences_per_map": (
+                    SINGLE_SMOKE_SEQUENCES
                     if smoke
-                    else {
-                        mode: dict(class_frames)
-                        for mode, class_frames in (
-                            SINGLE_FRAMES_BY_MOTION_AND_CLASS.items()
-                        )
-                    }
+                    else SINGLE_SEQUENCES_PER_MAP
                 ),
+                "motion_mode": SINGLE_MOTION_MODE,
+                "target_classes": list(SINGLE_TARGET_CLASSES),
+                "max_sequences_per_target_actor": 2,
                 "fps": SINGLE_FPS,
                 "frames_per_sequence": frames_per_sequence,
                 "sample_interval_ticks": SINGLE_SAMPLE_INTERVAL_TICKS,
@@ -428,6 +362,13 @@ def build_config(
                 "max_sequence_attempts": 48,
             }
         )
+        if "cooperative" in config:
+            config["cooperative"]["output_root"] = str(
+                GET_IMG_ROOT
+                / "AirGroundCoopSuite"
+                / ("_smoke" if smoke else "release")
+                / map_name
+            )
     return config
 
 
@@ -481,14 +422,11 @@ def single_object_plan_is_complete(
     expected_config = build_config("single_object", map_name, map_output, smoke)
     actual_config = manifest.get("config", {})
     plan_keys = (
-        "motion_modes",
-        "target_classes_by_motion_mode",
-        "sequences_by_motion_mode",
-        "frames_by_motion_mode",
-        "frames_by_motion_mode_and_target_class",
+        "motion_mode",
+        "target_classes",
+        "frames_per_sequence",
         "sample_interval_ticks_by_target_class",
-        "fixed_hover_stop_after_absent_frames",
-        "min_frames_by_motion_mode",
+        "rear_upper_follow",
         "max_sequences_per_target_actor",
         "min_target_average_speed_mps",
         "min_target_moving_step_ratio",
@@ -500,7 +438,9 @@ def single_object_plan_is_complete(
     )
     if any(actual_config.get(key) != expected_config.get(key) for key in plan_keys):
         return False
-    expected_sequences = 1 if smoke else SINGLE_SEQUENCES_PER_MAP
+    expected_sequences = (
+        SINGLE_SMOKE_SEQUENCES if smoke else SINGLE_SEQUENCES_PER_MAP
+    )
     sequence_count = sum(
         1 for path in (map_output / "vot").glob("*") if path.is_dir()
     )
@@ -527,6 +467,23 @@ RESUME_CONFIG_IGNORED_KEYS = {
     "weather_assignment_seed",
     "weather_sequence_schedule",
     "_config_path",
+    # These bounded recovery controls can be safely added to an existing
+    # sequence-level checkpoint without invalidating accepted sequences.
+    "max_target_population_refreshes",
+    "min_eligible_target_candidates",
+    "target_population_refresh_batch_size",
+    "max_active_target_actors_by_class",
+    "target_population_refresh_enabled_by_class",
+    "target_population_refresh_warmup_ticks",
+}
+
+RESUME_CONFIG_UPGRADE_KEYS = {
+    "max_target_population_refreshes",
+    "min_eligible_target_candidates",
+    "target_population_refresh_batch_size",
+    "max_active_target_actors_by_class",
+    "target_population_refresh_enabled_by_class",
+    "target_population_refresh_warmup_ticks",
 }
 
 
@@ -578,6 +535,13 @@ def resolve_map_config(
             "sensor_timeout": current["sensor_timeout"],
         }
     )
+    saved.update(
+        {
+            key: current[key]
+            for key in RESUME_CONFIG_UPGRADE_KEYS
+            if key in current
+        }
+    )
     return saved, True
 
 
@@ -609,9 +573,9 @@ def run_collector(
     ]
     if smoke:
         command.extend(
-            ["--max-scenes", "1"]
+            ["--max-scenes", "3"]
             if task == "multicamera"
-            else ["--max-sequences", "1"]
+            else ["--max-sequences", str(SINGLE_SMOKE_SEQUENCES)]
         )
     print("[COLLECT] " + subprocess.list2cmdline(command), flush=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -681,6 +645,19 @@ def collect_map(
     map_output = output_root / map_name
     if config is None:
         config = build_config(task, map_name, map_output, smoke)
+    # This wrapper starts and stops CARLA around the collector process.  Tell
+    # the nested collector to reuse that server without claiming ownership of
+    # its Windows process tree; otherwise both layers try to shut it down and
+    # the CARLA Python extension can terminate with 0xC0000409 after all data
+    # and audits have already been written.
+    simulator_config = dict(config.get("simulator", {}))
+    simulator_config.update(
+        {
+            "auto_start": False,
+            "stop_after_collection": False,
+        }
+    )
+    config["simulator"] = simulator_config
     config_path = output_root / "_configs" / f"{map_name}.json"
     log_path = output_root / "_logs" / f"{map_name}.log"
     write_json(config_path, config)
@@ -771,7 +748,14 @@ def main_for_task(
         RUN_SEED = int(args.run_seed)
         _WEATHER_SCHEDULE_CACHE.clear()
     task_spec = TASKS[task]
-    output_root = Path(str(task_spec["output"]) + ("_smoke" if args.smoke else ""))
+    output_root = (
+        GET_IMG_ROOT
+        / "AirGroundCoopSuite"
+        / "_smoke"
+        / ("derived_task3_mcmot" if task == "multicamera" else "derived_task2_sot")
+        if args.smoke
+        else Path(task_spec["output"])
+    )
     output_root.mkdir(parents=True, exist_ok=True)
     selected = list(args.only or MAPS)
     resolved_configs: Dict[str, Dict[str, Any]] = {}
@@ -833,31 +817,22 @@ def main_for_task(
             for map_name in selected
         },
         "scenes_or_sequences_per_map": (
-            1
+            3
             if args.smoke
             else MULTICAMERA_SCENES_PER_MAP
             if task == "multicamera"
             else SINGLE_SEQUENCES_PER_MAP
         ),
         "samples_per_scene_or_sequence": (
-            2
+            15
             if args.smoke and task == "multicamera"
-            else 3
+            else SINGLE_SMOKE_FRAMES
             if args.smoke
             else MULTICAMERA_FRAMES_PER_SCENE
             if task == "multicamera"
-            else dict(SINGLE_FRAMES_BY_MOTION_MODE)
+            else SINGLE_FRAMES_PER_SEQUENCE
         ),
-        "class_specific_samples_per_sequence": (
-            None
-            if task == "multicamera" or args.smoke
-            else {
-                mode: dict(class_frames)
-                for mode, class_frames in (
-                    SINGLE_FRAMES_BY_MOTION_AND_CLASS.items()
-                )
-            }
-        ),
+        "class_specific_samples_per_sequence": None,
         "sample_interval_ticks": (
             MULTICAMERA_SAMPLE_INTERVAL_TICKS
             if task == "multicamera"
@@ -943,7 +918,7 @@ def main_for_task(
         )
         passed = fresh_audit and audit_passed(task, map_output)
         expected_sequences = (
-            1
+            3
             if args.smoke
             else MULTICAMERA_SCENES_PER_MAP
             if task == "multicamera"

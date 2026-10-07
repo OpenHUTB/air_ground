@@ -2,9 +2,25 @@
   "host": "127.0.0.1",
   "port": 2000,
   "timeout": 30.0,
+  "simulator": {
+    "auto_start": true,
+    "profile": "auto",
+    "standard_executable": "E:/OpenHUTB/中电软件园/hutb_windows_v2.10.0/CarlaUE4.exe",
+    "ccsp_executable": "E:/OpenHUTB/中电软件园/WindowsNoEditor/WindowsNoEditor/CarlaUE4.exe",
+    "ccsp_map_markers": ["ccsp", "zhongdian", "software_park", "中电园", "中电软件园"],
+    "visible": true,
+    "quality_level": "Epic",
+    "startup_timeout_seconds": 360.0,
+    "probe_timeout_seconds": 3.0,
+    "poll_interval_seconds": 2.0,
+    "shutdown_timeout_seconds": 30.0,
+    "stop_after_collection": true,
+    "extra_args": []
+  },
   "tm_port": 8000,
-  "map": null,
-  "out": "E:/pythonProject/air_groud/get_img/dataset_uav_multimap_multicamera_mot_weather500_1",
+  "map": "Town03_Opt",
+  "out": "E:/pythonProject/air_groud/get_img/AirGroundCoopSuite/_smoke/Town03_Opt/task3_agc_mcmot_legacy",
+  "collection_profile": "smoke_review",
   "width": 1920,
   "height": 1080,
   "fov": 60.0,
@@ -14,11 +30,11 @@
   "pedestrian_sample_hz": 5.0,
   "enable_rgb_postprocess": true,
   "num_cameras": 3,
-  "scenes_per_map": 30,
-  "frames_per_scene": 50,
-  "train_frames_per_scene": 50,
-  "eval_frames_per_scene": 50,
-  "empty_camera_patience_frames": 5,
+  "scenes_per_map": 3,
+  "frames_per_scene": 15,
+  "train_frames_per_scene": 15,
+  "eval_frames_per_scene": 15,
+  "empty_camera_patience_frames": 15,
   "empty_camera_stop_count": 2,
   "weather_presets": [
     "ClearNoon",
@@ -123,5 +139,47 @@
   "max_actor_population_attempts": 3,
   "sensor_timeout": 15.0,
   "qa_frames_per_camera": 3,
-  "seed": null
+  "seed": 43,
+  "cooperative": {
+    "enabled": true,
+    "task_id": "task3",
+    "schema_version": "1.0.0",
+    "output_root": "E:/pythonProject/air_groud/get_img/AirGroundCoopSuite/_smoke/Town03_Opt",
+    "route_profile": "multi_object_traversal",
+    "topology": {
+      "air_platform_count": 3,
+      "ground_vehicle_count": 1,
+      "air_platform_type": "air_camera_platform",
+      "air_platform_is_virtual": true,
+      "fixed_for_all_profiles": true
+    },
+    "ground_vehicle": {
+      "platform_id": "vehicle_01",
+      "blueprint_id": "vehicle.tesla.model3",
+      "behavior": "normal",
+      "modalities": ["rgb", "depth", "semantic"],
+      "image_width": 1920,
+      "image_height": 1080,
+      "camera_fov_deg": 90.0,
+      "sensor_tick": 0.0,
+      "camera_mount": {
+        "x_m": 1.5,
+        "y_m": 0.0,
+        "z_m": 2.1,
+        "pitch_deg": -5.0,
+        "yaw_deg": 0.0,
+        "roll_deg": 0.0
+      },
+      "nominal_speed_kmh": 30.0,
+      "speed_jitter_kmh": 2.0,
+      "sensor_timeout": 15.0,
+      "parameter_status": "pilot_provisional"
+    },
+    "smoke_review": {
+      "map": "Town03_Opt",
+      "scenes": 3,
+      "frames_per_scene": 15,
+      "run_automatically": false
+    }
+  }
 }

@@ -81,7 +81,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -134,6 +134,17 @@ except ImportError as exc:
         "例如：\n"
         "set PYTHONPATH=%PYTHONPATH%;E:\\OpenHUTB\\hutb\\PythonAPI\\carla\\dist\\carla-xxx.egg\n"
     ) from exc
+
+COLLECT_ROOT = Path(__file__).resolve().parent.parent
+if str(COLLECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(COLLECT_ROOT))
+
+from cooperative_perception import (
+    CooperativeManager,
+    close_simulator,
+    ensure_simulator,
+)
+from cooperative_perception.cooperative_annotation import enrich_observations
 
 
 # ============================================================
@@ -283,8 +294,11 @@ def capture_synchronized_sensor_frame(
     sync: Dict[str, SensorSync],
     sensor_timeout: float,
     enable_lidar: bool,
+    before_tick=None,
 ) -> Tuple[int, carla.Image, carla.Image, carla.Image, carla.Image, Any]:
     """Tick once and return one strictly synchronized multimodal bundle."""
+    if before_tick is not None:
+        before_tick()
     carla_frame = world.tick()
     rgb_img = sync["rgb"].get(carla_frame, timeout=sensor_timeout)
     depth_img = sync["depth"].get(carla_frame, timeout=sensor_timeout)
@@ -468,6 +482,7 @@ def parse_args() -> argparse.Namespace:
     # 地图和输出
     parser.add_argument("--map", type=str, default=None)
     parser.add_argument("--out", type=str, default="dataset_uav_small_carla_1920_no_tiny_occ50")
+    parser.add_argument("--cooperative-output-root", type=str, default=None)
     parser.add_argument("--sequences", type=int, default=1)
     parser.add_argument("--frames", type=int, default=50)
 
@@ -2443,6 +2458,7 @@ def fast_projected_target_precheck(
     min_vehicles_per_frame: int,
     min_pedestrians_per_frame: int,
     min_targets_per_frame: int,
+    excluded_actor_ids: Iterable[int] = (),
 ) -> Dict[str, Any]:
     """快速排除从几何投影上就不可能满足硬标准的相机位姿。
 
@@ -2469,8 +2485,11 @@ def fast_projected_target_precheck(
 
     actors = list(world.get_actors().filter("vehicle.*"))
     actors.extend(list(world.get_actors().filter("walker.pedestrian.*")))
+    excluded = {int(actor_id) for actor_id in excluded_actor_ids}
     for actor in actors:
         if actor is None or not actor.is_alive:
+            continue
+        if int(actor.id) in excluded:
             continue
         target = target_for_actor(actor, targets)
         if target is None:
@@ -2547,7 +2566,8 @@ def build_annotations_from_actors(
     min_vehicle_projected_fill_ratio: float,
     min_pedestrian_projected_fill_ratio: float,
     actor_depth_margin: float,
-    actor_visibility_mode: str
+    actor_visibility_mode: str,
+    excluded_actor_ids: Iterable[int] = (),
 ) -> List[Dict[str, Any]]:
     """
     使用 OpenHUTB/CARLA actor 坐标接口生成车辆/行人 bbox。
@@ -2563,8 +2583,11 @@ def build_annotations_from_actors(
 
     actors = list(world.get_actors().filter("vehicle.*"))
     actors.extend(list(world.get_actors().filter("walker.pedestrian.*")))
+    excluded = {int(actor_id) for actor_id in excluded_actor_ids}
 
     for actor in actors:
+        if int(actor.id) in excluded:
+            continue
         target = target_for_actor(actor, targets)
         if target is None:
             continue
@@ -4826,10 +4849,288 @@ def write_dataset_standard_artifacts(
 # 9. 主程序
 # ============================================================
 
+def select_cooperative_focus_actor(
+    actors: Iterable[Any],
+    targets: List[TargetClass],
+    seed: int,
+) -> Optional[Any]:
+    """Choose a deterministic live traffic actor for joint Air/Ground views."""
+    live = []
+    for actor in actors:
+        try:
+            if actor is not None and actor.is_alive and target_for_actor(actor, targets):
+                live.append(actor)
+        except RuntimeError:
+            continue
+    if not live:
+        return None
+    pedestrians = [
+        actor for actor in live
+        if str(getattr(actor, "type_id", "")).startswith("walker.pedestrian.")
+    ]
+    vehicles = [
+        actor for actor in live
+        if str(getattr(actor, "type_id", "")).startswith("vehicle.")
+    ]
+    # The collector's strictest legacy view gate requires both a pedestrian
+    # and a vehicle.  Follow the vehicle nearest to a pedestrian: the Ground
+    # Vehicle can keep that traffic actor ahead over a sequence, while the UAV
+    # view centered on it can also satisfy the pedestrian gate.
+    if pedestrians and vehicles:
+        rng = random.Random(int(seed) + 470_017)
+        scored_vehicles = []
+        for vehicle in vehicles:
+            vehicle_location = vehicle.get_location()
+            nearest_pedestrian_m = min(
+                vehicle_location.distance(pedestrian.get_location())
+                for pedestrian in pedestrians
+            )
+            scored_vehicles.append(
+                (nearest_pedestrian_m, rng.random(), int(vehicle.id), vehicle)
+            )
+        return min(scored_vehicles, key=lambda item: item[:3])[3]
+    pool = pedestrians or vehicles or live
+    pool.sort(key=lambda actor: int(actor.id))
+    return random.Random(int(seed) + 470_017).choice(pool)
+
+
+def cooperative_min_shared_targets(cooperative: CooperativeManager) -> int:
+    quality = dict(cooperative.config.get("quality", {}))
+    return max(1, int(quality.get("min_shared_targets_per_frame", 1)))
+
+
+def select_ground_guided_uav_focus(
+    world: carla.World,
+    ground_annotations: Iterable[Dict[str, Any]],
+) -> Optional[Any]:
+    """Choose the largest currently Ground-visible target as UAV focus."""
+    visible = sorted(
+        ground_annotations,
+        key=lambda item: float(item.get("area_px", 0.0)),
+        reverse=True,
+    )
+    for annotation in visible:
+        actor = world.get_actor(int(annotation["carla_actor_id"]))
+        if actor is None:
+            continue
+        try:
+            if actor.is_alive:
+                return actor
+        except RuntimeError:
+            continue
+    return None
+
+
+def shared_annotation_actor_ids(
+    air_annotations: Iterable[Dict[str, Any]],
+    ground_annotations: Iterable[Dict[str, Any]],
+) -> List[int]:
+    air_ids = {int(item["carla_actor_id"]) for item in air_annotations}
+    ground_ids = {int(item["carla_actor_id"]) for item in ground_annotations}
+    return sorted(air_ids & ground_ids)
+
+
+def build_cooperative_ground_annotations(
+    cooperative: CooperativeManager,
+    world: carla.World,
+    args: argparse.Namespace,
+    ground_raw: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Build Ground annotations while explicitly excluding the ego vehicle."""
+    ground_rgb_data = ground_raw["vehicle_01_rgb"]
+    ground_depth_m = decode_carla_depth_meters(ground_raw["vehicle_01_depth"])
+    ground_semantic_id = decode_semantic_segmentation(
+        ground_raw["vehicle_01_semantic"]
+    )
+    ground_cfg = cooperative.config["ground_vehicle"]
+    ego_actor_id = int(cooperative.ground_vehicle.vehicle.id)
+    return build_annotations_from_actors(
+        world=world,
+        camera_transform=ground_rgb_data.transform,
+        depth_m=ground_depth_m,
+        semantic_id=ground_semantic_id,
+        targets=args.target,
+        width=int(ground_cfg["image_width"]),
+        height=int(ground_cfg["image_height"]),
+        fov=float(ground_cfg["camera_fov_deg"]),
+        min_mask_px=args.min_mask_px,
+        small_area_ratio=args.small_area_ratio,
+        small_max_side_px=args.small_max_side_px,
+        keep_all=True,
+        min_actor_visible_px=args.min_actor_visible_px,
+        min_actor_visible_ratio=args.min_actor_visible_ratio,
+        min_vehicle_projected_fill_ratio=args.min_vehicle_projected_fill_ratio,
+        min_pedestrian_projected_fill_ratio=args.min_pedestrian_projected_fill_ratio,
+        actor_depth_margin=args.actor_depth_margin,
+        actor_visibility_mode=args.actor_visibility_mode,
+        excluded_actor_ids=(ego_actor_id,),
+    )
+
+
+def save_cooperative_task1_frame(
+    cooperative: CooperativeManager,
+    world: carla.World,
+    args: argparse.Namespace,
+    frame_i: int,
+    carla_frame: int,
+    air_annotations: List[Dict[str, Any]],
+    air_paths: Dict[str, Path],
+    air_raw: Dict[str, Any],
+    ground_raw: Dict[str, Any],
+    ground_annotations: List[Dict[str, Any]],
+    weather_name: str,
+) -> None:
+    """Persist one symmetric Air/Ground five-modality Task-1 sample."""
+    staging = cooperative.writer.current_path
+    if staging is None or cooperative.object_registry is None:
+        raise RuntimeError("cooperative Task-1 transaction is not active")
+    ego_actor_id = int(cooperative.ground_vehicle.vehicle.id)
+    if any(
+        int(annotation["carla_actor_id"]) == ego_actor_id
+        for annotation in ground_annotations
+    ):
+        raise RuntimeError("Ground annotation contains the ego vehicle")
+    shared_actor_ids = shared_annotation_actor_ids(
+        air_annotations,
+        ground_annotations,
+    )
+    required_shared = cooperative_min_shared_targets(cooperative)
+    if len(shared_actor_ids) < required_shared:
+        raise RuntimeError(
+            "cooperative frame has no jointly visible target: shared=%s required=%d"
+            % (shared_actor_ids, required_shared)
+        )
+    stem = f"{frame_i:06d}"
+    ground_rgb_data = ground_raw["vehicle_01_rgb"]
+    ground_depth_data = ground_raw["vehicle_01_depth"]
+    ground_semantic_data = ground_raw["vehicle_01_semantic"]
+    ground_lidar_data = ground_raw["vehicle_01_lidar"]
+    ground_depth_m = decode_carla_depth_meters(ground_depth_data)
+    ground_semantic_id = decode_semantic_segmentation(ground_semantic_data)
+    ground_cfg = cooperative.config["ground_vehicle"]
+    ground_root = staging / "platforms/ground/vehicle_01"
+    ground_rgb_path = ground_root / "rgb" / f"{stem}.png"
+    ground_depth_path = ground_root / "depth_m" / f"{stem}.npy"
+    ground_depth_vis = ground_root / "depth_vis" / f"{stem}.png"
+    ground_depth_color = ground_root / "depth_color" / f"{stem}.png"
+    ground_normal_path = ground_root / "normal" / f"{stem}.npy"
+    ground_normal_png = ground_root / "normal" / f"{stem}.png"
+    ground_semantic_path = ground_root / "semantic" / f"{stem}.png"
+    ground_lidar_points = ground_root / "lidar" / f"{stem}.npy"
+    ground_lidar_projected = ground_root / "lidar_projected" / f"{stem}.npy"
+    ground_lidar_vis = ground_root / "lidar_projected" / f"{stem}.png"
+    ground_lidar_color = ground_root / "lidar_projected" / f"{stem}_color.png"
+    for path in (
+        ground_rgb_path,
+        ground_depth_path,
+        ground_depth_vis,
+        ground_depth_color,
+        ground_normal_path,
+        ground_normal_png,
+        ground_semantic_path,
+        ground_lidar_points,
+        ground_lidar_projected,
+        ground_lidar_vis,
+        ground_lidar_color,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    save_rgb(
+        ground_rgb_data,
+        ground_rgb_path,
+        weather_name=weather_name,
+        depth_m=ground_depth_m,
+        random_seed=int(args.seed) * 100_003 + frame_i,
+    )
+    save_depth(
+        ground_depth_m,
+        ground_depth_path,
+        ground_depth_vis,
+        ground_depth_color,
+        args.max_depth_vis,
+    )
+    save_surface_normal(
+        ground_depth_m,
+        ground_normal_path,
+        ground_normal_png,
+        float(ground_cfg["camera_fov_deg"]),
+        args.normal_max_depth_jump_m,
+    )
+    save_semantic_id(ground_semantic_id, ground_semantic_path)
+    lidar_cfg = ground_cfg["lidar"]
+    save_lidar_depth(
+        lidar_data=ground_lidar_data,
+        camera_data=ground_depth_data,
+        points_path=ground_lidar_points,
+        projected_npy_path=ground_lidar_projected,
+        projected_vis_path=ground_lidar_vis,
+        projected_color_path=ground_lidar_color,
+        width=int(ground_cfg["image_width"]),
+        height=int(ground_cfg["image_height"]),
+        fov_degrees=float(ground_cfg["camera_fov_deg"]),
+        max_range_m=float(lidar_cfg["range_m"]),
+        max_depth_vis_m=float(args.max_depth_vis),
+    )
+    air_observations = enrich_observations(
+        air_annotations,
+        cooperative.object_registry,
+        "uav_01_rgb",
+    )
+    ground_observations = enrich_observations(
+        ground_annotations,
+        cooperative.object_registry,
+        "vehicle_01_rgb",
+    )
+    for modality, source in air_paths.items():
+        cooperative.writer.copy_file(
+            source,
+            f"platforms/air/uav_01/{modality}/{source.name}",
+        )
+    air_semantic_path = (
+        staging / "platforms/air/uav_01/semantic" / f"{stem}.png"
+    )
+    air_semantic_path.parent.mkdir(parents=True, exist_ok=True)
+    save_semantic_id(
+        decode_semantic_segmentation(air_raw["semantic"]),
+        air_semantic_path,
+    )
+    snapshot = world.get_snapshot()
+    air_sensor_data = {
+        "uav_01_rgb": air_raw["rgb"],
+        "uav_01_depth": air_raw["depth"],
+        "uav_01_normal": air_raw["depth"],
+        "uav_01_semantic": air_raw["semantic"],
+        "uav_01_lidar": air_raw["lidar"],
+    }
+    ground_sensor_data = dict(ground_raw)
+    all_sensor_data = dict(air_sensor_data)
+    all_sensor_data.update(ground_sensor_data)
+    cooperative.record_frame(
+        carla_frame,
+        float(ground_rgb_data.timestamp),
+        float(snapshot.timestamp.elapsed_seconds),
+        {
+            "uav_01_rgb": air_observations,
+            "vehicle_01_rgb": ground_observations,
+        },
+        all_sensor_data,
+        ground_sensor_data,
+    )
+
 def main() -> None:
     global PNG_COMPRESSION_LEVEL
     args = parse_args()
     PNG_COMPRESSION_LEVEL = int(args.png_compression_level)
+    source_config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    cooperative_config = dict(source_config.get("cooperative", {}))
+    if args.cooperative_output_root:
+        cooperative_config["output_root"] = str(args.cooperative_output_root)
+    if bool(cooperative_config.get("enabled", False)) and not args.enable_lidar:
+        raise ValueError("Task 1 要求 Air 与 Ground 都必须同步采集 LiDAR")
+    if bool(cooperative_config.get("enabled", False)) and args.collect_all_weather_presets:
+        raise ValueError(
+            "协同采集不允许同一样本跨 Tick 循环天气；"
+            "请使用每 frame 唯一天气以保证十种必选数据同帧。"
+        )
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -4989,6 +5290,13 @@ def main() -> None:
             f"max_per_grid={args.max_frames_per_camera_grid or 'unlimited'}"
         )
 
+    simulator_session = ensure_simulator(
+        carla,
+        args.host,
+        args.port,
+        args.map,
+        dict(source_config.get("simulator", {})),
+    )
     client = carla.Client(args.host, args.port)
     client.set_timeout(args.timeout)
 
@@ -5006,6 +5314,14 @@ def main() -> None:
     walker_controllers: List[carla.Actor] = []
     sensors: Dict[str, carla.Sensor] = {}
     hidden_static_vehicle_ids: List[int] = []
+    cooperative = CooperativeManager(
+        client,
+        world,
+        carla,
+        Path(cooperative_config["output_root"]),
+        "task1",
+        cooperative_config,
+    )
 
     try:
         # ------------------------------------------------------------
@@ -5406,6 +5722,46 @@ def main() -> None:
         for job in collection_jobs:
             seq_idx = int(job["sequence_index"])
             seq_name = f"seq_{seq_idx:04d}"
+            scene_seed = int(args.seed) + seq_idx * 100_003
+            formal_scene_id = "%s_%s" % (
+                str(world.get_map().name).replace("/", "_").replace("\\", "_"),
+                seq_name,
+            )
+            scene_actors = (
+                list(vehicle_actors)
+                + list(walker_actors)
+                + list(target_actors)
+            )
+            cooperative_focus_actor = select_cooperative_focus_actor(
+                scene_actors,
+                args.target,
+                scene_seed,
+            )
+            if cooperative_focus_actor is None:
+                raise RuntimeError(
+                    "%s has no live vehicle/pedestrian for cooperative focus"
+                    % seq_name
+                )
+            cooperative.prepare_scene(
+                formal_scene_id,
+                scene_seed,
+                "target_interaction",
+                actors=scene_actors,
+                target_actor=cooperative_focus_actor,
+            )
+            cooperative.register_air_platform(
+                "uav_01",
+                virtual=False,
+                platform_type="uav",
+                sensors={
+                    "rgb": sensors["rgb"],
+                    "depth": sensors["depth"],
+                    "normal": sensors["depth"],
+                    "semantic": sensors["semantic"],
+                    "lidar": sensors["lidar"],
+                },
+                required_modalities=("rgb", "depth", "normal", "semantic", "lidar"),
+            )
             seq_dir = Path(job["sequence_root"]) / seq_name
             dirs = make_dirs(seq_dir)
             weather_candidates = [
@@ -5435,7 +5791,11 @@ def main() -> None:
                 args.radius_min,
                 args.radius_max
             )
-            if args.road_centered_camera:
+            if cooperative_focus_actor is not None:
+                focus_location = cooperative_focus_actor.get_location()
+                base_center_x = float(focus_location.x)
+                base_center_y = float(focus_location.y)
+            elif args.road_centered_camera:
                 base_center_x, base_center_y = random_road_center(world.get_map())
             else:
                 base_center_x, base_center_y = args.center_x, args.center_y
@@ -5470,6 +5830,13 @@ def main() -> None:
                 "weather_warmup_frames": args.weather_warmup_frames,
                 "route": args.route,
                 "center_xy": [base_center_x, base_center_y],
+                "cooperative_focus_actor_id": int(cooperative_focus_actor.id),
+                "cooperative_focus_actor_type": str(
+                    cooperative_focus_actor.type_id
+                ),
+                "minimum_shared_targets_per_frame": (
+                    cooperative_min_shared_targets(cooperative)
+                ),
                 "road_centered_camera": args.road_centered_camera,
                 "camera_origin_over_road": args.camera_origin_over_road,
                 "camera_roi": {
@@ -5612,6 +5979,7 @@ def main() -> None:
                                 and args.weather_warmup_frames > 0
                             ):
                                 for _ in range(args.weather_warmup_frames):
+                                    cooperative.before_world_tick()
                                     world.tick()
                                 for sensor_sync in sync.values():
                                     sensor_sync.drain()
@@ -5626,10 +5994,42 @@ def main() -> None:
                     accepted_semantic_sensor_id: Optional[np.ndarray] = None
                     accepted_target_semantic_id: Optional[np.ndarray] = None
                     accepted_target_instances: Optional[List[Dict[str, Any]]] = None
+                    accepted_ground_annotations: Optional[
+                        List[Dict[str, Any]]
+                    ] = None
+                    accepted_shared_actor_ids: Optional[List[int]] = None
                     expensive_pose_tries = 0
+                    ground_raw: Optional[Dict[str, Any]] = None
+                    joint_view_focus_actor = cooperative_focus_actor
 
                     for pose_try in range(max(1, args.max_camera_pose_retries)):
-                        if args.route == "orbit" and pose_try == 0:
+                        try:
+                            focus_is_alive = bool(joint_view_focus_actor.is_alive)
+                        except RuntimeError:
+                            focus_is_alive = False
+                        if focus_is_alive:
+                            # Start from the route focus, then follow a target
+                            # currently visible from the Ground camera.
+                            transform = random_pedestrian_centered_road_uav_transform(
+                                carla_map=world.get_map(),
+                                pedestrian_actors=[joint_view_focus_actor],
+                                height_min=max(
+                                    args.height_min,
+                                    args.safe_camera_min_z,
+                                ),
+                                height_max=max(
+                                    args.height_max,
+                                    args.safe_camera_min_z,
+                                ),
+                                radius_min=args.radius_min,
+                                radius_max=args.radius_max,
+                                pitch_min=args.pitch_min,
+                                pitch_max=args.pitch_max,
+                                roi_center_x=0.0,
+                                roi_center_y=0.0,
+                                roi_radius_m=0.0,
+                            )
+                        elif args.route == "orbit" and pose_try == 0:
                             theta = orbit_phase + math.radians(args.orbit_degrees_per_sequence) * frame_i / max(args.frames, 1)
                             transform = uav_orbit_transform(
                                 center_x=base_center_x,
@@ -5787,11 +6187,17 @@ def main() -> None:
                                 min_pedestrian_visible_equivalent_side_px=(
                                     args.min_pedestrian_visible_equivalent_side_px
                                 ),
-                                min_vehicles_per_frame=args.min_vehicles_per_frame,
-                                min_pedestrians_per_frame=(
-                                    args.min_pedestrians_per_frame
+                                # Joint visibility is the per-frame contract.
+                                # Per-class quotas are a dataset-level concern.
+                                min_vehicles_per_frame=0,
+                                min_pedestrians_per_frame=0,
+                                min_targets_per_frame=max(
+                                    1,
+                                    args.min_targets_per_frame,
                                 ),
-                                min_targets_per_frame=args.min_targets_per_frame,
+                                excluded_actor_ids=(
+                                    int(cooperative.ground_vehicle.vehicle.id),
+                                ),
                             )
                             if not bool(precheck_stats["passes"]):
                                 last_bad_view_stats = precheck_stats
@@ -5840,6 +6246,7 @@ def main() -> None:
 
                         # 只有进入新的流送区域才完整预热；锚点范围内仅刷新一帧。
                         for _ in range(streaming_ticks):
+                            cooperative.before_world_tick()
                             world.tick()
                         for sensor_sync in sync.values():
                             sensor_sync.drain()
@@ -5856,7 +6263,9 @@ def main() -> None:
                                 sync=sync,
                                 sensor_timeout=args.sensor_timeout,
                                 enable_lidar=args.enable_lidar,
+                                before_tick=cooperative.before_world_tick,
                             )
+                            ground_raw = cooperative.collect_ground(carla_frame)
 
                             depth_m = decode_carla_depth_meters(depth_img)
                             candidate_semantic_sensor_id = (
@@ -5896,6 +6305,7 @@ def main() -> None:
                                 for _ in range(
                                     args.streaming_readiness_step_frames
                                 ):
+                                    cooperative.before_world_tick()
                                     world.tick()
                                 for sensor_sync in sync.values():
                                     sensor_sync.drain()
@@ -5911,7 +6321,9 @@ def main() -> None:
                                     sync=sync,
                                     sensor_timeout=args.sensor_timeout,
                                     enable_lidar=args.enable_lidar,
+                                    before_tick=cooperative.before_world_tick,
                                 )
+                                ground_raw = cooperative.collect_ground(carla_frame)
                                 depth_m = decode_carla_depth_meters(depth_img)
                                 candidate_semantic_sensor_id = (
                                     decode_semantic_segmentation(semantic_img)
@@ -6019,7 +6431,10 @@ def main() -> None:
                                 args.min_pedestrian_projected_fill_ratio
                             ),
                             actor_depth_margin=args.actor_depth_margin,
-                            actor_visibility_mode=args.actor_visibility_mode
+                            actor_visibility_mode=args.actor_visibility_mode,
+                            excluded_actor_ids=(
+                                int(cooperative.ground_vehicle.vehicle.id),
+                            ),
                         )
                         boundary_margin = args.annotation_boundary_margin_px
                         filtered_boundary_annotation_count = sum(
@@ -6122,6 +6537,35 @@ def main() -> None:
                                     args.min_largest_component_ratio
                                 ),
                             )
+                        if ground_raw is None:
+                            raise RuntimeError(
+                                "Ground sensor bundle is missing before joint-view gate"
+                            )
+                        candidate_ground_annotations = (
+                            build_cooperative_ground_annotations(
+                                cooperative,
+                                world,
+                                args,
+                                ground_raw,
+                            )
+                        )
+                        candidate_shared_actor_ids = shared_annotation_actor_ids(
+                            candidate_annotations,
+                            candidate_ground_annotations,
+                        )
+                        if (
+                            not candidate_shared_actor_ids
+                            and candidate_ground_annotations
+                        ):
+                            guided_focus = select_ground_guided_uav_focus(
+                                world,
+                                candidate_ground_annotations,
+                            )
+                            if guided_focus is not None:
+                                joint_view_focus_actor = guided_focus
+                        required_shared_targets = (
+                            cooperative_min_shared_targets(cooperative)
+                        )
                         target_vehicle_count = sum(
                             bool(instance["trainable"])
                             and int(instance["mask_id"])
@@ -6149,6 +6593,18 @@ def main() -> None:
                                 and instance["carla_actor_id"] is None
                                 for instance in candidate_target_instances
                             )
+                        )
+                        bad_view_stats["ground_annotation_count"] = len(
+                            candidate_ground_annotations
+                        )
+                        bad_view_stats["shared_target_actor_ids"] = list(
+                            candidate_shared_actor_ids
+                        )
+                        bad_view_stats["shared_target_count"] = len(
+                            candidate_shared_actor_ids
+                        )
+                        bad_view_stats["required_shared_target_count"] = int(
+                            required_shared_targets
                         )
                         equivalent_sides = [
                             math.sqrt(
@@ -6266,21 +6722,17 @@ def main() -> None:
                             or not road_validation_passed
                             or tiny_target_count > 0
                             or undersized_pedestrian_count > 0
-                            or len(pedestrian_equivalent_sides)
-                            < args.min_pedestrians_per_frame
-                            or target_vehicle_count
-                            < args.min_vehicles_per_frame
-                            or target_pedestrian_count
-                            < args.min_pedestrians_per_frame
                             or (
                                 target_vehicle_count
                                 + target_pedestrian_count
-                                < args.min_targets_per_frame
+                                < max(1, args.min_targets_per_frame)
                             )
                             or (
                                 args.reject_boundary_annotations
                                 and boundary_annotation_count > 0
                             )
+                            or len(candidate_shared_actor_ids)
+                            < required_shared_targets
                         )
                         last_bad_view_stats = bad_view_stats
                         candidate_stats = dict(bad_view_stats)
@@ -6309,6 +6761,12 @@ def main() -> None:
                             accepted_target_instances = (
                                 candidate_target_instances
                             )
+                            accepted_ground_annotations = (
+                                candidate_ground_annotations
+                            )
+                            accepted_shared_actor_ids = list(
+                                candidate_shared_actor_ids
+                            )
                             accepted_view = True
                             break
 
@@ -6334,6 +6792,8 @@ def main() -> None:
                         or accepted_semantic_sensor_id is None
                         or accepted_target_semantic_id is None
                         or accepted_target_instances is None
+                        or accepted_ground_annotations is None
+                        or accepted_shared_actor_ids is None
                     ):
                         raise RuntimeError(
                             f"frame {frame_i} 已接受位姿但缺少同步标注或语义图"
@@ -6342,6 +6802,8 @@ def main() -> None:
                     semantic_sensor_id = accepted_semantic_sensor_id
                     target_semantic_id = accepted_target_semantic_id
                     target_semantic_instances = accepted_target_instances
+                    ground_annotations = accepted_ground_annotations
+                    shared_actor_ids = accepted_shared_actor_ids
 
                     # ------------------------------------------------
                     # 文件路径
@@ -6389,11 +6851,13 @@ def main() -> None:
                                 applied_weather = apply_weather(world, weather_variant)
                                 if args.weather_warmup_frames > 0:
                                     for _ in range(args.weather_warmup_frames):
+                                        cooperative.before_world_tick()
                                         world.tick()
                                     for sensor_sync in sync.values():
                                         sensor_sync.drain()
 
                                 restore_frozen_actor_transforms(frozen_snapshots)
+                                cooperative.before_world_tick()
                                 rgb_carla_frame = world.tick()
                                 weather_rgb_img = sync["rgb"].get(
                                     rgb_carla_frame,
@@ -6509,6 +6973,34 @@ def main() -> None:
                         width=args.width,
                         height=args.height_img
                     )
+                    if ground_raw is None or lidar_data is None:
+                        raise RuntimeError(
+                            f"frame {frame_i} 缺少同帧 Air/Ground 必选数据"
+                        )
+                    save_cooperative_task1_frame(
+                        cooperative=cooperative,
+                        world=world,
+                        args=args,
+                        frame_i=frame_i,
+                        carla_frame=int(carla_frame),
+                        air_annotations=anns,
+                        air_paths={
+                            "rgb": rgb_path,
+                            "depth_m": depth_npy_path,
+                            "normal": surface_normal_npy_path,
+                            "normal_preview": surface_normal_path,
+                            "lidar": lidar_points_path,
+                        },
+                        air_raw={
+                            "rgb": rgb_img,
+                            "depth": depth_img,
+                            "semantic": semantic_img,
+                            "lidar": lidar_data,
+                        },
+                        ground_raw=ground_raw,
+                        ground_annotations=ground_annotations,
+                        weather_name=canonical_weather,
+                    )
 
                     # ------------------------------------------------
                     # JSON 标注
@@ -6571,6 +7063,11 @@ def main() -> None:
                                 "filled_largest_external_instance_contour"
                             ),
                             "instances": target_semantic_instances,
+                        },
+                        "cooperative": {
+                            "focus_actor_id": int(cooperative_focus_actor.id),
+                            "shared_target_actor_ids": list(shared_actor_ids),
+                            "shared_target_count": len(shared_actor_ids),
                         },
                         "annotations": anns
                     }
@@ -6714,6 +7211,24 @@ def main() -> None:
                     json.dumps(seq_meta, ensure_ascii=False, indent=2),
                     encoding="utf-8"
                 )
+                if not sot_candidates:
+                    raise RuntimeError(f"{seq_name} 没有通过帧屏障的正式样本")
+                cooperative.commit_scene(
+                    {
+                        "frames": len(sot_candidates),
+                        "derived_formats": ["COCO", "YOLO"],
+                        "required_modalities": [
+                            "rgb",
+                            "depth_m",
+                            "normal",
+                            "semantic",
+                            "lidar",
+                        ],
+                        "depth_encoding": "float32_npy",
+                        "depth_unit": "meter",
+                        "parameter_status": "pilot_provisional",
+                    }
+                )
 
         # ------------------------------------------------------------
         # 写总 manifest
@@ -6778,6 +7293,7 @@ def main() -> None:
         # 清理
         # ------------------------------------------------------------
         print("[CLEANUP] Destroying sensors and restoring settings ...")
+        cooperative.close()
 
         for sensor in sensors.values():
             try:
@@ -6831,6 +7347,7 @@ def main() -> None:
             pass
 
         print("[CLEANUP] Finished.")
+        close_simulator(simulator_session)
 
 
 if __name__ == "__main__":

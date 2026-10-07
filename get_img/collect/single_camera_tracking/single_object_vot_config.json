@@ -3,63 +3,55 @@
   "port": 2000,
   "tm_port": 8000,
   "timeout": 30.0,
-  "map": null,
-  "out": "E:/pythonProject/air_groud/get_img/dataset_uav_multimap_single_object_vot_weather500",
+  "simulator": {
+    "auto_start": true,
+    "profile": "auto",
+    "standard_executable": "E:/OpenHUTB/中电软件园/hutb_windows_v2.10.0/CarlaUE4.exe",
+    "ccsp_executable": "E:/OpenHUTB/中电软件园/WindowsNoEditor/WindowsNoEditor/CarlaUE4.exe",
+    "ccsp_map_markers": ["ccsp", "zhongdian", "software_park", "中电园", "中电软件园"],
+    "visible": true,
+    "quality_level": "Epic",
+    "startup_timeout_seconds": 360.0,
+    "probe_timeout_seconds": 3.0,
+    "poll_interval_seconds": 2.0,
+    "shutdown_timeout_seconds": 30.0,
+    "stop_after_collection": true,
+    "extra_args": []
+  },
+  "map": "Town03_Opt",
+  "out": "E:/pythonProject/air_groud/get_img/AirGroundCoopSuite/_smoke/Town03_Opt/task2_agc_sot_legacy",
+  "collection_profile": "smoke_review",
   "width": 1920,
   "height": 1080,
   "fov": 55.0,
   "fps": 20.0,
   "sensor_tick": 0.0,
-  "sample_interval_ticks": 2,
+  "sample_interval_ticks": 4,
   "sample_interval_ticks_by_target_class": {
     "vehicle": 2,
     "pedestrian": 6
   },
   "enable_rgb_postprocess": true,
-  "sequences_per_map": 54,
-  "motion_modes": [
-    "fixed_hover",
-    "lagged_follow",
-    "lateral_orbit"
-  ],
-  "target_classes_by_motion_mode": {
-    "fixed_hover": [
-      "vehicle",
-      "pedestrian"
-    ],
-    "lagged_follow": [
-      "vehicle",
-      "pedestrian"
-    ],
-    "lateral_orbit": [
-      "vehicle",
-      "pedestrian"
-    ]
-  },
+  "sequences_per_map": 3,
+  "motion_mode": "rear_upper_follow",
+  "target_classes": ["vehicle", "pedestrian"],
   "max_sequences_per_target_actor": 2,
-  "sequences_by_motion_mode": {
-    "fixed_hover": 18,
-    "lagged_follow": 18,
-    "lateral_orbit": 18
+  "max_target_population_refreshes": 2,
+  "min_eligible_target_candidates": 2,
+  "target_population_refresh_batch_size": {
+    "vehicle": 6,
+    "pedestrian": 8
   },
-  "frames_by_motion_mode": {
-    "fixed_hover": 80,
-    "lagged_follow": 120,
-    "lateral_orbit": 150
+  "max_active_target_actors_by_class": {
+    "vehicle": 32,
+    "pedestrian": 48
   },
-  "frames_by_motion_mode_and_target_class": {
-    "lagged_follow": {
-      "pedestrian": 80
-    },
-    "lateral_orbit": {
-      "pedestrian": 100
-    }
+  "target_population_refresh_enabled_by_class": {
+    "vehicle": true,
+    "pedestrian": true
   },
-  "min_frames_by_motion_mode": {
-    "fixed_hover": 30
-  },
-  "fixed_hover_stop_after_absent_frames": 5,
-  "frames_per_sequence": 120,
+  "target_population_refresh_warmup_ticks": 20,
+  "frames_per_sequence": 15,
   "weather_presets": [
     "ClearNoon",
     "ClearSunset",
@@ -98,20 +90,18 @@
   "max_near_depth_ratio": 0.02,
   "max_absent_ratio_per_sequence": 0.4,
   "max_consecutive_absent_frames": 40,
-  "max_absent_ratio_by_motion_mode": {
-    "fixed_hover": 0.25,
-    "lagged_follow": 0.4,
-    "lateral_orbit": 0.4
+  "rear_upper_follow": {
+    "back_distance_m": 32.0,
+    "height_above_target_m": 28.0,
+    "position_response_time_s": 1.2,
+    "rotation_response_time_s": 0.8,
+    "max_position_speed_mps": 18.0,
+    "max_yaw_rate_deg_s": 55.0,
+    "max_pitch_rate_deg_s": 35.0,
+    "camera_pitch_min_deg": -65.0,
+    "camera_pitch_max_deg": -20.0,
+    "status": "pilot_provisional"
   },
-  "max_consecutive_absent_frames_by_motion_mode": {
-    "fixed_hover": 5,
-    "lagged_follow": 40,
-    "lateral_orbit": 40
-  },
-  "lagged_follow_position_alpha": 0.28,
-  "lagged_follow_rotation_alpha": 0.22,
-  "orbit_rotation_alpha": 0.3,
-  "orbit_sweep_degrees": 120.0,
   "min_target_average_speed_mps": {
     "vehicle": 0.5,
     "pedestrian": 0.2
@@ -127,5 +117,54 @@
   "max_sequence_attempts": 48,
   "warmup_frames": 20,
   "sensor_timeout": 15.0,
-  "seed": 31
+  "seed": 31,
+  "cooperative": {
+    "enabled": true,
+    "task_id": "task2",
+    "schema_version": "1.0.0",
+    "output_root": "E:/pythonProject/air_groud/get_img/AirGroundCoopSuite/_smoke/Town03_Opt",
+    "topology": {
+      "air_platform_count": 1,
+      "ground_vehicle_count": 1,
+      "air_platform_type": "uav",
+      "air_platform_is_virtual": false
+    },
+    "route_profile": "target_interaction",
+    "threshold_status": "pilot_provisional",
+    "ground_vehicle": {
+      "platform_id": "vehicle_01",
+      "blueprint_id": "vehicle.tesla.model3",
+      "behavior": "normal",
+      "modalities": ["rgb", "depth", "semantic"],
+      "image_width": 1920,
+      "image_height": 1080,
+      "camera_fov_deg": 90.0,
+      "sensor_tick": 0.0,
+      "camera_mount": {
+        "x_m": 1.5,
+        "y_m": 0.0,
+        "z_m": 2.1,
+        "pitch_deg": -5.0,
+        "yaw_deg": 0.0,
+        "roll_deg": 0.0
+      },
+      "nominal_speed_kmh": 18.0,
+      "speed_jitter_kmh": 2.0,
+      "sensor_timeout": 15.0,
+      "parameter_status": "pilot_provisional"
+    },
+    "visibility_thresholds": {
+      "joint_visible_ratio": null,
+      "uav_dominant_ratio": null,
+      "vehicle_dominant_ratio": null,
+      "max_consecutive_missing_frames": null,
+      "status": "pilot_provisional"
+    },
+    "smoke_review": {
+      "map": "Town03_Opt",
+      "sequences": 3,
+      "frames_per_sequence": 15,
+      "run_automatically": false
+    }
+  }
 }

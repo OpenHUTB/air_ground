@@ -1,0 +1,25 @@
+{
+  "status": "pilot_provisional",
+  "blueprint_id": "vehicle.tesla.model3",
+  "behavior": "normal",
+  "platform_id": "vehicle_01",
+  "camera_mount": {
+    "x_m": 1.5,
+    "y_m": 0.0,
+    "z_m": 2.1,
+    "pitch_deg": -5.0,
+    "yaw_deg": 0.0,
+    "roll_deg": 0.0
+  },
+  "camera_fov_deg": 90.0,
+  "nominal_speed_kmh": 25.0,
+  "speed_jitter_kmh": 2.0,
+  "min_route_distance_m": 60.0,
+  "max_route_distance_m": 260.0,
+  "min_spawn_clearance_m": 8.0,
+  "profiles": {
+    "coverage": {"nominal_speed_kmh": 25.0},
+    "target_interaction": {"nominal_speed_kmh": 18.0},
+    "multi_object_traversal": {"nominal_speed_kmh": 30.0}
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0.0",
+  "matrix_storage": "row-major",
+  "vector_convention": "column-vector",
+  "frame_contract": {
+    "barrier_key": "world_frame_id",
+    "required_fields": [
+      "world_frame_id",
+      "timestamp",
+      "simulation_time",
+      "sample_index",
+      "source_tick"
+    ],
+    "sensor_timestamp_tolerance_s": 0.0001,
+    "missing_sensor_policy": "reject_entire_frame",
+    "wrong_frame_policy": "reject_entire_frame",
+    "previous_frame_fill": "forbidden"
+  },
+  "base_units": {
+    "position": "meter",
+    "time": "second",
+    "velocity": "meter_per_second",
+    "acceleration": "meter_per_second_squared"
+  }
+}

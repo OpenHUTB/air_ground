@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0.0",
+  "dataset_namespace": "air-ground-coop-suite-v1",
+  "output_root": "E:/pythonProject/air_groud/get_img/AirGroundCoopSuite",
+  "transform_closure_atol": 1e-05,
+  "threshold_status": "pilot_provisional",
+  "communication": {
+    "assignment": "scene_level_deterministic",
+    "profiles": {
+      "Ideal": {"latency_ms": [0.0, 0.0], "packet_loss": [0.0, 0.0], "byte_budget": null},
+      "Stable": {"latency_ms": [20.0, 50.0], "packet_loss": [0.0, 0.01], "byte_budget": 8000000},
+      "Constrained": {"latency_ms": [80.0, 150.0], "packet_loss": [0.05, 0.1], "byte_budget": 1000000},
+      "Intermittent": {"latency_ms": [100.0, 300.0], "packet_loss": [0.1, 0.3], "byte_budget": 250000}
+    }
+  },
+  "quality": {
+    "min_shared_targets_per_frame": 1,
+    "sensor_timestamp_tolerance_s": 0.0001,
+    "moving_step_m": 0.02,
+    "reprojection_error_px": null,
+    "joint_visible_ratio": null,
+    "air_only_visible_ratio": null,
+    "vehicle_only_visible_ratio": null,
+    "max_consecutive_missing_frames": null,
+    "minimum_track_length": null,
+    "route_completion_ratio": null,
+    "max_stationary_duration_s": null,
+    "status": "pilot_provisional"
+  }
+}

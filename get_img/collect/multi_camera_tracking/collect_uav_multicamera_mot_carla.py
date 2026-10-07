@@ -2,9 +2,10 @@
 """
 OpenHUTB/CARLA 无人机跨相机多目标跟踪数据采集器。
 
-公开数据只保存 RGB。深度和语义相机仅在采集时用于遮挡判断、可见像素
-边界框和坏视角筛选，不写入最终数据集。所有相机在同一次 world.tick()
-中取帧，并以 CARLA actor.id 作为跨相机、跨帧统一的 global_id。
+正式 MCMOT 模型输入为 RGB。深度和语义相机数据作为遮挡、可见像素、
+边界框和投影 QA 辅助数据保存。所有相机在同一次 world.tick()
+中取帧。正式 Schema 使用 deterministic UUID5 的 global_object_uuid；
+CARLA actor.id 仅用于当前 runtime 回溯和 MOT 派生格式。
 """
 
 from __future__ import annotations
@@ -31,12 +32,14 @@ import numpy as np
 COLLECT_ROOT = Path(__file__).resolve().parent.parent
 MULTIMODAL_DIR = COLLECT_ROOT / "multimodal"
 SINGLE_CAMERA_DIR = COLLECT_ROOT / "single_camera_tracking"
-for dependency_dir in (MULTIMODAL_DIR, SINGLE_CAMERA_DIR):
+for dependency_dir in (COLLECT_ROOT, MULTIMODAL_DIR, SINGLE_CAMERA_DIR):
     if str(dependency_dir) not in sys.path:
         sys.path.insert(0, str(dependency_dir))
 
 import collect_rpg_small_targets_carla_v2 as base
 import collect_uav_single_object_vot_carla as vot
+from cooperative_perception import CooperativeManager, close_simulator, ensure_simulator
+from cooperative_perception.cooperative_annotation import enrich_observations
 
 
 carla = base.carla
@@ -150,8 +153,8 @@ def validate_config(config: Dict[str, Any]) -> None:
     for key in ("max_active_vehicles", "max_active_pedestrians"):
         if int(config.get(key, 1)) <= 0:
             raise ValueError(f"{key} 必须大于 0")
-    if int(config["num_cameras"]) < 2:
-        raise ValueError("跨相机数据至少需要 2 台相机")
+    if int(config["num_cameras"]) != 3:
+        raise ValueError("Task 3 永久固定为 3 个虚拟 Air Camera Platform")
     if int(config["scenes_per_map"]) < 1:
         raise ValueError("每张地图至少需要 1 个场景")
     if float(config.get("sensor_tick", 0.0)) < 0.0:
@@ -282,7 +285,14 @@ def prepare_output(
             )
         if overwrite:
             safe_name = str(root.parent / root.name).lower()
-            if "dataset_uav" not in safe_name or "multicamera_mot" not in safe_name:
+            allowed_legacy = (
+                "dataset_uav" in safe_name and "multicamera_mot" in safe_name
+            )
+            allowed_suite = (
+                "airgroundcoopsuite" in safe_name
+                and ("task3_agc_mcmot" in safe_name or "derived_task3_mcmot" in safe_name)
+            )
+            if not (allowed_legacy or allowed_suite):
                 raise RuntimeError(f"拒绝覆盖名称异常的目录：{root}")
             shutil.rmtree(root)
     paths = {
@@ -542,7 +552,10 @@ def tick_and_get(
     world: Any,
     units: Sequence[CameraUnit],
     timeout: float,
+    before_tick=None,
 ) -> Tuple[int, Dict[str, Dict[str, Any]]]:
+    if before_tick is not None:
+        before_tick()
     frame = int(world.tick())
     data: Dict[str, Dict[str, Any]] = {}
     for unit in units:
@@ -1961,6 +1974,97 @@ def sequence_quality_report(
     }
 
 
+def save_cooperative_task3_frame(
+    cooperative: CooperativeManager,
+    world: Any,
+    units: Sequence[CameraUnit],
+    raw: Dict[str, Dict[str, Any]],
+    ground_raw: Dict[str, Any],
+    camera_payloads: Dict[str, Dict[str, Any]],
+    frame_index: int,
+    carla_frame: int,
+    config: Dict[str, Any],
+) -> None:
+    staging = cooperative.writer.current_path
+    if staging is None or cooperative.object_registry is None:
+        raise RuntimeError("cooperative Task-3 transaction is not active")
+    stem = f"{frame_index:06d}"
+    observations_by_sensor: Dict[str, List[Dict[str, Any]]] = {}
+    sensor_data_by_id: Dict[str, Any] = {}
+    for camera_index, unit in enumerate(units, start=1):
+        platform_id = f"air_camera_{camera_index:02d}"
+        payload = camera_payloads[unit.name]
+        unit_raw = raw[unit.name]
+        root = staging / "platforms/air" / platform_id
+        rgb_path = root / "rgb" / f"{stem}.png"
+        depth_path = root / "depth_m" / f"{stem}.npy"
+        semantic_path = root / "semantic" / f"{stem}.png"
+        for path in (rgb_path, depth_path, semantic_path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(rgb_path), payload["rgb_bgr"])
+        np.save(depth_path, base.decode_carla_depth_meters(unit_raw["depth"]).astype(np.float32))
+        base.save_semantic_id(
+            base.decode_semantic_segmentation(unit_raw["semantic"]),
+            semantic_path,
+        )
+        observations = enrich_observations(
+            payload["annotations"],
+            cooperative.object_registry,
+            f"{platform_id}_rgb",
+        )
+        observations_by_sensor[f"{platform_id}_rgb"] = observations
+        for modality, data in unit_raw.items():
+            sensor_data_by_id[f"{platform_id}_{modality}"] = data
+
+    ground_rgb = ground_raw["vehicle_01_rgb"]
+    ground_depth_data = ground_raw["vehicle_01_depth"]
+    ground_semantic_data = ground_raw["vehicle_01_semantic"]
+    ground_depth = base.decode_carla_depth_meters(ground_depth_data)
+    ground_semantic = base.decode_semantic_segmentation(ground_semantic_data)
+    ground_root = staging / "platforms/ground/vehicle_01"
+    ground_rgb_path = ground_root / "rgb" / f"{stem}.png"
+    ground_depth_path = ground_root / "depth_m" / f"{stem}.npy"
+    ground_semantic_path = ground_root / "semantic" / f"{stem}.png"
+    for path in (ground_rgb_path, ground_depth_path, ground_semantic_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    base.save_rgb(ground_rgb, ground_rgb_path, depth_m=ground_depth)
+    np.save(ground_depth_path, ground_depth.astype(np.float32))
+    base.save_semantic_id(ground_semantic, ground_semantic_path)
+    ground_config = dict(config)
+    ground_vehicle_config = cooperative.config["ground_vehicle"]
+    ground_config.update(
+        {
+            "width": int(ground_vehicle_config["image_width"]),
+            "height": int(ground_vehicle_config["image_height"]),
+            "fov": float(ground_vehicle_config["camera_fov_deg"]),
+        }
+    )
+    ground_annotations = build_annotations(
+        world,
+        ground_rgb.transform,
+        ground_depth,
+        ground_semantic,
+        ground_config,
+    )
+    ground_observations = enrich_observations(
+        ground_annotations,
+        cooperative.object_registry,
+        "vehicle_01_rgb",
+    )
+    observations_by_sensor["vehicle_01_rgb"] = ground_observations
+    sensor_data_by_id.update(ground_raw)
+    snapshot = world.get_snapshot()
+    first_rgb = raw[units[0].name]["rgb"]
+    cooperative.record_frame(
+        carla_frame,
+        float(first_rgb.timestamp),
+        float(snapshot.timestamp.elapsed_seconds),
+        observations_by_sensor,
+        sensor_data_by_id,
+        ground_raw,
+    )
+
+
 def collect_scene_attempt(
     world: Any,
     units: Sequence[CameraUnit],
@@ -1972,6 +2076,7 @@ def collect_scene_attempt(
     traffic_actors: Sequence[Any],
     required_global_id: int,
     config: Dict[str, Any],
+    cooperative: CooperativeManager,
 ) -> Dict[str, Any]:
     for unit, transform in zip(units, transforms):
         set_camera_unit_transform(unit, transform)
@@ -1981,8 +2086,14 @@ def collect_scene_attempt(
     timeout = float(config["sensor_timeout"])
     warmup_ticks = max(2, int(config.get("streaming_warmup_ticks", 2)))
     for _ in range(warmup_ticks):
-        tick_and_get(world, units, timeout)
+        tick_and_get(
+            world,
+            units,
+            timeout,
+            before_tick=cooperative.before_world_tick,
+        )
     drain_camera_units(units)
+    cooperative.ground_vehicle.drain()
 
     current_anchor = next(
         (
@@ -2067,8 +2178,14 @@ def collect_scene_attempt(
         raw = None
         carla_frame = -1
         for _ in range(sample_interval_ticks):
-            carla_frame, raw = tick_and_get(world, units, timeout)
+            carla_frame, raw = tick_and_get(
+                world,
+                units,
+                timeout,
+                before_tick=cooperative.before_world_tick,
+            )
         assert raw is not None
+        ground_raw = cooperative.collect_ground(carla_frame)
         camera_payloads: Dict[str, Dict[str, Any]] = {}
         all_views_valid = True
         for unit in units:
@@ -2203,6 +2320,17 @@ def collect_scene_attempt(
             qa_indices,
             config,
         )
+        save_cooperative_task3_frame(
+            cooperative,
+            world,
+            units,
+            raw,
+            ground_raw,
+            camera_payloads,
+            frame_index,
+            carla_frame,
+            config,
+        )
         write_world_tracks(
             staging_dir,
             spec,
@@ -2312,7 +2440,10 @@ def collect_scene(
     eligible_pedestrian_ids: Optional[Sequence[int]] = None,
     used_anchor_ids: Optional[Sequence[int]] = None,
     used_anchor_instance_keys: Optional[Sequence[str]] = None,
+    cooperative: Optional[CooperativeManager] = None,
 ) -> Dict[str, Any]:
+    if cooperative is None:
+        raise RuntimeError("Task 3 cooperative manager is required")
     max_attempts = int(config["max_scene_attempts"])
     max_attempts_per_anchor = max(
         1,
@@ -2378,6 +2509,21 @@ def collect_scene(
             safe_remove_staging(staging_dir, paths["staging"])
             continue
         transforms, ground_z = rig
+        cooperative.prepare_scene(
+            spec.name,
+            int(config["seed"]) + int(spec.scene_id) * 100_003 + attempt,
+            str(cooperative.config["route_profile"]),
+            actors=traffic_actors,
+            target_actor=anchor,
+        )
+        for camera_index, unit in enumerate(units, start=1):
+            cooperative.register_air_platform(
+                f"air_camera_{camera_index:02d}",
+                virtual=True,
+                platform_type="air_camera_platform",
+                sensors=unit.sensors,
+                required_modalities=("rgb", "depth", "semantic"),
+            )
         try:
             result = collect_scene_attempt(
                 world,
@@ -2390,6 +2536,7 @@ def collect_scene(
                 traffic_actors,
                 int(anchor.id),
                 config,
+                cooperative,
             )
         except (TimeoutError, RuntimeError) as exc:
             result = {"accepted": False, "reason": str(exc)}
@@ -2398,6 +2545,21 @@ def collect_scene(
             if destination.exists():
                 raise RuntimeError(f"场景目录意外存在：{destination}")
             shutil.move(str(staging_dir), str(destination))
+            cooperative.commit_scene(
+                {
+                    "split": spec.split,
+                    "weather": spec.weather,
+                    "frames": int(cooperative.sample_index),
+                    "air_platform_count": 3,
+                    "air_platform_type": "air_camera_platform",
+                    "air_platform_is_virtual": True,
+                    "ground_vehicle_count": 1,
+                    "derived_formats": ["MOTChallenge", "MCMOT"],
+                    "model_input": "rgb",
+                    "auxiliary_modalities": ["depth_m", "semantic"],
+                    "parameter_status": "pilot_provisional",
+                }
+            )
             result.update(
                 {
                     "scene": spec.name,
@@ -2422,6 +2584,9 @@ def collect_scene(
                 f"classes={result['class_observations']}"
             )
             return result
+        cooperative.close_scene(
+            abort_reason="scene_attempt_rejected: " + str(result["reason"])
+        )
         print(
             f"[RETRY] {spec.name} attempt {attempt + 1}/{max_attempts}: "
             f"anchor_actor={int(anchor.id)}, {result['reason']}"
@@ -3018,6 +3183,13 @@ def run_collection(
     specs: Sequence[SceneSpec],
     paths: Dict[str, Path],
 ) -> List[Dict[str, Any]]:
+    simulator_session = ensure_simulator(
+        carla,
+        str(config["host"]),
+        int(config["port"]),
+        config.get("map"),
+        dict(config.get("simulator", {})),
+    )
     client = carla.Client(
         str(config["host"]),
         int(config["port"]),
@@ -3039,6 +3211,14 @@ def run_collection(
     controllers: List[Any] = []
     units: List[CameraUnit] = []
     results: List[Dict[str, Any]] = []
+    cooperative = CooperativeManager(
+        client,
+        world,
+        carla,
+        Path(config["cooperative"]["output_root"]),
+        "task3",
+        config["cooperative"],
+    )
     try:
         if bool(config["hide_static_map_vehicles"]):
             static_ids = base.hide_static_map_vehicles(world)
@@ -3368,6 +3548,7 @@ def run_collection(
                         ],
                         used_anchor_ids=used_anchor_ids,
                         used_anchor_instance_keys=used_anchor_instance_keys,
+                        cooperative=cooperative,
                     )
                 except RuntimeError as exc:
                     if population_attempt + 1 >= population_limit:
@@ -3433,6 +3614,7 @@ def run_collection(
                 continue
             results.append(result)
     finally:
+        cooperative.close()
         destroy_actors(
             sensor
             for unit in units
@@ -3453,6 +3635,7 @@ def run_collection(
         if static_ids:
             base.restore_static_map_vehicles(world, static_ids)
         world.apply_settings(original_settings)
+        close_simulator(simulator_session)
     return results
 
 

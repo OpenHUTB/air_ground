@@ -1,214 +1,67 @@
-# 无人机单相机单目标追踪数据集
+# Task 2：空地协同单目标跟踪
 
-本项目在 OpenHUTB/CARLA 中采集无人机视角的 RGB 单目标追踪序列，主任务格式参考 VOT/SOT。每条序列只指定一个主目标，主目标在完整序列中保持同一 CARLA actor 身份；画面内其他合格车辆和行人同时提供 YOLO 检测标签。
+Task 2 使用 1 个真实 UAV 视角、1 辆独立 Ground Vehicle 和 1 个独立 Target。正式模型输入是 RGB；Depth 与 Semantic 只作为 bbox、遮挡、可见性和 QA 辅助数据保存。
 
-正式数据集输出到（不会覆盖之前的试采结果）：
+Ground Vehicle 由共享 `GroundVehicleManager` 生成，角色为 `cooperative_vehicle`，使用 `BehaviorAgent` 按 `target_interaction` 预定义路线行驶。它不是 Target，也不会主动追随 Target。Target 是另一辆车辆或行人。
+
+## 唯一 UAV 运动策略
+
+所有正式序列固定使用：
 
 ```text
-E:\pythonProject\air_groud\get_img\dataset_uav_multimap_single_object_vot_motion_full
+motion_mode = rear_upper_follow
 ```
 
-## 数据特点
+期望位置按 Target 当前前向向量计算：
 
-- 公开模态：RGB。
-- 主任务：单相机单目标追踪（VOT/SOT）。
-- 辅助任务：车辆和行人 YOLO 检测。
-- 类别：`vehicle`、`pedestrian`。
-- 分辨率：1920×1080。
-- 仿真帧率：20 FPS；车辆每 2 tick 保存一次（10 Hz），人物每 6 tick 保存一次（约 3.33 Hz）。
-- 每张地图分别采集固定悬停、滞后跟随和侧向环绕各 18 条序列，共 54 条；
-  每种拍摄方式均包含 9 条车辆和 9 条人物序列。
-- 固定悬停最长 80 帧，连续 5 帧未出现目标即结束；不足 30 帧则重采。
-- 人物滞后跟随保存 80 帧（0.3 秒间隔，约 24 秒）。
-- 侧向环绕：车辆 150 帧（0.1 秒间隔），人物 100 帧（0.3 秒间隔）。
-- 每张地图计划最多 5490 张 RGB，八张地图计划最多 43920 张；固定悬停
-  允许提前结束，因此实际数量会略少。
-- 训练、验证、测试按完整序列划分；同一目标只属于一个 split，单个目标最多
-  拍摄 2 条序列，避免相邻帧和目标身份泄漏。
-- 深度与语义传感器只用于遮挡、道路、目标尺寸和穿模检查，不作为公开模态保存。
-- 中电园和湖工商使用 40 个带行走控制的补充行人；生成位置会根据车道宽度
-  移到道路边界以外，行走时也会提前检测并避开机动车道。普通交通参与者调整为
-  20 辆车、0 个额外导航行人，采集器还会跳过旧版静止桥接 actor。
-- 两张特殊地图启用完整贴图加载、30 帧预热和场景几何完整度检查；中电园还会
-  避开已知的贴图/虚空区域。
-- 三种运动模式分别从地图允许的天气中独立随机选择。每次启动批量采集都会
-  生成并记录新的运行种子、地图种子和天气种子；六张标准地图只会抽取
-  `ClearNoon`、`ClearSunset`、`ClearNight`；中电园和湖工商只会抽取
-  `ClearNoon` 和 `ClearSunset`。
-- 中电园单相机高度单独调整为 18–24 m、水平距离调整为 18–32 m，以提高
-  行人首帧尺寸和可见性；其他地图仍使用 30–36 m 高度。
+```text
+desired_uav_position = target_position
+                     - back_distance_m * target_forward
+                     + height_above_target_m * world_up
+```
 
-## 主要文件
+Camera 始终朝向 Target。位置采用响应时间与最大速度限幅，yaw/pitch 采用响应时间与最大角速度限幅。Target 转弯时目标后上方位置随 heading 连续变化。`back_distance_m`、高度、响应时间、最大速度、角速度和 pitch 范围均为 `pilot_provisional`，人工 smoke 后再冻结。
 
-| 文件 | 用途 |
-|---|---|
-| `collect_uav_single_object_vot_carla.py` | VOT/SOT 主采集器 |
-| `single_object_vot_config.json` | 单次采集基础配置 |
-| `run_multimap_single_object_vot_collection.py` | 八地图正式批量入口 |
-| `run_multimap_tracking_common.py` | 模拟器启动、地图切换、配置生成和完成度审计 |
-| `upload_uav_dataset_to_huggingface.py` | Hugging Face 上传工具 |
-| `hf_*.jsonl` | 上传批次、提交和运行历史 |
-| `hf_upload_completed_files.txt` | 上传断点记录 |
+## 数据与同步
 
-采集器复用相邻 `../multimodal/collect_rpg_small_targets_carla_v2.py` 中的 CARLA 传感器、投影和可见性基础函数，因此三个项目目录的相对位置不应随意改变。
+统一 source of truth 写入：
 
-## 环境要求
+```text
+E:\pythonProject\air_groud\get_img\AirGroundCoopSuite
+```
 
-- Windows 和可运行的 OpenHUTB/CARLA 模拟器。
-- 与模拟器版本匹配的 CARLA Python API。
-- Python 依赖至少包括 `numpy` 和 `opencv-python`。
-- 默认 RPC 端口 `2000`，Traffic Manager 端口 `8000`。
-- 上传功能需要 `huggingface_hub` 和有效凭据。
+VOT/SOT 只是派生兼容格式。每个正式 frame 以 `world_frame_id` 建立硬屏障，同时记录 `timestamp`、`simulation_time`、连续 `sample_index` 和 `source_tick`。Air RGB/Depth/Semantic 与 Vehicle RGB/Depth/Semantic 必须同帧且时间戳通过检查；任一必选 Sensor 超时、错帧或时间不一致会拒绝整帧，禁止复制上一帧补齐。
 
-八地图运行器还会复用多模态项目中的模拟器路径和地图定义。换机器时需要检查 `run_multimap_tracking_common.py` 与 `../multimodal/run_recommended_multimap_multimodal_collection.py` 中的本机路径。
+每帧分别保存 Air 与 Vehicle 的 platform pose、sensor pose、velocity、acceleration、heading 和 control。目标身份使用 deterministic UUID5 的 `global_object_uuid`，同时保存 scene 内连续的 `scene_object_id` 与仅供运行时回溯的 `carla_actor_id`。
 
-## 快速开始
+## 协同状态
 
-### 单地图直接采集
+逐帧记录 `Joint Visible`、`UAV Dominant`、`Vehicle Dominant`、`Occlusion`、视角切换和 `Reacquisition`。这些新指标的阈值在 pilot 前不作为最终标准。
 
-先启动模拟器，再执行：
+## Town03_Opt smoke
+
+当前 smoke 配置为 3 条短 sequence、每条 15 个正式 frame，仅写入：
+
+```text
+E:\pythonProject\air_groud\get_img\AirGroundCoopSuite\_smoke\Town03_Opt
+```
+
+用户手动启动模拟器后运行：
 
 ```powershell
 $PYTHON = "D:\anaconda2023.09\envs\openhutb\python.exe"
-$PROJECT = "E:\pythonProject\air_groud\get_img\collect\single_camera_tracking"
-
-& $PYTHON "$PROJECT\collect_uav_single_object_vot_carla.py" `
-  --config "$PROJECT\single_object_vot_config.json" `
-  --out "E:\pythonProject\air_groud\get_img\dataset_single_object_new" `
-  --overwrite
+$ROOT = "E:\pythonProject\air_groud\get_img\collect\single_camera_tracking"
+& $PYTHON "$ROOT\collect_uav_single_object_vot_carla.py" `
+  --config "$ROOT\single_object_vot_config.json" `
+  --max-sequences 3 `
+  --frames-per-sequence 15
 ```
 
-`--overwrite` 会重建目标输出，请勿指向需要保留的数据集。
+主要调参位置：
 
-小规模验证：
+- 后向距离/高度：`rear_upper_follow.back_distance_m`、`height_above_target_m`
+- 平滑与限速：`position_response_time_s`、`rotation_response_time_s`、`max_position_speed_mps`、`max_yaw_rate_deg_s`、`max_pitch_rate_deg_s`
+- 车载相机：`cooperative.ground_vehicle.camera_mount`、`camera_fov_deg`
+- Ground Vehicle 路线与速度：`route_profile`、`nominal_speed_kmh`、`speed_jitter_kmh`
 
-```powershell
-& $PYTHON "$PROJECT\collect_uav_single_object_vot_carla.py" `
-  --config "$PROJECT\single_object_vot_config.json" `
-  --out "E:\pythonProject\air_groud\get_img\dataset_single_object_smoke" `
-  --max-sequences 1 `
-  --frames-per-sequence 5 `
-  --overwrite
-```
-
-### 八地图批量运行
-
-```powershell
-& $PYTHON "$PROJECT\run_multimap_single_object_vot_collection.py" --visible
-```
-
-只运行指定地图：
-
-```powershell
-& $PYTHON "$PROJECT\run_multimap_single_object_vot_collection.py" `
-  --only Town03_Opt CCSP_Zhongdian_Software_Park `
-  --visible
-```
-
-运行隔离的小规模冒烟采集：
-
-```powershell
-& $PYTHON "$PROJECT\run_multimap_single_object_vot_collection.py" `
-  --only Town03_Opt `
-  --smoke `
-  --visible
-```
-
-| 批量入口参数 | 含义 |
-|---|---|
-| `--only MAP...` | 只运行指定地图 |
-| `--visible` | 显示模拟器窗口 |
-| `--rerun-complete` | 完成的地图也重新采集 |
-| `--smoke` | 使用隔离输出，只采一条极小序列 |
-| `--run-seed N` | 新采或强制重采时使用指定运行种子；省略则随机生成 |
-
-## 核心配置
-
-| 配置项 | 当前基础值 | 说明 |
-|---|---:|---|
-| `sequences_per_map` | 54 | 正式采集每张地图的完整序列数 |
-| `sequences_by_motion_mode` | 每种 18 条 | 三种运动模式的正式配额 |
-| `target_classes_by_motion_mode` | 每种均含车辆和人物 | 每种模式各 9 条车辆、9 条人物 |
-| `max_sequences_per_target_actor` | 2 | 单个目标最多进入两条序列，且不得跨 split |
-| `frames_by_motion_mode` | 最长 80 / 120 / 150 | 三种模式的默认/车辆上限 |
-| `frames_by_motion_mode_and_target_class` | 人物跟随 80 / 人物环绕 100 | 保持人物序列原覆盖时长 |
-| `fixed_hover_stop_after_absent_frames` | 5 | 固定悬停连续缺失 5 帧即结束 |
-| `min_frames_by_motion_mode.fixed_hover` | 30 | 固定悬停最低有效长度 |
-| `sample_interval_ticks_by_target_class` | 车辆 2 / 人物 6 | 分别对应 10 Hz 和约 3.33 Hz |
-| `height_min` / `height_max` | 30 / 36 m | 相机高度范围 |
-| `radius_min` / `radius_max` | 28 / 52 m | 相机与目标的水平距离 |
-| `pitch_min` / `pitch_max` | -45° / -35° | 相机俯角范围 |
-| `vehicles` / `walkers` | 20 / 30 | 尝试生成的目标数量 |
-| `min_visible_ratio` | 0.10 | 主目标最低可见比例 |
-| `min_visible_pixels` | 24 | 目标最低可见像素数 |
-| `max_absent_ratio_by_motion_mode` | 固定悬停 0.25 / 其余 0.40 | 单序列最大缺失帧比例 |
-| `max_consecutive_absent_frames_by_motion_mode` | 固定悬停 5 / 其余 40 | 最大连续缺失帧数 |
-| `min_vehicle_equivalent_side_px` | 40 px | 车辆等效边长下限 |
-| `min_pedestrian_equivalent_side_px` | 35 px | 行人等效边长下限 |
-| `min_target_average_speed_mps` | 车辆 0.5 / 人物 0.2 | 拒绝目标自身几乎不移动的序列 |
-| `min_target_moving_step_ratio` | 车辆/人物 0.2 | 至少 20% 的相邻采样位置发生有效移动 |
-
-命令行可覆盖序列数、帧数、天气和输出目录。查看完整参数：
-
-```powershell
-& $PYTHON "$PROJECT\collect_uav_single_object_vot_carla.py" --help
-```
-
-## 输出结构
-
-```text
-<map_root>/
-├─ vot/<sequence_name>/
-│  ├─ color/00000001.png
-│  ├─ groundtruth.txt
-│  ├─ absence.label
-│  ├─ occlusion.label
-│  ├─ target_state.label
-│  ├─ sequence_meta.json
-│  ├─ annotations.jsonl
-│  └─ labels_yolo/
-├─ yolo/
-│  ├─ images/{train,val,test}/
-│  ├─ labels/{train,val,test}/
-│  └─ data.yaml
-├─ dataset_manifest.json
-├─ quality_audit.json
-└─ README.md
-```
-
-`groundtruth.txt` 每行采用 `x,y,width,height`。当主目标不可见或严重遮挡时写入 `0,0,0,0`，同时在 `absence.label` 或 `occlusion.label` 中记录状态。
-
-## 质量与续跑
-
-- 第一帧必须存在合格主目标，否则整条尝试失败。
-- 一条序列超过缺失比例或连续缺失上限时不会进入正式结果。
-- 目标自身的世界坐标平均速度或有效运动帧比例不足时整条重采，不能再依靠背景
-  或相机运动通过质量检查。
-- 质量审计会拒绝目标跨 train/val/test、单个目标超过 2 条或缺少任一“运动模式/目标类别”组合的数据。
-- 每验收一条序列，就原子更新 `resume_state.json`。重新执行同一条批量命令时，
-  完整序列会被逐项校验并跳过，从第一条缺失序列继续。
-- 图片、YOLO、VOT、逐帧 JSON 或元数据数量不一致的半成品不会跳过，而会
-  移到 `_resume_rejected/` 后重采。
-- 续跑复用 `_configs/<地图名>.json` 中原来的运行种子、地图种子、天气种子
-  和天气计划；已经完成的地图仍由批量运行器直接跳过。
-- 普通续跑不需要传种子。若需要从头复现实验，可从旧的
-  `collection_status.json` 读取 `session_run_seed`，配合
-  `--run-seed <数值> --rerun-complete` 使用。
-- `quality_audit.json` 应为 `PASS`，并检查序列级数据划分和 VOT 必需文件。
-- 批量运行器按地图核对图像数量、天气分布、清单新鲜度和质量审计。
-- `--smoke` 输出与正式数据隔离，适合验证环境和地图兼容性。
-- 特殊地图的几何检查用于拒绝未完整加载或大面积虚空画面，不能修复地图资源包
-  自身的贴图缺失；若错误覆盖大部分地图，需修复或替换对应地图资源。
-
-## 上传说明
-
-上传工具会读取同目录的历史和完成文件以支持断点续传。移动或删除这些记录会导致重新扫描或重复提交。正式上传前应检查脚本顶部的本地数据目录与 Hugging Face `REPO_ID`。
-
-## 注意事项
-
-- 正式单相机项目是 VOT/SOT，不是旧的单相机多目标 MOT 方案。
-- `--overwrite` 是破坏性选项，只应用于确认可以重建的输出目录。
-- `--rerun-complete` 会放弃完整地图的跳过行为并从头采集，不用于普通断点续跑。
-- 同一序列内天气和主目标身份必须保持不变。
-- 不要按帧随机拆分训练集、验证集和测试集，否则会产生相邻帧泄漏。
-- CARLA RPC 端口默认是 2000；不要同时运行另一个采集聊天或采集脚本。
+不要自动启动或关闭 CARLA，不要在人工确认 smoke 结果前开始 pilot/full collection。

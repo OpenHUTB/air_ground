@@ -4,8 +4,8 @@
 """
 在 OpenHUTB/CARLA 中采集 RGB 单目标追踪数据。。
 
-公开数据采用 VOT 矩形框格式；内部深度和语义相机仅用于遮挡、穿模与
-路面质量检查，不保存为多模态数据。YOLO 标签会标出画面中全部合格车辆
+公开数据采用 VOT 矩形框格式；RGB 是正式模型输入，深度和语义作为遮挡、穿模与
+路面质量 QA 辅助数据保存。YOLO 标签会标出画面中全部合格车辆
 和行人，避免把非主目标错误地当成背景。
 """
 
@@ -32,8 +32,15 @@ COLLECT_ROOT = Path(__file__).resolve().parent.parent
 MULTIMODAL_DIR = COLLECT_ROOT / "multimodal"
 if str(MULTIMODAL_DIR) not in sys.path:
     sys.path.insert(0, str(MULTIMODAL_DIR))
+if str(COLLECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(COLLECT_ROOT))
 
 import collect_rpg_small_targets_carla_v2 as base
+from cooperative_perception import CooperativeManager, close_simulator, ensure_simulator
+from cooperative_perception.cooperative_annotation import (
+    enrich_observations,
+    target_event_record,
+)
 
 
 carla = base.carla
@@ -92,19 +99,8 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
         config["out"] = str(args.out)
     if args.sequences_per_map is not None:
         config["sequences_per_map"] = args.sequences_per_map
-        modes = list(config.get("motion_modes", []))
-        if modes:
-            quotient, remainder = divmod(args.sequences_per_map, len(modes))
-            config["sequences_by_motion_mode"] = {
-                mode: quotient + (1 if index < remainder else 0)
-                for index, mode in enumerate(modes)
-            }
     if args.frames_per_sequence is not None:
         config["frames_per_sequence"] = args.frames_per_sequence
-        config["frames_by_motion_mode"] = {
-            mode: args.frames_per_sequence
-            for mode in config.get("motion_modes", [])
-        }
     if args.weather_presets is not None:
         config["weather_presets"] = args.weather_presets
     if (
@@ -171,44 +167,47 @@ def validate_config(config: Dict[str, Any]) -> None:
             "weather_assignment 只能是 cycle、random、random_unseeded "
             "或 random_per_run"
         )
-    motion_modes = list(config.get("motion_modes", []))
-    if not motion_modes:
-        raise ValueError("motion_modes 不能为空")
-    supported_modes = {"fixed_hover", "lagged_follow", "lateral_orbit"}
-    unknown_modes = sorted(set(motion_modes) - supported_modes)
-    if unknown_modes:
-        raise ValueError(f"不支持的运动模式：{unknown_modes}")
-    configured_count = sum(
-        int(config.get("sequences_by_motion_mode", {}).get(mode, 0))
-        for mode in motion_modes
-    )
-    if configured_count != int(config["sequences_per_map"]):
-        raise ValueError(
-            "sequences_per_map 必须等于 sequences_by_motion_mode 的总和"
-        )
+    if str(config.get("motion_mode")) != "rear_upper_follow":
+        raise ValueError("Task 2 只允许 motion_mode=rear_upper_follow")
     interval_by_class = config.get("sample_interval_ticks_by_target_class", {})
     for target_class in ("vehicle", "pedestrian"):
         if int(interval_by_class.get(target_class, config["sample_interval_ticks"])) <= 0:
             raise ValueError(f"{target_class} 的采样 tick 间隔必须大于 0")
-    for mode in motion_modes:
-        if int(config.get("frames_by_motion_mode", {}).get(mode, 0)) <= 0:
-            raise ValueError(f"{mode} 的最大帧数必须大于 0")
-    target_classes_by_mode = config.get("target_classes_by_motion_mode", {})
-    for mode in motion_modes:
-        classes = list(
-            target_classes_by_mode.get(mode, ("vehicle", "pedestrian"))
-        )
-        if not classes:
-            raise ValueError(f"{mode} 的目标类别列表不能为空")
-        unknown_classes = sorted(
-            set(classes) - {"vehicle", "pedestrian"}
-        )
-        if unknown_classes:
-            raise ValueError(
-                f"{mode} 包含未知目标类别：{unknown_classes}"
-            )
+    target_classes = list(config.get("target_classes", []))
+    if not target_classes:
+        raise ValueError("target_classes 不能为空")
+    unknown_classes = sorted(set(target_classes) - {"vehicle", "pedestrian"})
+    if unknown_classes:
+        raise ValueError(f"target_classes 包含未知类别：{unknown_classes}")
+    rear_upper = dict(config.get("rear_upper_follow", {}))
+    for key in (
+        "back_distance_m",
+        "height_above_target_m",
+        "position_response_time_s",
+        "rotation_response_time_s",
+        "max_position_speed_mps",
+        "max_yaw_rate_deg_s",
+        "max_pitch_rate_deg_s",
+    ):
+        if float(rear_upper.get(key, 0.0)) <= 0.0:
+            raise ValueError(f"rear_upper_follow/{key} 必须大于 0")
     if int(config.get("max_sequences_per_target_actor", 2)) <= 0:
         raise ValueError("max_sequences_per_target_actor 必须大于 0")
+    if int(config.get("max_target_population_refreshes", 2)) < 0:
+        raise ValueError("max_target_population_refreshes 不能小于 0")
+    if int(config.get("min_eligible_target_candidates", 2)) <= 0:
+        raise ValueError("min_eligible_target_candidates 必须大于 0")
+    if int(config.get("target_population_refresh_warmup_ticks", 20)) < 0:
+        raise ValueError("target_population_refresh_warmup_ticks 不能小于 0")
+    for key in (
+        "target_population_refresh_batch_size",
+        "max_active_target_actors_by_class",
+    ):
+        for target_class, value in config.get(key, {}).items():
+            if target_class not in {"vehicle", "pedestrian"}:
+                raise ValueError(f"{key} 包含未知类别：{target_class}")
+            if int(value) <= 0:
+                raise ValueError(f"{key}/{target_class} 必须大于 0")
     for key in (
         "min_target_average_speed_mps",
         "min_target_moving_step_ratio",
@@ -219,32 +218,10 @@ def validate_config(config: Dict[str, Any]) -> None:
                 raise ValueError(f"{key} 包含未知类别：{target_class}")
             if float(value) < 0.0:
                 raise ValueError(f"{key}/{target_class} 不能小于 0")
-    for mode, class_frames in config.get(
-        "frames_by_motion_mode_and_target_class", {}
-    ).items():
-        if mode not in supported_modes:
-            raise ValueError(f"类别专用帧数包含未知模式：{mode}")
-        for target_class, frame_count in class_frames.items():
-            if target_class not in {"vehicle", "pedestrian"}:
-                raise ValueError(f"类别专用帧数包含未知类别：{target_class}")
-            if int(frame_count) <= 0:
-                raise ValueError(f"{mode}/{target_class} 的帧数必须大于 0")
 
 
 def frames_for_sequence(spec: SequenceSpec, config: Dict[str, Any]) -> int:
-    class_specific = (
-        config.get("frames_by_motion_mode_and_target_class", {})
-        .get(spec.motion_mode, {})
-        .get(spec.target_class)
-    )
-    if class_specific is not None:
-        return int(class_specific)
-    return int(
-        config.get("frames_by_motion_mode", {}).get(
-            spec.motion_mode,
-            config["frames_per_sequence"],
-        )
-    )
+    return int(config["frames_per_sequence"])
 
 
 def sample_interval_ticks_for_sequence(
@@ -263,24 +240,14 @@ def max_absent_ratio_for_sequence(
     spec: SequenceSpec,
     config: Dict[str, Any],
 ) -> float:
-    return float(
-        config.get("max_absent_ratio_by_motion_mode", {}).get(
-            spec.motion_mode,
-            config["max_absent_ratio_per_sequence"],
-        )
-    )
+    return float(config["max_absent_ratio_per_sequence"])
 
 
 def max_consecutive_absent_for_sequence(
     spec: SequenceSpec,
     config: Dict[str, Any],
 ) -> int:
-    return int(
-        config.get("max_consecutive_absent_frames_by_motion_mode", {}).get(
-            spec.motion_mode,
-            config["max_consecutive_absent_frames"],
-        )
-    )
+    return int(config["max_consecutive_absent_frames"])
 
 
 def prepare_output(
@@ -298,7 +265,18 @@ def prepare_output(
                 "为避免混入旧追踪帧，换一个 out，或使用 --overwrite/--resume。"
             )
         safe_name = str(root.parent / root.name).lower()
-        if "dataset_uav" not in safe_name or "single_object_vot" not in safe_name:
+        allowed_legacy = (
+            "dataset_uav" in safe_name and "single_object_vot" in safe_name
+        )
+        allowed_smoke = (
+            "airgroundcoopsuite" in safe_name
+            and "_smoke" in safe_name
+            and (
+                "task2_agc_sot" in safe_name
+                or "derived_task2_sot" in safe_name
+            )
+        )
+        if not (allowed_legacy or allowed_smoke):
             raise RuntimeError(f"拒绝覆盖名称异常的目录：{root}")
         if overwrite:
             shutil.rmtree(root)
@@ -333,7 +311,7 @@ def prepare_output(
 
 
 def build_sequence_specs(config: Dict[str, Any]) -> List[SequenceSpec]:
-    """Build the configured number of sequences for every motion mode."""
+    """Build rear-upper-follow sequences with scene-level diversity."""
     specs: List[SequenceSpec] = []
     count = int(config["sequences_per_map"])
     weathers = list(config["weather_presets"])
@@ -358,16 +336,6 @@ def build_sequence_specs(config: Dict[str, Any]) -> List[SequenceSpec]:
         )
     )
     weather_occurrences: Counter = Counter()
-    mode_occurrences: Counter = Counter()
-    motion_modes = list(config["motion_modes"])
-    mode_counts = config["sequences_by_motion_mode"]
-    max_mode_count = max(int(mode_counts[mode]) for mode in motion_modes)
-    mode_schedule = [
-        mode
-        for round_index in range(max_mode_count)
-        for mode in motion_modes
-        if round_index < int(mode_counts[mode])
-    ]
     if count == 3:
         split_schedule = ["train", "val", "test"]
     else:
@@ -378,8 +346,9 @@ def build_sequence_specs(config: Dict[str, Any]) -> List[SequenceSpec]:
             for index in range(count)
         ]
     class_offset = int(config.get("target_class_offset", 0))
-    target_classes_by_mode = config.get("target_classes_by_motion_mode", {})
-    for sequence_id, motion_mode in enumerate(mode_schedule):
+    target_classes = list(config.get("target_classes", ("vehicle", "pedestrian")))
+    motion_mode = "rear_upper_follow"
+    for sequence_id in range(count):
         weather = (
             configured_weather_schedule[sequence_id]
             if configured_weather_schedule
@@ -393,17 +362,9 @@ def build_sequence_specs(config: Dict[str, Any]) -> List[SequenceSpec]:
         )
         index_in_weather = int(weather_occurrences[weather])
         weather_occurrences[weather] += 1
-        target_classes = list(
-            target_classes_by_mode.get(
-                motion_mode,
-                ("vehicle", "pedestrian"),
-            )
-        )
-        occurrence = int(mode_occurrences[motion_mode])
         target_class = target_classes[
-            (occurrence + class_offset) % len(target_classes)
+            (sequence_id + class_offset) % len(target_classes)
         ]
-        mode_occurrences[motion_mode] += 1
         split = split_schedule[sequence_id]
         specs.append(
             SequenceSpec(
@@ -461,8 +422,11 @@ def tick_and_get_sensors(
     world,
     sensor_sync: Dict[str, Any],
     timeout: float,
+    before_tick=None,
 ) -> Tuple[int, Dict[str, Any]]:
     """Advance one simulation tick and consume every synchronized modality."""
+    if before_tick is not None:
+        before_tick()
     carla_frame = int(world.tick())
     return carla_frame, {
         name: sync.get(carla_frame, timeout=timeout)
@@ -471,17 +435,74 @@ def tick_and_get_sensors(
 
 
 def destroy_actors(actors: Iterable[Any]) -> None:
+    unique: Dict[int, Any] = {}
     for actor in actors:
+        if actor is None:
+            continue
         try:
+            unique[int(actor.id)] = actor
+        except (AttributeError, RuntimeError):
+            continue
+    live_ids: Optional[set] = None
+    for actor in unique.values():
+        try:
+            if live_ids is None:
+                live_ids = {
+                    int(current.id)
+                    for current in actor.get_world().get_actors()
+                }
+            if int(actor.id) not in live_ids:
+                continue
             if hasattr(actor, "stop"):
                 actor.stop()
-        except RuntimeError:
-            pass
+            if actor.destroy():
+                live_ids.discard(int(actor.id))
+        except (AttributeError, RuntimeError):
+            continue
+
+
+def registered_actors(actors: Iterable[Any]) -> List[Any]:
+    candidates = [actor for actor in actors if actor is not None]
+    if not candidates:
+        return []
+    try:
+        live_ids = {
+            int(current.id)
+            for current in candidates[0].get_world().get_actors()
+        }
+    except (AttributeError, RuntimeError):
+        return [actor for actor in candidates if actor.is_alive]
+    return [
+        actor
+        for actor in candidates
+        if int(actor.id) in live_ids
+    ]
+
+
+def destroy_traffic_population(
+    world: Any,
+    controllers: Iterable[Any],
+    walkers: Iterable[Any],
+    vehicles: Iterable[Any],
+) -> None:
+    """Destroy walkers before their attached controllers on OpenHUTB."""
+    live_controllers = registered_actors(controllers)
+    for controller in live_controllers:
         try:
-            if actor.is_alive:
-                actor.destroy()
-        except RuntimeError:
-            pass
+            controller.stop()
+        except (AttributeError, RuntimeError):
+            continue
+    try:
+        world.tick()
+    except RuntimeError:
+        pass
+    destroy_actors(walkers)
+    try:
+        world.tick()
+    except RuntimeError:
+        pass
+    destroy_actors(live_controllers)
+    destroy_actors(vehicles)
 
 
 def actor_role_name(actor: Any) -> str:
@@ -523,12 +544,14 @@ def choose_target_actor(
     attempted_actor_ids: Counter,
     rng: random.Random,
 ) -> Any:
-    candidates = [
-        actor
-        for actor in live_targets(actors, target_class)
-        if used_actor_ids[int(actor.id)] < max_sequences_per_actor
-        and actor_split_assignments.get(int(actor.id), split) == split
-    ]
+    candidates = eligible_target_actors(
+        actors,
+        target_class,
+        used_actor_ids,
+        actor_split_assignments,
+        split,
+        max_sequences_per_actor,
+    )
     if not candidates:
         raise RuntimeError(
             f"没有可用于 {split} 的 {target_class} actor："
@@ -564,159 +587,248 @@ def choose_target_actor(
     return target
 
 
+def eligible_target_actors(
+    actors: Sequence[Any],
+    target_class: str,
+    used_actor_ids: Counter,
+    actor_split_assignments: Dict[int, str],
+    split: str,
+    max_sequences_per_actor: int,
+) -> List[Any]:
+    return [
+        actor
+        for actor in live_targets(actors, target_class)
+        if used_actor_ids[int(actor.id)] < max_sequences_per_actor
+        and actor_split_assignments.get(int(actor.id), split) == split
+    ]
+
+
+def refresh_target_population(
+    client: Any,
+    world: Any,
+    sensor_sync: Dict[str, Any],
+    target_class: str,
+    refresh_index: int,
+    config: Dict[str, Any],
+    vehicles: List[Any],
+    walkers: List[Any],
+    controllers: List[Any],
+    target_vehicles: List[Any],
+    target_walkers: List[Any],
+) -> Dict[str, Any]:
+    """Spawn a bounded batch of fresh targets for one exhausted class."""
+    enabled = bool(
+        config.get("target_population_refresh_enabled_by_class", {}).get(
+            target_class,
+            True,
+        )
+    )
+    target_pool = target_vehicles if target_class == "vehicle" else target_walkers
+    active_before = len(live_targets(target_pool, target_class))
+    active_cap = int(
+        config.get("max_active_target_actors_by_class", {}).get(
+            target_class,
+            32 if target_class == "vehicle" else 48,
+        )
+    )
+    if not enabled:
+        return {
+            "spawned": 0,
+            "active_before": active_before,
+            "active_after": active_before,
+            "reason": f"{target_class} population refresh disabled",
+        }
+    remaining_capacity = max(0, active_cap - active_before)
+    requested = min(
+        remaining_capacity,
+        int(
+            config.get("target_population_refresh_batch_size", {}).get(
+                target_class,
+                6 if target_class == "vehicle" else 8,
+            )
+        ),
+    )
+    if requested <= 0:
+        return {
+            "spawned": 0,
+            "active_before": active_before,
+            "active_after": active_before,
+            "reason": (
+                f"{target_class} active actor cap reached: "
+                f"{active_before}/{active_cap}"
+            ),
+        }
+
+    refresh_seed = (
+        int(config["seed"])
+        + 500_009
+        + int(refresh_index) * 100_003
+        + (17 if target_class == "pedestrian" else 0)
+    )
+    new_vehicles, new_walkers, new_controllers = base.spawn_background_traffic(
+        client,
+        world,
+        requested if target_class == "vehicle" else 0,
+        requested if target_class == "pedestrian" else 0,
+        int(config["tm_port"]),
+        refresh_seed,
+    )
+    vehicles.extend(new_vehicles)
+    walkers.extend(new_walkers)
+    controllers.extend(new_controllers)
+    if target_class == "vehicle":
+        target_vehicles.extend(new_vehicles)
+    else:
+        target_walkers.extend(new_walkers)
+
+    for _ in range(int(config.get("target_population_refresh_warmup_ticks", 20))):
+        world.tick()
+    for item in sensor_sync.values():
+        item.drain()
+
+    active_after = len(live_targets(target_pool, target_class))
+    return {
+        "spawned": max(0, active_after - active_before),
+        "requested": requested,
+        "active_before": active_before,
+        "active_after": active_after,
+        "active_cap": active_cap,
+        "seed": refresh_seed,
+        "reason": "ok" if active_after > active_before else "spawned no live actors",
+    }
+
+
 def distance_xy(first, second) -> float:
     return math.hypot(float(first.x - second.x), float(first.y - second.y))
 
 
-def camera_transform_for_target(
-    carla_map,
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def angle_delta_degrees(current: float, desired: float) -> float:
+    return (desired - current + 180.0) % 360.0 - 180.0
+
+
+def move_angle_toward(
+    current: float,
+    desired: float,
+    response_alpha: float,
+    max_delta: float,
+) -> float:
+    delta = angle_delta_degrees(current, desired) * response_alpha
+    return current + clamp(delta, -max_delta, max_delta)
+
+
+def rear_upper_follow_transform(
     target,
-    target_class: str,
-    direction: str,
-    progress: float,
     config: Dict[str, Any],
-    previous_ground_location=None,
-) -> Tuple[Any, Dict[str, float]]:
-    target_location = target.get_location()
-    target_waypoint = carla_map.get_waypoint(
-        target_location,
-        project_to_road=True,
+    state: Dict[str, Any],
+) -> Tuple[Any, Dict[str, Any]]:
+    """Compute a heading-relative, rate-limited rear-and-above camera pose."""
+    follow = config["rear_upper_follow"]
+    dt = max(
+        1.0 / float(config["fps"]),
+        float(state.get("dt_seconds", 1.0 / float(config["fps"]))),
     )
-    if target_waypoint is None:
-        raise RuntimeError("目标附近没有道路 waypoint")
-
-    preferred_pitch = float(
-        config[
-            "preferred_pitch_vehicle"
-            if target_class == "vehicle"
-            else "preferred_pitch_pedestrian"
-        ]
+    target_transform = target.get_transform()
+    target_location = target_transform.location
+    forward = target_transform.get_forward_vector()
+    forward_norm = max(
+        1.0e-6,
+        math.sqrt(float(forward.x) ** 2 + float(forward.y) ** 2),
     )
-    wave = math.sin(progress * math.pi * 2.0)
-    altitude = (
-        float(config["height_min"])
-        + (float(config["height_max"]) - float(config["height_min"]))
-        * (0.32 + 0.12 * wave)
-    )
-    radius = altitude / math.tan(math.radians(abs(preferred_pitch)))
-    radius *= 1.0 + 0.035 * math.sin(progress * math.pi)
-    radius = float(
-        np.clip(
-            radius,
-            float(config["radius_min"]),
-            float(config["radius_max"]),
-        )
+    forward_x = float(forward.x) / forward_norm
+    forward_y = float(forward.y) / forward_norm
+    desired_location = carla.Location(
+        x=float(target_location.x)
+        - float(follow["back_distance_m"]) * forward_x,
+        y=float(target_location.y)
+        - float(follow["back_distance_m"]) * forward_y,
+        z=float(target_location.z) + float(follow["height_above_target_m"]),
     )
 
-    step = getattr(target_waypoint, direction, None)
-    candidates = step(radius) if callable(step) else []
-    if not candidates:
-        fallback = "next" if direction == "previous" else "previous"
-        step = getattr(target_waypoint, fallback, None)
-        candidates = step(radius) if callable(step) else []
-    if not candidates:
-        raise RuntimeError("无法沿道路找到安全的无人机地面投影点")
-
-    if previous_ground_location is None:
-        camera_waypoint = min(
-            candidates,
-            key=lambda candidate: abs(
-                float(candidate.transform.rotation.yaw)
-                - float(target_waypoint.transform.rotation.yaw)
-            ),
-        )
+    previous = state.get("previous_transform")
+    if previous is None:
+        camera_location = desired_location
     else:
-        camera_waypoint = min(
-            candidates,
-            key=lambda candidate: distance_xy(
-                candidate.transform.location,
-                previous_ground_location,
-            ),
+        response_time = max(1.0e-3, float(follow["position_response_time_s"]))
+        alpha = 1.0 - math.exp(-dt / response_time)
+        dx = alpha * float(desired_location.x - previous.location.x)
+        dy = alpha * float(desired_location.y - previous.location.y)
+        dz = alpha * float(desired_location.z - previous.location.z)
+        distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+        max_distance = float(follow["max_position_speed_mps"]) * dt
+        scale = min(1.0, max_distance / distance) if distance > 1.0e-6 else 1.0
+        camera_location = carla.Location(
+            x=float(previous.location.x) + dx * scale,
+            y=float(previous.location.y) + dy * scale,
+            z=float(previous.location.z) + dz * scale,
         )
 
-    ground = camera_waypoint.transform.location
-    camera_location = carla.Location(
-        x=float(ground.x),
-        y=float(ground.y),
-        z=float(ground.z) + altitude,
-    )
     bbox = target.bounding_box
     aim_location = carla.Location(
         x=float(target_location.x),
         y=float(target_location.y),
         z=float(target_location.z + max(0.4, bbox.extent.z * 0.55)),
     )
-    dx = float(aim_location.x - camera_location.x)
-    dy = float(aim_location.y - camera_location.y)
-    dz = float(aim_location.z - camera_location.z)
-    horizontal = max(0.1, math.hypot(dx, dy))
-    yaw = math.degrees(math.atan2(dy, dx))
-    pitch = math.degrees(math.atan2(dz, horizontal))
-    if not (
-        float(config["pitch_min"]) - 2.0
-        <= pitch
-        <= float(config["pitch_max"]) + 2.0
-    ):
-        raise RuntimeError(f"相机俯角超出安全范围：{pitch:.2f}")
+    look_x = float(aim_location.x - camera_location.x)
+    look_y = float(aim_location.y - camera_location.y)
+    look_z = float(aim_location.z - camera_location.z)
+    horizontal = max(0.1, math.hypot(look_x, look_y))
+    desired_yaw = math.degrees(math.atan2(look_y, look_x))
+    desired_pitch = clamp(
+        math.degrees(math.atan2(look_z, horizontal)),
+        float(follow["camera_pitch_min_deg"]),
+        float(follow["camera_pitch_max_deg"]),
+    )
+    if previous is None:
+        yaw = desired_yaw
+        pitch = desired_pitch
+    else:
+        rotation_time = max(1.0e-3, float(follow["rotation_response_time_s"]))
+        rotation_alpha = 1.0 - math.exp(-dt / rotation_time)
+        yaw = move_angle_toward(
+            float(previous.rotation.yaw),
+            desired_yaw,
+            rotation_alpha,
+            float(follow["max_yaw_rate_deg_s"]) * dt,
+        )
+        pitch = move_angle_toward(
+            float(previous.rotation.pitch),
+            desired_pitch,
+            rotation_alpha,
+            float(follow["max_pitch_rate_deg_s"]) * dt,
+        )
+        pitch = clamp(
+            pitch,
+            float(follow["camera_pitch_min_deg"]),
+            float(follow["camera_pitch_max_deg"]),
+        )
 
     transform = carla.Transform(
         camera_location,
         carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0),
     )
-    return transform, {
-        "altitude_m": altitude,
-        "ground_distance_m": horizontal,
-        "pitch_deg": pitch,
-        "yaw_deg": yaw,
-        "ground_x": float(ground.x),
-        "ground_y": float(ground.y),
-        "ground_z": float(ground.z),
-    }
-
-
-def blend_angle_degrees(previous: float, current: float, alpha: float) -> float:
-    delta = (current - previous + 180.0) % 360.0 - 180.0
-    return previous + alpha * delta
-
-
-def look_at_transform(camera_location, aim_location) -> Any:
-    dx = float(aim_location.x - camera_location.x)
-    dy = float(aim_location.y - camera_location.y)
-    dz = float(aim_location.z - camera_location.z)
-    horizontal = max(0.1, math.hypot(dx, dy))
-    return carla.Transform(
-        camera_location,
-        carla.Rotation(
-            pitch=math.degrees(math.atan2(dz, horizontal)),
-            yaw=math.degrees(math.atan2(dy, dx)),
-            roll=0.0,
-        ),
+    state["previous_transform"] = transform
+    desired_error = math.sqrt(
+        float(desired_location.x - camera_location.x) ** 2
+        + float(desired_location.y - camera_location.y) ** 2
+        + float(desired_location.z - camera_location.z) ** 2
     )
-
-
-def blend_transforms(previous, current, position_alpha: float, rotation_alpha: float):
-    location = carla.Location(
-        x=float(previous.location.x)
-        + position_alpha * float(current.location.x - previous.location.x),
-        y=float(previous.location.y)
-        + position_alpha * float(current.location.y - previous.location.y),
-        z=float(previous.location.z)
-        + position_alpha * float(current.location.z - previous.location.z),
+    stats = motion_pose_stats(transform, target, "rear_upper_follow")
+    stats.update(
+        {
+            "desired_x": float(desired_location.x),
+            "desired_y": float(desired_location.y),
+            "desired_z": float(desired_location.z),
+            "desired_position_error_m": desired_error,
+            "target_forward_x": forward_x,
+            "target_forward_y": forward_y,
+            "parameter_status": str(follow.get("status", "pilot_provisional")),
+        }
     )
-    rotation = carla.Rotation(
-        pitch=blend_angle_degrees(
-            float(previous.rotation.pitch),
-            float(current.rotation.pitch),
-            rotation_alpha,
-        ),
-        yaw=blend_angle_degrees(
-            float(previous.rotation.yaw),
-            float(current.rotation.yaw),
-            rotation_alpha,
-        ),
-        roll=0.0,
-    )
-    return carla.Transform(location, rotation)
+    return transform, stats
 
 
 def motion_pose_stats(transform, target, motion_mode: str) -> Dict[str, Any]:
@@ -758,83 +870,10 @@ def camera_transform_for_motion(
     config: Dict[str, Any],
     state: Dict[str, Any],
 ) -> Tuple[Any, Dict[str, Any]]:
-    if motion_mode == "fixed_hover":
-        if "fixed_transform" not in state:
-            transform, _ = camera_transform_for_target(
-                carla_map,
-                target,
-                target_class,
-                direction,
-                0.0,
-                config,
-            )
-            state["fixed_transform"] = transform
-        transform = state["fixed_transform"]
-    elif motion_mode == "lagged_follow":
-        ideal, _ = camera_transform_for_target(
-            carla_map,
-            target,
-            target_class,
-            direction,
-            progress,
-            config,
-            previous_ground_location=state.get("previous_ground"),
-        )
-        previous = state.get("previous_transform")
-        transform = ideal if previous is None else blend_transforms(
-            previous,
-            ideal,
-            float(config.get("lagged_follow_position_alpha", 0.28)),
-            float(config.get("lagged_follow_rotation_alpha", 0.22)),
-        )
-        state["previous_ground"] = carla.Location(
-            x=float(transform.location.x),
-            y=float(transform.location.y),
-            z=float(target.get_location().z),
-        )
-        state["previous_transform"] = transform
-    elif motion_mode == "lateral_orbit":
-        target_transform = target.get_transform()
-        target_location = target_transform.location
-        sweep = float(config.get("orbit_sweep_degrees", 120.0))
-        bearing = (
-            float(target_transform.rotation.yaw)
-            + 90.0
-            - sweep * 0.5
-            + sweep * progress
-        )
-        phase = math.sin(progress * math.pi)
-        radius = float(config["radius_max"]) - (
-            float(config["radius_max"]) - float(config["radius_min"])
-        ) * phase
-        altitude = float(config["height_min"]) + (
-            float(config["height_max"]) - float(config["height_min"])
-        ) * (0.25 + 0.65 * phase)
-        radians = math.radians(bearing)
-        camera_location = carla.Location(
-            x=float(target_location.x + radius * math.cos(radians)),
-            y=float(target_location.y + radius * math.sin(radians)),
-            z=float(target_location.z + altitude),
-        )
-        bbox = target.bounding_box
-        aim_location = carla.Location(
-            x=float(target_location.x),
-            y=float(target_location.y),
-            z=float(target_location.z + max(0.4, bbox.extent.z * 0.55)),
-        )
-        ideal = look_at_transform(camera_location, aim_location)
-        previous = state.get("previous_transform")
-        transform = ideal if previous is None else blend_transforms(
-            previous,
-            ideal,
-            1.0,
-            float(config.get("orbit_rotation_alpha", 0.3)),
-        )
-        state["previous_transform"] = transform
-    else:
-        raise RuntimeError(f"不支持的运动模式：{motion_mode}")
-
-    return transform, motion_pose_stats(transform, target, motion_mode)
+    del carla_map, target_class, direction, progress
+    if motion_mode != "rear_upper_follow":
+        raise RuntimeError(f"正式采集只支持 rear_upper_follow：{motion_mode}")
+    return rear_upper_follow_transform(target, config, state)
 
 
 def annotation_equivalent_side(annotation: Dict[str, Any]) -> float:
@@ -1040,18 +1079,14 @@ def collect_sequence_attempt(
     attempt_dir: Path,
     direction: str,
     config: Dict[str, Any],
+    cooperative: CooperativeManager,
 ) -> Tuple[bool, Dict[str, Any]]:
     color_dir = attempt_dir / "color"
     label_dir = attempt_dir / "labels_yolo"
     color_dir.mkdir(parents=True, exist_ok=True)
     label_dir.mkdir(parents=True, exist_ok=True)
     planned_max_frames = frames_for_sequence(spec, config)
-    min_frames = int(
-        config.get("min_frames_by_motion_mode", {}).get(spec.motion_mode, 1)
-    )
-    fixed_hover_stop_after_absent = int(
-        config.get("fixed_hover_stop_after_absent_frames", 5)
-    )
+    min_frames = max(1, int(config.get("minimum_track_length", 1)))
     sample_interval_ticks = sample_interval_ticks_for_sequence(spec, config)
     max_absent_ratio = max_absent_ratio_for_sequence(spec, config)
     max_consecutive_absent = max_consecutive_absent_for_sequence(spec, config)
@@ -1073,11 +1108,17 @@ def collect_sequence_attempt(
     previous_gray: Optional[np.ndarray] = None
     target_world_step_distances: List[float] = []
     previous_target_world_location = None
-    motion_state: Dict[str, Any] = {}
+    motion_state: Dict[str, Any] = {
+        "dt_seconds": sample_interval_ticks / float(config["fps"]),
+    }
     consecutive_absent = 0
     absent_frames = 0
     class_counts: Counter = Counter()
     termination_reason = "max_frames_reached"
+    previous_cooperative_state: Optional[str] = None
+    cooperative_state_counts: Counter = Counter()
+    interaction_event_count = 0
+    reacquisition_count = 0
 
     metadata_path = attempt_dir / "annotations.jsonl"
     with metadata_path.open("w", encoding="utf-8") as metadata_file:
@@ -1102,9 +1143,11 @@ def collect_sequence_attempt(
                 world.get_spectator().set_transform(camera_transform)
             if frame_index == 0:
                 for _ in range(int(config.get("streaming_warmup_frames", 0))):
+                    cooperative.before_world_tick()
                     world.tick()
                 for item in sensor_sync.values():
                     item.drain()
+                cooperative.ground_vehicle.drain()
             try:
                 raw = None
                 carla_frame = -1
@@ -1113,8 +1156,10 @@ def collect_sequence_attempt(
                         world,
                         sensor_sync,
                         float(config["sensor_timeout"]),
+                        before_tick=cooperative.before_world_tick,
                     )
                 assert raw is not None
+                ground_raw = cooperative.collect_ground(carla_frame)
                 rgb_data = raw["rgb"]
                 depth_data = raw["depth"]
                 semantic_data = raw["semantic"]
@@ -1188,6 +1233,38 @@ def collect_sequence_attempt(
                 depth_m,
                 semantic_id,
                 config,
+            )
+            air_observations = enrich_observations(
+                annotations,
+                cooperative.object_registry,
+                "uav_01_rgb",
+            )
+            ground_depth = base.decode_carla_depth_meters(
+                ground_raw["vehicle_01_depth"]
+            )
+            ground_semantic = base.decode_semantic_segmentation(
+                ground_raw["vehicle_01_semantic"]
+            )
+            ground_config = dict(config)
+            ground_vehicle_config = config["cooperative"]["ground_vehicle"]
+            ground_config.update(
+                {
+                    "width": int(ground_vehicle_config["image_width"]),
+                    "height": int(ground_vehicle_config["image_height"]),
+                    "fov": float(ground_vehicle_config["camera_fov_deg"]),
+                }
+            )
+            ground_annotations = build_actor_annotations(
+                world,
+                ground_raw["vehicle_01_rgb"].transform,
+                ground_depth,
+                ground_semantic,
+                ground_config,
+            )
+            ground_observations = enrich_observations(
+                ground_annotations,
+                cooperative.object_registry,
+                "vehicle_01_rgb",
             )
             target_annotation = find_target_annotation(
                 annotations,
@@ -1279,6 +1356,98 @@ def collect_sequence_attempt(
                 int(config["width"]),
                 int(config["height"]),
             )
+            staging = cooperative.writer.current_path
+            if staging is None:
+                raise RuntimeError("cooperative dataset transaction is not active")
+            ground_rgb_path = (
+                staging / "platforms/ground/vehicle_01/rgb" / f"{frame_name}.png"
+            )
+            ground_rgb_path.parent.mkdir(parents=True, exist_ok=True)
+            base.save_rgb(
+                ground_raw["vehicle_01_rgb"],
+                ground_rgb_path,
+                weather_name=spec.weather,
+                depth_m=ground_depth,
+                random_seed=int(config["seed"]) + frame_index,
+            )
+            depth_path = (
+                staging / "platforms/ground/vehicle_01/depth_m" / f"{frame_name}.npy"
+            )
+            depth_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(depth_path, ground_depth.astype(np.float32))
+            semantic_path = (
+                staging / "platforms/ground/vehicle_01/semantic" / f"{frame_name}.png"
+            )
+            semantic_path.parent.mkdir(parents=True, exist_ok=True)
+            base.save_semantic_id(ground_semantic, semantic_path)
+            cooperative.writer.copy_file(
+                image_path,
+                f"platforms/air/uav_01/rgb/{frame_name}.png",
+            )
+            air_depth_path = (
+                staging / "platforms/air/uav_01/depth_m" / f"{frame_name}.npy"
+            )
+            air_depth_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(air_depth_path, depth_m.astype(np.float32))
+            air_semantic_path = (
+                staging / "platforms/air/uav_01/semantic" / f"{frame_name}.png"
+            )
+            air_semantic_path.parent.mkdir(parents=True, exist_ok=True)
+            base.save_semantic_id(semantic_id, air_semantic_path)
+            target_identity = cooperative.object_registry.lookup(int(target.id))
+            air_target = next(
+                (
+                    item
+                    for item in air_observations
+                    if int(item.get("carla_actor_id", -1)) == int(target.id)
+                ),
+                None,
+            )
+            ground_target = next(
+                (
+                    item
+                    for item in ground_observations
+                    if int(item.get("carla_actor_id", -1)) == int(target.id)
+                ),
+                None,
+            )
+            event = target_event_record(
+                carla_frame,
+                str(target_identity["global_object_uuid"]),
+                air_target,
+                ground_target,
+                previous_cooperative_state,
+            )
+            previous_cooperative_state = str(event["visibility_state"])
+            cooperative_state_counts[previous_cooperative_state] += 1
+            interaction_event_count += len(event["events"])
+            reacquisition_count += int("reacquisition_event" in event["events"])
+            snapshot = world.get_snapshot()
+            all_sensor_data = {
+                "uav_01_%s" % name: data
+                for name, data in raw.items()
+            }
+            all_sensor_data.update(ground_raw)
+            frame_report = cooperative.record_frame(
+                carla_frame,
+                float(rgb_data.timestamp),
+                float(snapshot.timestamp.elapsed_seconds),
+                {
+                    "uav_01_rgb": air_observations,
+                    "vehicle_01_rgb": ground_observations,
+                },
+                all_sensor_data,
+                ground_raw,
+            )
+            event.update(
+                {
+                    "timestamp": float(rgb_data.timestamp),
+                    "simulation_time": float(snapshot.timestamp.elapsed_seconds),
+                    "sample_index": int(frame_report["sample_index"]),
+                    "source_tick": int(carla_frame),
+                }
+            )
+            cooperative.writer.append_jsonl("events/visibility.jsonl", event)
             for annotation in annotations:
                 class_counts[annotation["class_name"]] += 1
 
@@ -1332,37 +1501,6 @@ def collect_sequence_attempt(
                         f"weather={spec.weather}"
                     ),
                 )
-
-            if (
-                spec.motion_mode == "fixed_hover"
-                and consecutive_absent >= fixed_hover_stop_after_absent
-            ):
-                if len(groundtruth) < min_frames:
-                    return False, {
-                        "reason": (
-                            "固定悬停目标过早离开画面："
-                            f"saved={len(groundtruth)}, min_required={min_frames}"
-                        ),
-                        "saved_frames": len(groundtruth),
-                    }
-                if frame_index not in {
-                    0,
-                    planned_max_frames // 2,
-                    planned_max_frames - 1,
-                }:
-                    save_overlay(
-                        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-                        annotations,
-                        int(target.id),
-                        target_annotation,
-                        attempt_dir / f"overlay_{frame_name}.png",
-                        (
-                            f"{spec.name} frame={frame_index + 1} "
-                            "stop=5_consecutive_absent"
-                        ),
-                    )
-                termination_reason = "target_absent_for_consecutive_frames"
-                break
 
     actual_frames = len(groundtruth)
     absent_ratio = absent_frames / float(actual_frames)
@@ -1496,7 +1634,20 @@ def collect_sequence_attempt(
         "yolo_objects": dict(class_counts),
         "vot_region_format": "x,y,width,height; absent frames are 0,0,0,0",
         "public_modalities": ["RGB"],
-        "internal_quality_sensors_not_saved": ["depth", "semantic"],
+        "auxiliary_modalities_saved_for_qa": ["depth", "semantic"],
+        "cooperative_visibility_state_counts": dict(cooperative_state_counts),
+        "joint_visible_ratio": float(
+            cooperative_state_counts["Joint Visible"] / max(1, actual_frames)
+        ),
+        "uav_dominant_ratio": float(
+            cooperative_state_counts["UAV Dominant"] / max(1, actual_frames)
+        ),
+        "vehicle_dominant_ratio": float(
+            cooperative_state_counts["Vehicle Dominant"] / max(1, actual_frames)
+        ),
+        "interaction_event_count": int(interaction_event_count),
+        "reacquisition_count": int(reacquisition_count),
+        "cooperative_threshold_status": "pilot_provisional",
     }
     (attempt_dir / "sequence_meta.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
@@ -1586,9 +1737,7 @@ def load_sequence_checkpoint(
         frame_count = int(summary["frames"])
     except (KeyError, TypeError, ValueError):
         return None, "invalid frame count in sequence_meta"
-    min_frames = int(
-        config.get("min_frames_by_motion_mode", {}).get(spec.motion_mode, 1)
-    )
+    min_frames = max(1, int(config.get("minimum_track_length", 1)))
     if not min_frames <= frame_count <= frames_for_sequence(spec, config):
         return None, f"frame count outside valid range: {frame_count}"
 
@@ -2009,6 +2158,13 @@ def main() -> None:
     random.seed(int(config["seed"]))
     np.random.seed(int(config["seed"]))
 
+    simulator_session = ensure_simulator(
+        carla,
+        str(config["host"]),
+        int(config["port"]),
+        config.get("map"),
+        dict(config.get("simulator", {})),
+    )
     client = carla.Client(str(config["host"]), int(config["port"]))
     client.set_timeout(float(config["timeout"]))
     world = (
@@ -2029,8 +2185,17 @@ def main() -> None:
     accepted_specs: List[SequenceSpec] = []
     sequence_summaries: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
+    population_refresh_history: List[Dict[str, Any]] = []
     target_vehicles: List[Any] = []
     target_walkers: List[Any] = []
+    cooperative = CooperativeManager(
+        client,
+        world,
+        carla,
+        Path(config["cooperative"]["output_root"]),
+        "task2",
+        config["cooperative"],
+    )
 
     if args.resume:
         accepted_specs, sequence_summaries = load_resume_checkpoints(
@@ -2133,30 +2298,17 @@ def main() -> None:
 
         initial_transform = None
         initial_errors: List[str] = []
-        # The initial pose only exists to spawn the reusable sensor rig. Custom
-        # maps may have bridge pedestrians beside a road whose topology cannot
-        # be traversed in one direction, so probe several actors and directions.
+        # The initial pose only exists to spawn the reusable sensor rig.
         for initial_target in (target_vehicles + target_walkers)[:80]:
-            target_class = (
-                "pedestrian"
-                if initial_target.type_id.startswith("walker.")
-                else "vehicle"
-            )
-            for direction in ("previous", "next"):
-                try:
-                    initial_transform, _ = camera_transform_for_target(
-                        world.get_map(),
-                        initial_target,
-                        target_class,
-                        direction,
-                        0.0,
-                        config,
-                    )
-                    break
-                except RuntimeError as exc:
-                    initial_errors.append(str(exc))
-            if initial_transform is not None:
+            try:
+                initial_transform, _ = rear_upper_follow_transform(
+                    initial_target,
+                    config,
+                    {"dt_seconds": 1.0 / float(config["fps"])},
+                )
                 break
+            except RuntimeError as exc:
+                initial_errors.append(str(exc))
         if initial_transform is None:
             raise RuntimeError(
                 "无法从现有目标生成初始相机位姿："
@@ -2192,100 +2344,277 @@ def main() -> None:
                 item.drain()
 
             accepted = False
-            attempted_actor_ids: Counter = Counter()
-            for attempt in range(int(config["max_sequence_attempts"])):
+            population_round = 0
+            population_refreshes_used = 0
+            max_refreshes = int(
+                config.get("max_target_population_refreshes", 2)
+            )
+            min_candidates = int(
+                config.get("min_eligible_target_candidates", 2)
+            )
+            max_attempts = int(config["max_sequence_attempts"])
+            last_failure_reason = "未找到可用目标"
+            while not accepted:
                 actors = (
                     target_vehicles
                     if spec.target_class == "vehicle"
                     else target_walkers
                 )
-                target = choose_target_actor(
+                eligible = eligible_target_actors(
                     actors,
                     spec.target_class,
                     used_actor_ids,
                     actor_split_assignments,
                     spec.split,
                     int(config.get("max_sequences_per_target_actor", 2)),
-                    attempted_actor_ids,
-                    rng,
                 )
-                direction = (
-                    "previous"
-                    if (attempt + sequence_index) % 2 == 0
-                    else "next"
-                )
-                attempt_dir = paths["tmp"] / (
-                    f"{spec.name}_attempt_{attempt:02d}"
-                )
-                if attempt_dir.exists():
-                    shutil.rmtree(attempt_dir)
-                attempt_dir.mkdir(parents=True)
-                success, summary = collect_sequence_attempt(
-                    world,
-                    sensors,
-                    sensor_sync,
-                    target,
-                    spec,
-                    attempt_dir,
-                    direction,
-                    config,
-                )
-                if success:
-                    target_actor_id = int(target.id)
-                    assigned_split = actor_split_assignments.get(
-                        target_actor_id
+                if (
+                    len(eligible) < min_candidates
+                    and population_refreshes_used < max_refreshes
+                ):
+                    refresh = refresh_target_population(
+                        client,
+                        world,
+                        sensor_sync,
+                        spec.target_class,
+                        sequence_index * (max_refreshes + 1)
+                        + population_refreshes_used,
+                        config,
+                        vehicles,
+                        walkers,
+                        controllers,
+                        target_vehicles,
+                        target_walkers,
                     )
-                    if assigned_split is not None and assigned_split != spec.split:
-                        raise RuntimeError(
-                            f"目标 actor={target_actor_id} 不允许从 "
-                            f"{assigned_split} 跨到 {spec.split}"
-                        )
-                    actor_split_assignments[target_actor_id] = spec.split
-                    used_actor_ids[target_actor_id] += 1
-                    summary["attempt"] = attempt
-                    summary["camera_road_direction"] = direction
-                    (attempt_dir / "sequence_meta.json").write_text(
-                        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8",
+                    population_refreshes_used += 1
+                    population_refresh_history.append(
+                        {
+                            "sequence": spec.name,
+                            "trigger": "eligible_pool_below_minimum",
+                            "eligible_before": len(eligible),
+                            "refresh_number": population_refreshes_used,
+                            **refresh,
+                        }
                     )
-                    finalize_sequence(
-                        attempt_dir,
-                        paths["vot"] / spec.name,
-                        paths["qa"],
-                        spec,
-                    )
-                    accepted_specs.append(spec)
-                    sequence_summaries.append(summary)
-                    completed_names.add(spec.name)
-                    write_resume_state(
-                        paths["root"],
-                        specs,
-                        accepted_specs,
-                        sequence_summaries,
-                        failures,
-                        "in_progress",
-                    )
-                    accepted = True
                     print(
-                        f"[ACCEPT] actor={target.id} "
-                        f"absent={summary['absent_ratio']:.3f} "
-                        "target_eq_median="
-                        f"{summary['target_equivalent_side_px']['median']:.1f}px"
+                        f"[REFRESH-TARGETS] {spec.name} "
+                        f"class={spec.target_class} "
+                        f"refresh={population_refreshes_used}/{max_refreshes} "
+                        f"eligible={len(eligible)} spawned={refresh['spawned']} "
+                        f"active={refresh['active_after']} "
+                        f"reason={refresh['reason']}",
+                        flush=True,
+                    )
+                    if int(refresh["spawned"]) > 0:
+                        population_round += 1
+                        continue
+
+                eligible = eligible_target_actors(
+                    actors,
+                    spec.target_class,
+                    used_actor_ids,
+                    actor_split_assignments,
+                    spec.split,
+                    int(config.get("max_sequences_per_target_actor", 2)),
+                )
+                if not eligible:
+                    last_failure_reason = (
+                        f"{spec.split}/{spec.target_class} 没有剩余合格目标"
                     )
                     break
-                failures.append(
+
+                attempted_actor_ids: Counter = Counter()
+                for local_attempt in range(max_attempts):
+                    attempt = population_round * max_attempts + local_attempt
+                    try:
+                        target = choose_target_actor(
+                            actors,
+                            spec.target_class,
+                            used_actor_ids,
+                            actor_split_assignments,
+                            spec.split,
+                            int(config.get("max_sequences_per_target_actor", 2)),
+                            attempted_actor_ids,
+                            rng,
+                        )
+                    except RuntimeError as exc:
+                        last_failure_reason = str(exc)
+                        break
+                    direction = "target_heading"
+                    attempt_dir = paths["tmp"] / (
+                        f"{spec.name}_attempt_{attempt:03d}"
+                    )
+                    if attempt_dir.exists():
+                        shutil.rmtree(attempt_dir)
+                    attempt_dir.mkdir(parents=True)
+                    scene_seed = (
+                        int(config["seed"])
+                        + int(spec.sequence_id) * 100_003
+                        + int(attempt)
+                    )
+                    cooperative.prepare_scene(
+                        spec.name,
+                        scene_seed,
+                        str(cooperative.config["route_profile"]),
+                        actors=list(target_vehicles) + list(target_walkers),
+                        target_actor=target,
+                    )
+                    cooperative.register_air_platform(
+                        "uav_01",
+                        virtual=False,
+                        platform_type="uav",
+                        sensors=sensors,
+                        required_modalities=("rgb", "depth", "semantic"),
+                    )
+                    try:
+                        success, summary = collect_sequence_attempt(
+                            world,
+                            sensors,
+                            sensor_sync,
+                            target,
+                            spec,
+                            attempt_dir,
+                            direction,
+                            config,
+                            cooperative,
+                        )
+                    except Exception:
+                        cooperative.close_scene(
+                            abort_reason="sequence_attempt_exception"
+                        )
+                        raise
+                    if success:
+                        target_actor_id = int(target.id)
+                        assigned_split = actor_split_assignments.get(
+                            target_actor_id
+                        )
+                        if (
+                            assigned_split is not None
+                            and assigned_split != spec.split
+                        ):
+                            raise RuntimeError(
+                                f"目标 actor={target_actor_id} 不允许从 "
+                                f"{assigned_split} 跨到 {spec.split}"
+                            )
+                        actor_split_assignments[target_actor_id] = spec.split
+                        used_actor_ids[target_actor_id] += 1
+                        summary["attempt"] = attempt
+                        summary["target_population_round"] = population_round
+                        summary["target_population_refreshes_used"] = (
+                            population_refreshes_used
+                        )
+                        summary["camera_road_direction"] = direction
+                        (attempt_dir / "sequence_meta.json").write_text(
+                            json.dumps(summary, ensure_ascii=False, indent=2)
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                        finalize_sequence(
+                            attempt_dir,
+                            paths["vot"] / spec.name,
+                            paths["qa"],
+                            spec,
+                        )
+                        cooperative.commit_scene(
+                            {
+                                "split": spec.split,
+                                "motion_mode": "rear_upper_follow",
+                                "target_class": spec.target_class,
+                                "frames": int(summary["frames"]),
+                                "derived_format": "VOT/SOT",
+                                "parameter_status": "pilot_provisional",
+                                "joint_visible_ratio": summary["joint_visible_ratio"],
+                                "uav_dominant_ratio": summary["uav_dominant_ratio"],
+                                "vehicle_dominant_ratio": summary[
+                                    "vehicle_dominant_ratio"
+                                ],
+                                "interaction_event_count": summary[
+                                    "interaction_event_count"
+                                ],
+                                "reacquisition_count": summary[
+                                    "reacquisition_count"
+                                ],
+                            }
+                        )
+                        accepted_specs.append(spec)
+                        sequence_summaries.append(summary)
+                        completed_names.add(spec.name)
+                        write_resume_state(
+                            paths["root"],
+                            specs,
+                            accepted_specs,
+                            sequence_summaries,
+                            failures,
+                            "in_progress",
+                        )
+                        accepted = True
+                        print(
+                            f"[ACCEPT] actor={target.id} "
+                            f"absent={summary['absent_ratio']:.3f} "
+                            "target_eq_median="
+                            f"{summary['target_equivalent_side_px']['median']:.1f}px"
+                        )
+                        break
+                    last_failure_reason = str(summary["reason"])
+                    cooperative.close_scene(
+                        abort_reason="sequence_attempt_rejected: "
+                        + last_failure_reason
+                    )
+                    failures.append(
+                        {
+                            "sequence": spec.name,
+                            "attempt": attempt,
+                            "target_population_round": population_round,
+                            "target_actor_id": int(target.id),
+                            **summary,
+                        }
+                    )
+                    print(
+                        f"[RETRY] {spec.name} attempt={attempt + 1}: "
+                        f"{summary['reason']}"
+                    )
+                    shutil.rmtree(attempt_dir, ignore_errors=True)
+                if accepted:
+                    break
+                if population_refreshes_used >= max_refreshes:
+                    break
+
+                refresh = refresh_target_population(
+                    client,
+                    world,
+                    sensor_sync,
+                    spec.target_class,
+                    sequence_index * (max_refreshes + 1)
+                    + population_refreshes_used,
+                    config,
+                    vehicles,
+                    walkers,
+                    controllers,
+                    target_vehicles,
+                    target_walkers,
+                )
+                population_refreshes_used += 1
+                population_refresh_history.append(
                     {
                         "sequence": spec.name,
-                        "attempt": attempt,
-                        "target_actor_id": int(target.id),
-                        **summary,
+                        "trigger": "attempt_round_exhausted",
+                        "refresh_number": population_refreshes_used,
+                        **refresh,
                     }
                 )
                 print(
-                    f"[RETRY] {spec.name} attempt={attempt + 1}: "
-                    f"{summary['reason']}"
+                    f"[REFRESH-TARGETS] {spec.name} "
+                    f"class={spec.target_class} "
+                    f"refresh={population_refreshes_used}/{max_refreshes} "
+                    f"spawned={refresh['spawned']} "
+                    f"active={refresh['active_after']} "
+                    f"reason={refresh['reason']}",
+                    flush=True,
                 )
-                shutil.rmtree(attempt_dir, ignore_errors=True)
+                if int(refresh["spawned"]) <= 0:
+                    last_failure_reason = str(refresh["reason"])
+                    break
+                population_round += 1
             if not accepted:
                 write_resume_state(
                     paths["root"],
@@ -2296,7 +2625,8 @@ def main() -> None:
                     "sequence_failed",
                 )
                 raise RuntimeError(
-                    f"序列 {spec.name} 在最大尝试次数内仍未通过质量检查"
+                    f"序列 {spec.name} 在目标池刷新上限内仍未通过："
+                    f"{last_failure_reason}"
                 )
 
         summaries_by_name = {
@@ -2334,6 +2664,7 @@ def main() -> None:
             ),
             "sequence_summaries": sequence_summaries,
             "failed_attempts": failures,
+            "target_population_refreshes": population_refresh_history,
             "yolo": yolo_summary,
             "quality_audit": audit,
         }
@@ -2360,15 +2691,14 @@ def main() -> None:
         print(json.dumps(audit, ensure_ascii=False, indent=2))
         print(f"[DONE] {paths['root']}")
     finally:
+        cooperative.close()
         destroy_actors(sensors.values())
-        for controller in controllers:
-            try:
-                controller.stop()
-            except RuntimeError:
-                pass
-        destroy_actors(controllers)
-        destroy_actors(walkers)
-        destroy_actors(vehicles)
+        destroy_traffic_population(
+            world,
+            controllers,
+            walkers,
+            vehicles,
+        )
         try:
             client.get_trafficmanager(int(config["tm_port"])).set_synchronous_mode(
                 False
@@ -2384,6 +2714,7 @@ def main() -> None:
             world.apply_settings(original_settings)
         except RuntimeError:
             pass
+        close_simulator(simulator_session)
 
 
 if __name__ == "__main__":

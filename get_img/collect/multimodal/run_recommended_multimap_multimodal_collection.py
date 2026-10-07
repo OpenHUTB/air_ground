@@ -29,7 +29,12 @@ CCSP_QUALITY_COLLECTOR = (
 )
 CONFIG = PROJECT_DIR / "collection_config.json"
 STATIC_PEDESTRIAN_HELPER = PROJECT_DIR / "prepare_static_pedestrians_carla.py"
-OUTPUT_ROOT = GET_IMG_ROOT / "dataset_uav_multimap_town600_hutb300_ccsp300"
+OUTPUT_ROOT = (
+    GET_IMG_ROOT
+    / "AirGroundCoopSuite"
+    / "release"
+    / "derived_task1_detection"
+)
 
 OPENHUTB_PYTHON = Path(r"D:\anaconda2023.09\envs\openhutb\python.exe")
 GENERIC_SIMULATOR = Path(r"E:\OpenHUTB\中电软件园\hutb_windows_v2.10.0\CarlaUE4.exe")
@@ -382,6 +387,8 @@ def run_collector(
         "300",
         "--out",
         str(map_output),
+        "--cooperative-output-root",
+        str(GET_IMG_ROOT / "AirGroundCoopSuite" / "release" / str(map_name)),
         "--sequences",
         "1",
         "--frames",

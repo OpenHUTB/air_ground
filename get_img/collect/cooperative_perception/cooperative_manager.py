@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+import numpy as np
+
 from .association_manager import AssociationManager
 from .air_sensor_adapter import AirSensorAdapter
-from .calibration_manager import CalibrationManager
+from .calibration_manager import CalibrationManager, backproject_pixel, project_world_point
 from .communication_manager import CommunicationManager
 from .dataset_writer import DatasetWriter
 from .ground_vehicle_manager import GroundVehicleManager
 from .object_registry import ObjectRegistry
 from .platform_registry import PlatformRegistry
 from .quality_manager import QualityManager
+from .runtime import CooperativePerceptionRuntime
 from .schema import SCHEMA_VERSION, TASK_IDS
 
 
@@ -26,6 +31,18 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
         else:
             merged[key] = value
     return merged
+
+
+def _code_version() -> Optional[str]:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parents[3]),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
 
 
 class CooperativeManager:
@@ -68,6 +85,11 @@ class CooperativeManager:
         self.scene_seed = 0
         self.air_adapters: Dict[str, AirSensorAdapter] = {}
         self.sample_index = 0
+        self.runtime: Optional[CooperativePerceptionRuntime] = None
+        self.target_actor_id: Optional[int] = None
+        self.defer_perception = bool(
+            self.config.get("perception", {}).get("defer_until_replay", False)
+        )
 
     def prepare_scene(
         self,
@@ -83,6 +105,7 @@ class CooperativeManager:
         self.scene_seed = int(scene_seed)
         self.sample_index = 0
         self.air_adapters = {}
+        self.platform_registry = PlatformRegistry()
         self.object_registry = ObjectRegistry(
             self.scene_id,
             dataset_namespace=str(
@@ -90,6 +113,7 @@ class CooperativeManager:
             ),
         )
         self.object_registry.register_many(list(actors))
+        self.target_actor_id = None if target_actor is None else int(target_actor.id)
         self.ground_vehicle.spawn_vehicle(
             scene_id=self.scene_id,
             scene_seed=self.scene_seed,
@@ -119,7 +143,21 @@ class CooperativeManager:
         self.communication = CommunicationManager(
             self.scene_seed,
             dict(self.config.get("communication", {})),
+            self.scene_id,
         )
+        if self.defer_perception:
+            self.runtime = None
+        else:
+            try:
+                self.runtime = CooperativePerceptionRuntime(
+                    self.task_id, self.scene_id, self.communication, self.config
+                )
+            except Exception:
+                self.ground_vehicle.destroy()
+                self.object_registry = None
+                self.communication = None
+                self.scene_id = ""
+                raise
         path = self.writer.begin(self.scene_id, overwrite=overwrite_staging)
         self.writer.write_json(
             "scene.json",
@@ -130,6 +168,11 @@ class CooperativeManager:
                 "scene_seed": self.scene_seed,
                 "seed_lineage": "%s:%d" % (self.scene_id, self.scene_seed),
                 "threshold_status": "pilot_provisional",
+                "perception_execution": (
+                    "deferred_until_offline_replay"
+                    if self.defer_perception
+                    else "online"
+                ),
                 "topology": dict(self.config.get("topology", {})),
                 "frame_contract": {
                     "barrier_key": "world_frame_id",
@@ -192,6 +235,25 @@ class CooperativeManager:
 
     def collect_ground(self, world_frame_id: int) -> Dict[str, Any]:
         return self.ground_vehicle.collect_frame(world_frame_id)
+
+    @staticmethod
+    def _camera_array(data: Any) -> np.ndarray:
+        array = np.frombuffer(data.raw_data, dtype=np.uint8).reshape(
+            int(data.height), int(data.width), 4
+        )
+        return array[:, :, :3].copy()
+
+    @staticmethod
+    def _metric_depth(data: Any) -> np.ndarray:
+        array = np.frombuffer(data.raw_data, dtype=np.uint8).reshape(
+            int(data.height), int(data.width), 4
+        ).astype(np.float64)
+        encoded = array[:, :, 2] + array[:, :, 1] * 256.0 + array[:, :, 0] * 65536.0
+        return (encoded / 16777215.0 * 1000.0).astype(np.float32)
+
+    @staticmethod
+    def _lidar_points(data: Any) -> np.ndarray:
+        return np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4)[:, :3].copy()
 
     def record_frame(
         self,
@@ -257,6 +319,9 @@ class CooperativeManager:
             "sync": sync_report,
         })
         self.writer.append_jsonl("platforms/ground/vehicle_01/states.jsonl", state)
+        platform_states: Dict[str, Dict[str, Any]] = {
+            self.ground_vehicle.platform_id: state
+        }
         for platform_id, adapter in sorted(self.air_adapters.items()):
             air_state = adapter.frame_state(
                 world_frame_id,
@@ -268,6 +333,7 @@ class CooperativeManager:
                 "platforms/air/%s/states.jsonl" % platform_id,
                 air_state,
             )
+            platform_states[platform_id] = air_state
         ground_vehicle_transform = self.ground_vehicle.vehicle.get_transform()
         calibrations: Dict[str, Any] = {}
         ground_sensor_transforms: Dict[str, Any] = {}
@@ -275,9 +341,8 @@ class CooperativeManager:
             sensor_id = "%s_%s" % (self.ground_vehicle.platform_id, modality)
             sensor_transform = sensor.get_transform()
             ground_sensor_transforms[sensor_id] = sensor_transform
-            calibrations[sensor_id] = self.calibration.sensor_calibration(
-                ground_vehicle_transform,
-                sensor_transform,
+            calibrations[sensor_id] = self.calibration.sensor_calibration_from_actor(
+                ground_vehicle_transform, sensor
             )
         if "normal" in self.ground_vehicle.config.get("modalities", []) and "depth" in self.ground_vehicle.sensors:
             calibrations["%s_normal" % self.ground_vehicle.platform_id] = dict(
@@ -295,9 +360,8 @@ class CooperativeManager:
             air_primary_transforms[platform_id] = platform_transform
             for modality, sensor in sorted(adapter.sensors.items()):
                 sensor_id = "%s_%s" % (platform_id, modality)
-                calibrations[sensor_id] = self.calibration.sensor_calibration(
-                    platform_transform,
-                    sensor.get_transform(),
+                calibrations[sensor_id] = self.calibration.sensor_calibration_from_actor(
+                    platform_transform, sensor
                 )
         pairwise = {}
         ground_primary = self.ground_vehicle.sensors.get("rgb")
@@ -319,6 +383,19 @@ class CooperativeManager:
                     ],
                     "closure_ok": record["closure_ok"],
                 }
+        reprojection_errors = []
+        for calibration_record in calibrations.values():
+            if calibration_record.get("intrinsic") is None:
+                continue
+            width = float(calibration_record["image_width"])
+            height = float(calibration_record["image_height"])
+            pixel = [width * 0.6, height * 0.4]
+            world_point = backproject_pixel(pixel, 20.0, calibration_record)
+            projected = project_world_point(world_point, calibration_record)
+            reprojection_errors.append(
+                float(((projected[0] - pixel[0]) ** 2 + (projected[1] - pixel[1]) ** 2) ** 0.5)
+            )
+        reprojection_error = max(reprojection_errors or [float("inf")])
         self.writer.write_json(
             "calibration/%06d.json" % sample_index,
             {
@@ -329,10 +406,79 @@ class CooperativeManager:
                 "source_tick": int(world_frame_id),
                 "sensors": calibrations,
                 "cross_platform": pairwise,
-                "reprojection_error_px": None,
-                "reprojection_threshold_status": "pilot_provisional",
+                "reprojection_error_px": reprojection_error,
+                "reprojection_ok": bool(reprojection_error <= 1.0e-5),
+                "reprojection_threshold_px": 1.0e-5,
             },
         )
+        algorithm: Optional[Dict[str, Any]] = None
+        if self.runtime is not None:
+            platform_bundles: Dict[str, Dict[str, Any]] = {}
+            for platform_id in sorted(platform_states):
+                rgb_id = "%s_rgb" % platform_id
+                depth_id = "%s_depth" % platform_id
+                if rgb_id not in sensor_data_by_id or depth_id not in sensor_data_by_id:
+                    continue
+                bundle = {
+                    "sensor_id": rgb_id,
+                    "rgb": self._camera_array(sensor_data_by_id[rgb_id]),
+                    "depth_m": self._metric_depth(sensor_data_by_id[depth_id]),
+                    "timestamp": float(getattr(sensor_data_by_id[rgb_id], "timestamp", timestamp)),
+                    "world_frame_id": int(world_frame_id),
+                }
+                lidar_id = "%s_lidar" % platform_id
+                if lidar_id in sensor_data_by_id and lidar_id in calibrations:
+                    bundle["lidar_points"] = self._lidar_points(sensor_data_by_id[lidar_id])
+                    bundle["T_world_from_lidar"] = calibrations[lidar_id]["T_world_from_sensor"]
+                platform_bundles[platform_id] = bundle
+            if set(platform_bundles) != set(platform_states):
+                raise RuntimeError("every cooperative platform requires RGB and metric depth")
+            vot_initial_boxes: Optional[Dict[str, Any]] = None
+            if self.task_id == "task2" and sample_index == 0 and self.target_actor_id is not None:
+                vot_initial_boxes = {}
+                for sensor_id, rows in temporal_observations.items():
+                    platform_id = str(sensor_id).rsplit("_rgb", 1)[0]
+                    match = next((row for row in rows if int(row.get("carla_actor_id", -1)) == self.target_actor_id), None)
+                    if match is not None:
+                        vot_initial_boxes[platform_id] = {
+                            "bbox_xyxy": [float(value) for value in match["bbox_xyxy"]],
+                            "class_name": str(match["class_name"]),
+                        }
+            algorithm = self.runtime.process_frame(
+                world_frame_id, float(timestamp), platform_bundles, calibrations,
+                platform_states, vot_initial_boxes
+            )
+            for platform_id, result in algorithm["local_perception"].items():
+                self.writer.append_jsonl("algorithms/local/%s.jsonl" % platform_id, result)
+            for mode in ("air_only", "ground_only", "cooperative"):
+                self.writer.append_jsonl(
+                    "algorithms/results/%s.jsonl" % mode,
+                    {"world_frame_id": int(world_frame_id), "timestamp": float(timestamp),
+                     "objects": algorithm[mode]},
+                )
+            for message in algorithm["messages_sent"]:
+                self.writer.append_jsonl("communication/messages.jsonl", message.record())
+            for message in algorithm["messages_delivered"]:
+                self.writer.append_jsonl(
+                    "communication/events.jsonl",
+                    {"event": "consumed-by-fusion", **message.record()},
+                )
+            if self.task_id == "task2":
+                self.writer.append_jsonl("air_track.jsonl", {"world_frame_id": int(world_frame_id), "tracks": algorithm["air_only"]})
+                self.writer.append_jsonl("ground_track.jsonl", {"world_frame_id": int(world_frame_id), "tracks": algorithm["ground_only"]})
+                self.writer.append_jsonl("fused_track.jsonl", {"world_frame_id": int(world_frame_id), "tracks": algorithm["cooperative"], "target": algorithm["fused_sot"]})
+                if algorithm["handoff_event"] is not None:
+                    self.writer.append_jsonl("handoff_events.jsonl", algorithm["handoff_event"])
+            if self.task_id == "task3":
+                for platform_id, tracks in algorithm["local_tracks"].items():
+                    self.writer.append_jsonl(
+                        "local_tracks/%s.jsonl" % platform_id,
+                        {"world_frame_id": int(world_frame_id), "tracks": tracks},
+                    )
+                self.writer.append_jsonl(
+                    "fused_tracks.jsonl",
+                    {"world_frame_id": int(world_frame_id), "tracks": algorithm["cooperative"]},
+                )
         for association in associations:
             record = dict(association)
             record.update(
@@ -374,12 +520,62 @@ class CooperativeManager:
             "ground_state": state,
             "associations": associations,
             "sample_index": sample_index,
+            "algorithm": algorithm,
         }
 
     def commit_scene(self, extra_manifest: Dict[str, Any]) -> Path:
         self.writer.write_json("platforms/platforms.json", self.platform_registry.as_dict())
-        self.writer.write_json("quality/ground_vehicle.json", self.ground_vehicle.check_qa())
+        ground_qa = self.ground_vehicle.check_qa()
+        self.writer.write_json("quality/ground_vehicle.json", ground_qa)
+        ground_blockers = self.quality.ground_commit_blockers(ground_qa)
+        if ground_blockers:
+            self.close_scene(abort_reason="ground_vehicle_qa:" + ",".join(ground_blockers))
+            raise RuntimeError("ground vehicle QA prevents commit: %s" % ground_blockers)
         payload = dict(extra_manifest)
+        config_hash = hashlib.sha256(
+            json.dumps(self.config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if self.defer_perception:
+            payload.update(
+                {
+                    "run_mode": "synchronized_raw_acquisition",
+                    "offline_perception_status": "pending",
+                    "model_weights_sha256": None,
+                    "cross_platform_fusion_verified": False,
+                    "ground_tracking_contribution_verified": False,
+                    "ownership_handoff_verified": False,
+                }
+            )
+        else:
+            if self.runtime is None or not self.runtime.detector_is_real_model:
+                self.close_scene(abort_reason="real_detector_not_verified")
+                raise RuntimeError("a real local detector is required for commit")
+            if not self.runtime.cross_platform_fusion_seen:
+                self.close_scene(abort_reason="no_algorithmic_air_ground_fusion")
+                raise RuntimeError("no fused result used arrived Air and Ground messages")
+            if self.task_id in ("task2", "task3") and not self.runtime.ground_contribution_seen:
+                self.close_scene(abort_reason="ground_did_not_contribute_to_tracking")
+                raise RuntimeError("Ground messages did not contribute to tracking")
+            payload.update(
+                {
+                "scene_id": self.scene_id,
+                "task_id": self.task_id,
+                "scene_seed": self.scene_seed,
+                "schema_version": SCHEMA_VERSION,
+                "communication_seed": self.scene_seed,
+                "communication_profile": self.communication.profile_name,
+                "raw_sensor_data_modified_by_communication": False,
+                "model_weights_sha256": self.runtime.model_hash,
+                "run_mode": "online_cooperative_perception",
+                "config_sha256": config_hash,
+                "code_version": _code_version(),
+                "cross_platform_fusion_verified": True,
+                "ground_tracking_contribution_verified": bool(
+                    self.runtime.ground_contribution_seen
+                ),
+                "ownership_handoff_verified": bool(self.runtime.handoff_seen),
+                }
+            )
         payload.update(
             {
                 "scene_id": self.scene_id,
@@ -389,12 +585,15 @@ class CooperativeManager:
                 "communication_seed": self.scene_seed,
                 "communication_profile": self.communication.profile_name,
                 "raw_sensor_data_modified_by_communication": False,
+                "config_sha256": config_hash,
+                "code_version": _code_version(),
             }
         )
         destination = self.writer.commit(payload)
         self.ground_vehicle.destroy()
         self.object_registry = None
         self.communication = None
+        self.runtime = None
         self.scene_id = ""
         return destination
 

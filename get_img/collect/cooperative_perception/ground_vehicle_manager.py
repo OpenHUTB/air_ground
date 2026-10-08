@@ -60,6 +60,7 @@ class GroundVehicleManager:
         self.sync = SyncManager(timeout=float(self.config.get("sensor_timeout", 15.0)))
         self.collision_sensor = None
         self.collision_count = 0
+        self.collision_events: List[Dict[str, Any]] = []
         self.offroad_count = 0
         self.travel_distance = 0.0
         self.last_location = None
@@ -73,6 +74,7 @@ class GroundVehicleManager:
         self.state_history: List[Dict[str, Any]] = []
         self.scene_id = ""
         self.scene_seed = 0
+        self.initial_route_waypoint_count = 0
 
     @property
     def platform_id(self) -> str:
@@ -172,6 +174,7 @@ class GroundVehicleManager:
         if self.vehicle is not None:
             raise RuntimeError("Ground Vehicle already exists; call destroy first")
         self.collision_count = 0
+        self.collision_events = []
         self.offroad_count = 0
         self.travel_distance = 0.0
         self.last_location = None
@@ -215,7 +218,10 @@ class GroundVehicleManager:
             )
         self._build_agent()
         self._spawn_sensors()
-        self.last_location = self.vehicle.get_location()
+        # In synchronous mode CARLA may still report the actor at the origin
+        # until the first world tick after spawning.  The first sampled state,
+        # not that pre-tick placeholder, is the trajectory baseline.
+        self.last_location = None
         return self.vehicle
 
     def _build_agent(self) -> None:
@@ -256,6 +262,14 @@ class GroundVehicleManager:
                 self.agent.set_destination(start_location, destination, clean=True)
             except TypeError:
                 self.agent.set_destination(destination)
+        local_planner = getattr(self.agent, "_local_planner", None)
+        queue = getattr(local_planner, "_waypoints_queue", None)
+        buffer_ = getattr(local_planner, "_waypoint_buffer", None)
+        self.initial_route_waypoint_count = max(
+            1,
+            (len(queue) if queue is not None else 0)
+            + (len(buffer_) if buffer_ is not None else 0),
+        )
 
     def _camera_transform(self) -> Any:
         mount = dict(self.config.get("camera_mount", {}))
@@ -353,8 +367,29 @@ class GroundVehicleManager:
             attach_to=self.vehicle,
         )
 
-    def _on_collision(self, _event: Any) -> None:
+    def _on_collision(self, event: Any) -> None:
         self.collision_count += 1
+        impulse = getattr(event, "normal_impulse", None)
+        impulse_magnitude = 0.0
+        if impulse is not None:
+            impulse_magnitude = math.sqrt(
+                float(impulse.x) ** 2
+                + float(impulse.y) ** 2
+                + float(impulse.z) ** 2
+            )
+        other_actor = getattr(event, "other_actor", None)
+        self.collision_events.append(
+            {
+                "world_frame_id": int(getattr(event, "frame", -1)),
+                "other_actor_id": (
+                    None if other_actor is None else int(other_actor.id)
+                ),
+                "other_actor_type": (
+                    None if other_actor is None else str(other_actor.type_id)
+                ),
+                "normal_impulse_magnitude": float(impulse_magnitude),
+            }
+        )
 
     def run_step(self) -> Any:
         if self.agent is None or self.vehicle is None:
@@ -386,7 +421,7 @@ class GroundVehicleManager:
         if queue is None:
             return 0.0
         remaining = len(queue) + (len(buffer_) if buffer_ is not None else 0)
-        initial = max(1, int(self.config.get("estimated_route_waypoints", 100)))
+        initial = max(1, int(self.initial_route_waypoint_count))
         return max(0.0, min(1.0, 1.0 - float(remaining) / initial))
 
     def get_state(
@@ -402,13 +437,17 @@ class GroundVehicleManager:
         location = transform.location
         if self.last_location is not None:
             step_distance = math.sqrt(
-                (float(location.x) - float(self.last_location.x)) ** 2
-                + (float(location.y) - float(self.last_location.y)) ** 2
-                + (float(location.z) - float(self.last_location.z)) ** 2
+                (float(location.x) - self.last_location[0]) ** 2
+                + (float(location.y) - self.last_location[1]) ** 2
+                + (float(location.z) - self.last_location[2]) ** 2
             )
             self.travel_distance += step_distance
             self.max_pose_jump_m = max(self.max_pose_jump_m, step_distance)
-        self.last_location = location
+        self.last_location = (
+            float(location.x),
+            float(location.y),
+            float(location.z),
+        )
         speed = math.sqrt(
             float(velocity.x) ** 2 + float(velocity.y) ** 2 + float(velocity.z) ** 2
         )
@@ -467,6 +506,7 @@ class GroundVehicleManager:
             "route_completion_ratio": self._route_completion_ratio(),
             "travel_distance_m": float(self.travel_distance),
             "collision_count": int(self.collision_count),
+            "collision_events": list(self.collision_events),
             "offroad_count": int(self.offroad_count),
             "stationary_duration_s": float(self.current_stationary_duration_s),
             "max_pose_jump_m": float(self.max_pose_jump_m),
@@ -490,6 +530,7 @@ class GroundVehicleManager:
             ),
             "max_stationary_duration_s": float(self.max_stationary_duration_s),
             "collision_count": int(self.collision_count),
+            "collision_events": list(self.collision_events),
             "offroad_count": int(self.offroad_count),
             "valid_sensor_frame_ratio": float(
                 self.valid_sensor_frames / max(1, self.sensor_frame_requests)
@@ -497,7 +538,9 @@ class GroundVehicleManager:
             "max_pose_jump_m": float(self.max_pose_jump_m),
             "route_failure": bool(
                 not self.state_history
-                or self._route_completion_ratio() <= 0.0
+                or self.route_plan is None
+                or self.agent is None
+                or self.initial_route_waypoint_count <= 0
             ),
             "threshold_status": "pilot_provisional",
         }

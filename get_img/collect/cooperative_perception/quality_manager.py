@@ -86,3 +86,18 @@ class QualityManager:
             "offroad_count": max([int(row.get("offroad_count", 0)) for row in rows] or [0]),
             "threshold_status": "pilot_provisional",
         }
+
+    @staticmethod
+    def ground_commit_blockers(report: Dict[str, Any]) -> List[str]:
+        blockers = []
+        if bool(report.get("route_failure")):
+            blockers.append("route_failure")
+        if int(report.get("collision_count", 0)) > 0:
+            blockers.append("collision")
+        if int(report.get("offroad_count", 0)) > 0:
+            blockers.append("offroad")
+        if float(report.get("valid_sensor_frame_ratio", 0.0)) < 1.0:
+            blockers.append("sensor_missing")
+        if float(report.get("max_pose_jump_m", 0.0)) > 10.0:
+            blockers.append("pose_jump")
+        return blockers

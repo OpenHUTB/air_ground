@@ -26,6 +26,9 @@ class PlatformRegistry:
             "parent_actor_id": (
                 None if parent_actor_id is None else int(parent_actor_id)
             ),
+            "control": {
+                "mode": "kinematic_sensor_platform" if bool(virtual) else "actor_control"
+            },
         }
         self.platforms[str(platform_id)] = record
         return record
@@ -55,4 +58,3 @@ class PlatformRegistry:
             "platforms": list(self.platforms.values()),
             "sensors": list(self.sensors.values()),
         }
-

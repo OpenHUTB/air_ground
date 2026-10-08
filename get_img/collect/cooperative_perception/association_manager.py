@@ -29,7 +29,8 @@ class AssociationManager:
                             "target_sensor": target,
                             "relation": "same_object",
                             "truth_source": "carla_actor_registry",
+                            "association_source": "ground_truth",
+                            "usage": "annotation_and_evaluation_only",
                         }
                     )
         return records
-

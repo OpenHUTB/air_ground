@@ -79,6 +79,17 @@ def parse_args() -> argparse.Namespace:
         help="保留已完成场景，仅采集缺失场景并在末尾重新审计。",
     )
     parser.add_argument("--max-scenes", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--defer-perception",
+        action="store_true",
+        help="Collect synchronized raw data only; run real perception and fusion later via dataset_replay.",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run one bounded isolated development scene with relaxed duration gates.",
+    )
     parser.add_argument(
         "--frames-per-scene",
         type=int,
@@ -102,6 +113,9 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if args.out is not None:
         config["out"] = str(args.out)
+        config.setdefault("cooperative", {})["output_root"] = str(
+            args.out.resolve() / "cooperative"
+        )
     if args.frames_per_scene is not None:
         config["frames_per_scene"] = args.frames_per_scene
         config["train_frames_per_scene"] = args.frames_per_scene
@@ -110,6 +124,35 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
         config["scenes_per_map"] = args.scenes_per_map
     if args.weather_presets is not None:
         config["weather_presets"] = args.weather_presets
+    if args.seed is not None:
+        config["seed"] = int(args.seed)
+        config["seed_source"] = "command_line"
+    if args.defer_perception:
+        config.setdefault("cooperative", {}).setdefault("perception", {})[
+            "defer_until_replay"
+        ] = True
+    if args.smoke:
+        config.update(
+            {
+                "scenes_per_map": 1,
+                "max_scene_attempts": min(3, int(config.get("max_scene_attempts", 3))),
+                "max_actor_population_attempts": 1,
+                "min_valid_frame_ratio": 0.2,
+                "min_anchor_visible_any_camera_ratio": 0.2,
+                "min_anchor_common_view_seconds": 0.1,
+                "min_effective_track_seconds": 0.1,
+                "min_dynamic_event_count": 0,
+                "vehicle_min_dynamic_event_count": 0,
+                "vehicle_min_sequence_displacement_m": 0.0,
+                "vehicle_min_sequence_path_length_m": 0.0,
+                "vehicle_min_median_speed_mps": 0.0,
+                "vehicle_min_moving_frame_ratio": 0.0,
+            }
+        )
+        config.setdefault("simulator", {})["visible"] = False
+        config.setdefault("cooperative", {}).setdefault("perception", {}).update(
+            {"device": "0", "confidence": 0.05}
+        )
     config["_config_path"] = str(config_path)
     return config
 
@@ -1279,9 +1322,10 @@ def dataset_global_id(scene_id: int, carla_actor_id: int) -> int:
 
 def frame_quality(
     camera_payloads: Dict[str, Dict[str, Any]],
+    ground_payload: Dict[str, Any],
     anchor_class: str,
     config: Dict[str, Any],
-) -> Tuple[bool, List[int], Dict[int, int]]:
+) -> Tuple[bool, List[int], Dict[int, int], Dict[str, Any]]:
     counts = {
         int(annotation["global_id"]): 0
         for payload in camera_payloads.values()
@@ -1296,6 +1340,14 @@ def frame_quality(
             for payload in camera_payloads.values()
         )
     common = sorted(global_id for global_id, count in counts.items() if count >= 2)
+    air_ids = set(counts)
+    ground_ids = {
+        int(annotation["global_id"])
+        for annotation in ground_payload["annotations"]
+    }
+    air_ground_shared = sorted(air_ids & ground_ids)
+    ground_only = sorted(ground_ids - air_ids)
+    air_only = sorted(air_ids - ground_ids)
     enough_objects = all(
         len(payload["annotations"]) >= int(config["min_objects_per_camera"])
         for payload in camera_payloads.values()
@@ -1319,7 +1371,14 @@ def frame_quality(
         and enough_anchor_objects
         and len(common) >= int(config["min_common_ids_per_frame"])
     )
-    return valid, common, counts
+    coverage = {
+        "air_air_shared_ids": common,
+        "air_ground_shared_ids": air_ground_shared,
+        "ground_only_ids": ground_only,
+        "air_only_ids": air_only,
+        "all_platform_coverage_ids": sorted(air_ids | ground_ids),
+    }
+    return valid, common, counts, coverage
 
 
 def largest_connected_region_ratio(mask: np.ndarray) -> float:
@@ -2046,6 +2105,12 @@ def save_cooperative_task3_frame(
         ground_semantic,
         ground_config,
     )
+    ground_annotations = [
+        annotation
+        for annotation in ground_annotations
+        if int(annotation.get("carla_actor_id", -1))
+        != int(cooperative.ground_vehicle.vehicle.id)
+    ]
     ground_observations = enrich_observations(
         ground_annotations,
         cooperative.object_registry,
@@ -2053,12 +2118,12 @@ def save_cooperative_task3_frame(
     )
     observations_by_sensor["vehicle_01_rgb"] = ground_observations
     sensor_data_by_id.update(ground_raw)
-    snapshot = world.get_snapshot()
     first_rgb = raw[units[0].name]["rgb"]
+    frame_timestamp = float(first_rgb.timestamp)
     cooperative.record_frame(
         carla_frame,
-        float(first_rgb.timestamp),
-        float(snapshot.timestamp.elapsed_seconds),
+        frame_timestamp,
+        frame_timestamp,
         observations_by_sensor,
         sensor_data_by_id,
         ground_raw,
@@ -2162,6 +2227,7 @@ def collect_scene_attempt(
     ssim_by_camera: Dict[str, List[float]] = defaultdict(list)
     previous_rgb: Dict[str, np.ndarray] = {}
     invalid_frame_reasons: Counter = Counter()
+    cooperative_coverage_rows: List[Dict[str, Any]] = []
     empty_camera_streaks: Dict[str, int] = {
         unit.name: 0 for unit in units
     }
@@ -2198,6 +2264,28 @@ def collect_scene_attempt(
             )
             camera_payloads[unit.name] = payload
             all_views_valid = all_views_valid and bool(payload["view_valid"])
+        ground_config = dict(config)
+        ground_vehicle_config = cooperative.config["ground_vehicle"]
+        ground_config.update(
+            {
+                "width": int(ground_vehicle_config["image_width"]),
+                "height": int(ground_vehicle_config["image_height"]),
+                "fov": float(ground_vehicle_config["camera_fov_deg"]),
+            }
+        )
+        ground_annotations_for_quality = build_annotations(
+            world,
+            ground_raw["vehicle_01_rgb"].transform,
+            base.decode_carla_depth_meters(ground_raw["vehicle_01_depth"]),
+            base.decode_semantic_segmentation(ground_raw["vehicle_01_semantic"]),
+            ground_config,
+        )
+        ground_annotations_for_quality = [
+            annotation
+            for annotation in ground_annotations_for_quality
+            if int(annotation.get("carla_actor_id", -1))
+            != int(cooperative.ground_vehicle.vehicle.id)
+        ]
         rejected_unmodeled_views = {
             camera_name: payload["unmodeled_region"]
             for camera_name, payload in camera_payloads.items()
@@ -2246,11 +2334,13 @@ def collect_scene_attempt(
                 flush=True,
             )
             break
-        valid, common_ids, visibility_counts = frame_quality(
+        valid, common_ids, visibility_counts, cooperative_coverage = frame_quality(
             camera_payloads,
+            {"annotations": ground_annotations_for_quality},
             spec.anchor_class,
             config,
         )
+        cooperative_coverage_rows.append(cooperative_coverage)
         required_visible = int(required_global_id) in set(map(int, common_ids))
         valid = valid and all_views_valid and required_visible
         frame_validity.append(bool(valid))
@@ -2357,6 +2447,32 @@ def collect_scene_attempt(
     quality["empty_camera_patience_frames"] = empty_camera_patience
     quality["empty_camera_stop_count"] = empty_camera_stop_count
     quality["camera_rig_geometry"] = camera_rig_geometry(transforms)
+    quality["air_ground_shared_track_ids"] = sorted(
+        {
+            int(value)
+            for row in cooperative_coverage_rows
+            for value in row["air_ground_shared_ids"]
+        }
+    )
+    quality["ground_only_track_ids"] = sorted(
+        {
+            int(value)
+            for row in cooperative_coverage_rows
+            for value in row["ground_only_ids"]
+        }
+    )
+    quality["air_only_track_ids"] = sorted(
+        {
+            int(value)
+            for row in cooperative_coverage_rows
+            for value in row["air_only_ids"]
+        }
+    )
+    if not quality["air_ground_shared_track_ids"]:
+        quality["failures"].append("no_air_ground_shared_track")
+    if not quality["ground_only_track_ids"]:
+        quality["failures"].append("no_ground_blind_spot_supplement")
+    quality["passed"] = bool(quality.get("passed", False) and not quality["failures"])
     write_json(staging_dir / "scene_quality.json", quality)
     accepted = bool(quality["passed"])
     if accepted:
@@ -2544,22 +2660,36 @@ def collect_scene(
             destination = paths["scenes"] / spec.name
             if destination.exists():
                 raise RuntimeError(f"场景目录意外存在：{destination}")
-            shutil.move(str(staging_dir), str(destination))
-            cooperative.commit_scene(
-                {
-                    "split": spec.split,
-                    "weather": spec.weather,
-                    "frames": int(cooperative.sample_index),
-                    "air_platform_count": 3,
-                    "air_platform_type": "air_camera_platform",
-                    "air_platform_is_virtual": True,
-                    "ground_vehicle_count": 1,
-                    "derived_formats": ["MOTChallenge", "MCMOT"],
-                    "model_input": "rgb",
-                    "auxiliary_modalities": ["depth_m", "semantic"],
-                    "parameter_status": "pilot_provisional",
-                }
-            )
+            try:
+                cooperative.commit_scene(
+                    {
+                        "split": spec.split,
+                        "weather": spec.weather,
+                        "frames": int(cooperative.sample_index),
+                        "air_platform_count": 3,
+                        "air_platform_type": "air_camera_platform",
+                        "air_platform_is_virtual": True,
+                        "ground_vehicle_count": 1,
+                        "derived_formats": [
+                            "MOTChallenge",
+                            "MCMOT",
+                            (
+                                "algorithmic_MCMOT_four_platforms_pending_replay"
+                                if cooperative.defer_perception
+                                else "algorithmic_MCMOT_four_platforms"
+                            ),
+                        ],
+                        "model_input": "rgb",
+                        "auxiliary_modalities": ["depth_m", "semantic"],
+                        "parameter_status": "pilot_provisional",
+                    }
+                )
+            except RuntimeError as exc:
+                result["accepted"] = False
+                result["reason"] = str(exc)
+            else:
+                shutil.move(str(staging_dir), str(destination))
+        if result["accepted"]:
             result.update(
                 {
                     "scene": spec.name,

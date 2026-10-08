@@ -6,6 +6,9 @@
   "threshold_status": "pilot_provisional",
   "communication": {
     "assignment": "scene_level_deterministic",
+    "profile": "Ideal",
+    "max_age_ms": 500.0,
+    "ground_messages_enabled": true,
     "profiles": {
       "Ideal": {"latency_ms": [0.0, 0.0], "packet_loss": [0.0, 0.0], "byte_budget": null},
       "Stable": {"latency_ms": [20.0, 50.0], "packet_loss": [0.0, 0.01], "byte_budget": 8000000},
@@ -13,12 +16,26 @@
       "Intermittent": {"latency_ms": [100.0, 300.0], "packet_loss": [0.1, 0.3], "byte_budget": 250000}
     }
   },
+  "perception": {
+    "enabled": true,
+    "provider": "ultralytics_local",
+    "weights": "E:/pythonProject/YOLO/yolov8n.pt",
+    "confidence": 0.25,
+    "device": "cpu",
+    "allow_weight_download": false
+  },
+  "fusion": {
+    "distance_gate_m": 4.0,
+    "track_distance_gate_m": 6.0,
+    "association_source": "algorithm"
+  },
   "quality": {
     "min_shared_targets_per_frame": 1,
     "sensor_timestamp_tolerance_s": 0.0001,
     "moving_step_m": 0.02,
     "reprojection_error_px": null,
     "joint_visible_ratio": null,
+    "min_ground_target_visible_ratio": 0.1,
     "air_only_visible_ratio": null,
     "vehicle_only_visible_ratio": null,
     "max_consecutive_missing_frames": null,

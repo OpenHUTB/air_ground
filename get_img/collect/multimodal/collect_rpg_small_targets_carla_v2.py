@@ -5751,8 +5751,8 @@ def main() -> None:
             )
             cooperative.register_air_platform(
                 "uav_01",
-                virtual=False,
-                platform_type="uav",
+                virtual=True,
+                platform_type="air_camera_platform",
                 sensors={
                     "rgb": sensors["rgb"],
                     "depth": sensors["depth"],

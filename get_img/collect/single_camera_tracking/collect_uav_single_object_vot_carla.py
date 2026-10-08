@@ -1119,6 +1119,8 @@ def collect_sequence_attempt(
     cooperative_state_counts: Counter = Counter()
     interaction_event_count = 0
     reacquisition_count = 0
+    current_both_missing_frames = 0
+    max_consecutive_both_missing_frames = 0
 
     metadata_path = attempt_dir / "annotations.jsonl"
     with metadata_path.open("w", encoding="utf-8") as metadata_file:
@@ -1261,6 +1263,12 @@ def collect_sequence_attempt(
                 ground_semantic,
                 ground_config,
             )
+            ground_annotations = [
+                annotation
+                for annotation in ground_annotations
+                if int(annotation.get("carla_actor_id", -1))
+                != int(cooperative.ground_vehicle.vehicle.id)
+            ]
             ground_observations = enrich_observations(
                 ground_annotations,
                 cooperative.object_registry,
@@ -1420,6 +1428,14 @@ def collect_sequence_attempt(
             )
             previous_cooperative_state = str(event["visibility_state"])
             cooperative_state_counts[previous_cooperative_state] += 1
+            if not bool(event["air_visible"]) and not bool(event["vehicle_visible"]):
+                current_both_missing_frames += 1
+                max_consecutive_both_missing_frames = max(
+                    max_consecutive_both_missing_frames,
+                    current_both_missing_frames,
+                )
+            else:
+                current_both_missing_frames = 0
             interaction_event_count += len(event["events"])
             reacquisition_count += int("reacquisition_event" in event["events"])
             snapshot = world.get_snapshot()
@@ -1645,6 +1661,16 @@ def collect_sequence_attempt(
         "vehicle_dominant_ratio": float(
             cooperative_state_counts["Vehicle Dominant"] / max(1, actual_frames)
         ),
+        "ground_target_visible_ratio": float(
+            (
+                cooperative_state_counts["Joint Visible"]
+                + cooperative_state_counts["Vehicle Dominant"]
+            )
+            / max(1, actual_frames)
+        ),
+        "max_consecutive_both_missing_frames": int(
+            max_consecutive_both_missing_frames
+        ),
         "interaction_event_count": int(interaction_event_count),
         "reacquisition_count": int(reacquisition_count),
         "cooperative_threshold_status": "pilot_provisional",
@@ -1653,6 +1679,20 @@ def collect_sequence_attempt(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    minimum_ground_visible_ratio = float(
+        cooperative.config.get("quality", {}).get(
+            "min_ground_target_visible_ratio", 0.10
+        )
+    )
+    if summary["ground_target_visible_ratio"] < minimum_ground_visible_ratio:
+        return False, {
+            **summary,
+            "reason": (
+                "ground target visibility below cooperative acceptance gate: "
+                f"{summary['ground_target_visible_ratio']:.3f} < "
+                f"{minimum_ground_visible_ratio:.3f}"
+            ),
+        }
     return True, summary
 
 
@@ -2039,6 +2079,25 @@ def audit_dataset(
         errors.append(
             f"missing motion/target combinations: {missing_combinations}"
         )
+    covered_cooperative_states = {
+        state
+        for summary in sequence_summaries
+        for state, count in summary.get(
+            "cooperative_visibility_state_counts", {}
+        ).items()
+        if int(count) > 0
+    }
+    required_cooperative_states = {
+        "Joint Visible", "UAV Dominant", "Vehicle Dominant"
+    }
+    missing_cooperative_states = sorted(
+        required_cooperative_states - covered_cooperative_states
+    )
+    if missing_cooperative_states:
+        errors.append(
+            "missing cooperative visibility states: "
+            + json.dumps(missing_cooperative_states, ensure_ascii=False)
+        )
     audit = {
         "status": "PASS" if not errors else "FAIL",
         "errors": errors,
@@ -2051,6 +2110,7 @@ def audit_dataset(
         ),
         "sequence_level_split": True,
         "weather_is_constant_inside_each_sequence": True,
+        "cooperative_visibility_states": sorted(covered_cooperative_states),
         "target_actor_is_constant_inside_each_sequence": True,
         "target_actor_is_split_isolated": not cross_split_actors,
         "max_sequences_per_target_actor": max_sequences_per_actor,
@@ -2461,8 +2521,8 @@ def main() -> None:
                     )
                     cooperative.register_air_platform(
                         "uav_01",
-                        virtual=False,
-                        platform_type="uav",
+                        virtual=True,
+                        platform_type="air_camera_platform",
                         sensors=sensors,
                         required_modalities=("rgb", "depth", "semantic"),
                     )
@@ -2527,6 +2587,12 @@ def main() -> None:
                                 "uav_dominant_ratio": summary["uav_dominant_ratio"],
                                 "vehicle_dominant_ratio": summary[
                                     "vehicle_dominant_ratio"
+                                ],
+                                "ground_target_visible_ratio": summary[
+                                    "ground_target_visible_ratio"
+                                ],
+                                "max_consecutive_both_missing_frames": summary[
+                                    "max_consecutive_both_missing_frames"
                                 ],
                                 "interaction_event_count": summary[
                                     "interaction_event_count"
